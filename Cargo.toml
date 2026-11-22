@@ -1,0 +1,41 @@
+[workspace]
+members = [
+    "crates/gnomon-kernel",
+    "crates/gnomon-wasm",
+    "crates/gnomon-sieve",
+    "crates/gnomon-mcp",
+    "crates/gnomon-bench",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.cargo]
+unused_workspace_dependencies = "allow"
+unused_dependencies = "allow"
+
+[workspace.metadata.kani]
+flags = { jobs = "8", output-format = "terse", no-assertion-reach-checks = true }
+
+[workspace.dependencies]
+gnomon-kernel = { path = "crates/gnomon-kernel" }
+gnomon-wasm = { path = "crates/gnomon-wasm" }
+gnomon-sieve = { path = "crates/gnomon-sieve" }
+wasmparser = "0.263.0"
+wasm-encoder = "0.263.0"
+wasmtime = "51.0.0"
+egglog = "3.0.0"
+bitwuzla = { version = "0.11.0", features = ["static"] }
+stitch_core = "0.1.0"
+rmcp = "3.11.0"
+tokio = { version = "1.54.1", features = ["full"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+thiserror = "2.0.21"
+proptest = "1.12.0"

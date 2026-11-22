@@ -1,0 +1,13 @@
+[package]
+name = "gnomon-mcp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+gnomon-kernel.workspace = true
+gnomon-wasm.workspace = true
+gnomon-sieve.workspace = true
+
+[lints]
+workspace = true
