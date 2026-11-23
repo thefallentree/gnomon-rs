@@ -512,6 +512,7 @@ pub(crate) const TAG_STMT_YIELD: u8 = 11;
 pub(crate) const TAG_STMT_BREAK: u8 = 12;
 pub(crate) const TAG_STMT_CONTINUE: u8 = 13;
 pub(crate) const TAG_STMT_RETURN: u8 = 14;
+pub(crate) const TAG_NODE_AUX: u8 = 15;
 
 pub(crate) const OP_CONST_I32: u8 = 0;
 pub(crate) const OP_CONST_I64: u8 = 1;
@@ -540,7 +541,7 @@ const fn shift_pair(start: u32, len: u32, offset: u32) -> (u32, u32) {
     if len == 0 { (0, 0) } else { (start + offset, len) }
 }
 
-/// Flat zero-union, zero-padding arena element (`36` bytes, `Copy`, `!needs_drop`)
+/// Flat zero-union, zero-padding arena element (`24` bytes, `Copy`, `!needs_drop`)
 /// stored inside `Region::pool`. Encoding items as scalar fields instead of nested
 /// tagged unions eliminates enum-union padding nondets during bounded model checking.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -553,9 +554,6 @@ pub struct IrSlot {
     pub w2: u32,
     pub w3: u32,
     pub w4: u32,
-    pub w5: u32,
-    pub w6: u32,
-    pub w7: u32,
 }
 
 impl IrSlot {
@@ -568,14 +566,11 @@ impl IrSlot {
         w2: 0,
         w3: 0,
         w4: 0,
-        w5: 0,
-        w6: 0,
-        w7: 0,
     };
 
     #[inline]
     const fn base(tag: u8, sub: u8, aux: u16) -> Self {
-        Self { tag, sub, aux, w0: 0, w1: 0, w2: 0, w3: 0, w4: 0, w5: 0, w6: 0, w7: 0 }
+        Self { tag, sub, aux, w0: 0, w1: 0, w2: 0, w3: 0, w4: 0 }
     }
 
     pub const fn val(v: ValId) -> Self {
@@ -594,7 +589,10 @@ impl IrSlot {
         Self::base(TAG_TY, 0, t.to_u8() as u16)
     }
 
-    pub const fn from_node(node: RegionNode) -> Self {
+    /// Encodes a `RegionNode` head slot (`Block`, `IfElse`, or the child-node IDs of
+    /// `BoundedLoop`/`InvariantLoop`; loop span metadata is stored in an accompanying
+    /// `TAG_NODE_AUX` slot by `SlotPool::push_node`).
+    pub const fn from_node_head(node: RegionNode) -> Self {
         match node {
             RegionNode::Block(span) => {
                 let mut s = Self::base(TAG_NODE_BLOCK, 0, 0);
@@ -611,37 +609,39 @@ impl IrSlot {
                 s.w4 = results.len;
                 s
             }
-            RegionNode::BoundedLoop { max_iters, init_vars, state_vars, body } => {
+            RegionNode::BoundedLoop { max_iters, init_vars, body, .. } => {
                 let mut s = Self::base(TAG_NODE_BLOOP, 0, 0);
-                s.w0 = max_iters;
-                s.w1 = init_vars.start;
-                s.w2 = init_vars.len;
-                s.w3 = state_vars.start;
-                s.w4 = state_vars.len;
-                s.w5 = body.0;
+                s.w0 = body.0;
+                s.w1 = max_iters;
+                s.w2 = init_vars.start;
+                s.w3 = init_vars.len;
                 s
             }
-            RegionNode::InvariantLoop {
-                init_vars,
-                state_vars,
-                cond,
-                invariant_pred,
-                fuel_measure,
-                body,
-            } => Self {
-                tag: TAG_NODE_ILOOP,
-                sub: 0,
-                aux: 0,
-                w0: init_vars.start,
-                w1: init_vars.len,
-                w2: state_vars.start,
-                w3: state_vars.len,
-                w4: cond.0,
-                w5: invariant_pred.0,
-                w6: fuel_measure.0,
-                w7: body.0,
-            },
+            RegionNode::InvariantLoop { cond, invariant_pred, fuel_measure, body, .. } => {
+                let mut s = Self::base(TAG_NODE_ILOOP, 0, 0);
+                s.w0 = cond.0;
+                s.w1 = invariant_pred.0;
+                s.w2 = fuel_measure.0;
+                s.w3 = body.0;
+                s
+            }
         }
+    }
+
+    pub(crate) const fn node_aux_bloop(state_vars: Span) -> Self {
+        let mut s = Self::base(TAG_NODE_AUX, 0, 0);
+        s.w0 = state_vars.start;
+        s.w1 = state_vars.len;
+        s
+    }
+
+    pub(crate) const fn node_aux_iloop(init_vars: Span, state_vars: Span) -> Self {
+        let mut s = Self::base(TAG_NODE_AUX, 1, 0);
+        s.w0 = init_vars.start;
+        s.w1 = init_vars.len;
+        s.w2 = state_vars.start;
+        s.w3 = state_vars.len;
+        s
     }
 
     pub const fn let_op(dst: ValId, ty: ValType, op: Op) -> Self {
@@ -735,11 +735,10 @@ impl IrSlot {
             }
             EffectOp::MemoryCopy { dst_mem, src_mem, dst, src, len } => {
                 let mut s = Self::base(TAG_STMT_EFFECT, EFF_MEM_COPY, 0);
-                s.w0 = dst_mem.0 as u32;
-                s.w1 = src_mem.0 as u32;
-                s.w2 = dst.0;
-                s.w3 = src.0;
-                s.w4 = len.0;
+                s.w0 = (dst_mem.0 as u32) | ((src_mem.0 as u32) << 16);
+                s.w1 = dst.0;
+                s.w2 = src.0;
+                s.w3 = len.0;
                 s
             }
             EffectOp::MemoryFill { mem, dst, val, len } => {
@@ -866,7 +865,7 @@ impl IrSlot {
         if self.tag == TAG_TY { ValType::from_u8(self.aux as u8) } else { None }
     }
 
-    pub const fn to_node(self) -> Option<RegionNode> {
+    pub const fn to_simple_node(self) -> Option<RegionNode> {
         match self.tag {
             TAG_NODE_BLOCK => Some(RegionNode::Block(Span { start: self.w0, len: self.w1 })),
             TAG_NODE_IF => Some(RegionNode::IfElse {
@@ -875,20 +874,53 @@ impl IrSlot {
                 else_region: RegionNodeId(self.w2),
                 results: Span { start: self.w3, len: self.w4 },
             }),
-            TAG_NODE_BLOOP => Some(RegionNode::BoundedLoop {
-                max_iters: self.w0,
-                init_vars: Span { start: self.w1, len: self.w2 },
-                state_vars: Span { start: self.w3, len: self.w4 },
-                body: RegionNodeId(self.w5),
+            _ => None,
+        }
+    }
+
+    pub(crate) const fn to_node_with_pool(self, idx: usize, pool: &[IrSlot]) -> Option<RegionNode> {
+        match self.tag {
+            TAG_NODE_BLOCK => Some(RegionNode::Block(Span { start: self.w0, len: self.w1 })),
+            TAG_NODE_IF => Some(RegionNode::IfElse {
+                cond: ValId(self.w0),
+                then_region: RegionNodeId(self.w1),
+                else_region: RegionNodeId(self.w2),
+                results: Span { start: self.w3, len: self.w4 },
             }),
-            TAG_NODE_ILOOP => Some(RegionNode::InvariantLoop {
-                init_vars: Span { start: self.w0, len: self.w1 },
-                state_vars: Span { start: self.w2, len: self.w3 },
-                cond: RegionNodeId(self.w4),
-                invariant_pred: RegionNodeId(self.w5),
-                fuel_measure: RegionNodeId(self.w6),
-                body: RegionNodeId(self.w7),
-            }),
+            TAG_NODE_BLOOP => {
+                let aux_i = self.w4 as usize;
+                if aux_i >= idx || aux_i >= pool.len() {
+                    return None;
+                }
+                let aux = pool[aux_i];
+                if aux.tag != TAG_NODE_AUX || aux.sub != 0 {
+                    return None;
+                }
+                Some(RegionNode::BoundedLoop {
+                    max_iters: self.w1,
+                    init_vars: Span { start: self.w2, len: self.w3 },
+                    state_vars: Span { start: aux.w0, len: aux.w1 },
+                    body: RegionNodeId(self.w0),
+                })
+            }
+            TAG_NODE_ILOOP => {
+                let aux_i = self.w4 as usize;
+                if aux_i >= idx || aux_i >= pool.len() {
+                    return None;
+                }
+                let aux = pool[aux_i];
+                if aux.tag != TAG_NODE_AUX || aux.sub != 1 {
+                    return None;
+                }
+                Some(RegionNode::InvariantLoop {
+                    init_vars: Span { start: aux.w0, len: aux.w1 },
+                    state_vars: Span { start: aux.w2, len: aux.w3 },
+                    cond: RegionNodeId(self.w0),
+                    invariant_pred: RegionNodeId(self.w1),
+                    fuel_measure: RegionNodeId(self.w2),
+                    body: RegionNodeId(self.w3),
+                })
+            }
             _ => None,
         }
     }
@@ -957,11 +989,11 @@ impl IrSlot {
                 })
             }
             EFF_MEM_COPY => Some(EffectOp::MemoryCopy {
-                dst_mem: MemId(self.w0 as u16),
-                src_mem: MemId(self.w1 as u16),
-                dst: ValId(self.w2),
-                src: ValId(self.w3),
-                len: ValId(self.w4),
+                dst_mem: MemId((self.w0 & 0xFFFF) as u16),
+                src_mem: MemId((self.w0 >> 16) as u16),
+                dst: ValId(self.w1),
+                src: ValId(self.w2),
+                len: ValId(self.w3),
             }),
             EFF_MEM_FILL => Some(EffectOp::MemoryFill {
                 mem: MemId(self.w0 as u16),
@@ -1034,17 +1066,22 @@ impl IrSlot {
                 (s.w3, s.w4) = shift_pair(s.w3, s.w4, offset);
             }
             TAG_NODE_BLOOP => {
-                (s.w1, s.w2) = shift_pair(s.w1, s.w2, offset);
-                (s.w3, s.w4) = shift_pair(s.w3, s.w4, offset);
-                s.w5 += offset;
-            }
-            TAG_NODE_ILOOP => {
-                (s.w0, s.w1) = shift_pair(s.w0, s.w1, offset);
+                s.w0 += offset;
                 (s.w2, s.w3) = shift_pair(s.w2, s.w3, offset);
                 s.w4 += offset;
-                s.w5 += offset;
-                s.w6 += offset;
-                s.w7 += offset;
+            }
+            TAG_NODE_ILOOP => {
+                s.w0 += offset;
+                s.w1 += offset;
+                s.w2 += offset;
+                s.w3 += offset;
+                s.w4 += offset;
+            }
+            TAG_NODE_AUX => {
+                (s.w0, s.w1) = shift_pair(s.w0, s.w1, offset);
+                if s.sub == 1 {
+                    (s.w2, s.w3) = shift_pair(s.w2, s.w3, offset);
+                }
             }
             TAG_STMT_REGION => {
                 (s.w0, s.w1) = shift_pair(s.w0, s.w1, offset);
@@ -1064,11 +1101,11 @@ impl IrSlot {
 }
 
 /// Inline capacity of `SlotPool` before spilling to heap `Vec<IrSlot>`.
-pub const SLOT_POOL_INLINE: usize = 10;
+pub const SLOT_POOL_INLINE: usize = 9;
 
-/// Small-vector arena storage for `IrSlot`s: stores up to 10 flat 36-byte
+/// Small-vector arena storage for `IrSlot`s: stores up to 9 flat 24-byte
 /// slots inline with zero heap allocation, spilling seamlessly to `Vec<IrSlot>`
-/// on the 11th+ slot.
+/// on the 10th+ slot.
 #[derive(Debug)]
 pub struct SlotPool {
     inline: [IrSlot; SLOT_POOL_INLINE],
@@ -1151,6 +1188,53 @@ impl SlotPool {
             self.inline_len += 1;
         } else {
             self.push_spill(slot);
+        }
+    }
+
+    pub fn push_node(&mut self, node: RegionNode) -> RegionNodeId {
+        match node {
+            RegionNode::Block(_) | RegionNode::IfElse { .. } => {
+                let id = RegionNodeId(self.len() as u32);
+                self.push(IrSlot::from_node_head(node));
+                id
+            }
+            RegionNode::BoundedLoop { max_iters, init_vars, state_vars, body } => {
+                let aux_id = self.len() as u32;
+                self.push(IrSlot::node_aux_bloop(state_vars));
+                let id = RegionNodeId(self.len() as u32);
+                let mut head = IrSlot::from_node_head(RegionNode::BoundedLoop {
+                    max_iters,
+                    init_vars,
+                    state_vars,
+                    body,
+                });
+                head.w4 = aux_id;
+                self.push(head);
+                id
+            }
+            RegionNode::InvariantLoop {
+                init_vars,
+                state_vars,
+                cond,
+                invariant_pred,
+                fuel_measure,
+                body,
+            } => {
+                let aux_id = self.len() as u32;
+                self.push(IrSlot::node_aux_iloop(init_vars, state_vars));
+                let id = RegionNodeId(self.len() as u32);
+                let mut head = IrSlot::from_node_head(RegionNode::InvariantLoop {
+                    init_vars,
+                    state_vars,
+                    cond,
+                    invariant_pred,
+                    fuel_measure,
+                    body,
+                });
+                head.w4 = aux_id;
+                self.push(head);
+                id
+            }
         }
     }
 
@@ -1365,7 +1449,15 @@ impl Region {
     ) -> Self {
         let t_len = if then_region.is_empty_block() { 0 } else { then_region.pool.len() };
         let e_len = if else_region.is_empty_block() { 0 } else { else_region.pool.len() };
-        let total = t_len + 1 + e_len + 1 + results.len();
+        let t_extra = usize::from(matches!(
+            then_region.root,
+            RegionNode::BoundedLoop { .. } | RegionNode::InvariantLoop { .. }
+        ));
+        let e_extra = usize::from(matches!(
+            else_region.root,
+            RegionNode::BoundedLoop { .. } | RegionNode::InvariantLoop { .. }
+        ));
+        let total = t_len + 1 + t_extra + e_len + 1 + e_extra + results.len();
         let mut pool = SlotPool::with_capacity(total);
 
         let then_node = if t_len == 0 {
@@ -1379,8 +1471,7 @@ impl Region {
             }
             then_region.root.shift(off)
         };
-        let then_id = RegionNodeId(pool.len() as u32);
-        pool.push(IrSlot::from_node(then_node));
+        let then_id = pool.push_node(then_node);
 
         let else_node = if e_len == 0 {
             RegionNode::Block(Span::EMPTY)
@@ -1393,8 +1484,7 @@ impl Region {
             }
             else_region.root.shift(off)
         };
-        let else_id = RegionNodeId(pool.len() as u32);
-        pool.push(IrSlot::from_node(else_node));
+        let else_id = pool.push_node(else_node);
 
         let res_span = if results.is_empty() {
             Span::EMPTY
@@ -1426,7 +1516,11 @@ impl Region {
         body: &Region,
     ) -> Self {
         let b_len = if body.is_empty_block() { 0 } else { body.pool.len() };
-        let total = init_vars.len() + state_vars.len() + b_len + 1;
+        let b_extra = usize::from(matches!(
+            body.root,
+            RegionNode::BoundedLoop { .. } | RegionNode::InvariantLoop { .. }
+        ));
+        let total = init_vars.len() + state_vars.len() + b_len + 1 + b_extra;
         let mut pool = SlotPool::with_capacity(total);
 
         let inits = if init_vars.is_empty() {
@@ -1462,8 +1556,7 @@ impl Region {
             }
             body.root.shift(off)
         };
-        let body_id = RegionNodeId(pool.len() as u32);
-        pool.push(IrSlot::from_node(body_node));
+        let body_id = pool.push_node(body_node);
 
         Self {
             root: RegionNode::BoundedLoop {
@@ -1484,20 +1577,41 @@ impl Region {
         fuel_measure: &Region,
         body: &Region,
     ) -> Self {
-        let subs = [cond, invariant_pred, fuel_measure, body];
         let sub_lens = [
             if cond.is_empty_block() { 0 } else { cond.pool.len() },
             if invariant_pred.is_empty_block() { 0 } else { invariant_pred.pool.len() },
             if fuel_measure.is_empty_block() { 0 } else { fuel_measure.pool.len() },
             if body.is_empty_block() { 0 } else { body.pool.len() },
         ];
+        let any_empty = sub_lens[0] == 0 || sub_lens[1] == 0 || sub_lens[2] == 0 || sub_lens[3] == 0;
+        let non_empty_nodes = usize::from(sub_lens[0] != 0)
+            + usize::from(sub_lens[1] != 0)
+            + usize::from(sub_lens[2] != 0)
+            + usize::from(sub_lens[3] != 0);
+        let loop_extra = |r: &Region, slen: usize| -> usize {
+            if slen != 0
+                && matches!(
+                    r.root,
+                    RegionNode::BoundedLoop { .. } | RegionNode::InvariantLoop { .. }
+                )
+            {
+                1
+            } else {
+                0
+            }
+        };
         let total = init_vars.len()
             + state_vars.len()
             + sub_lens[0]
             + sub_lens[1]
             + sub_lens[2]
             + sub_lens[3]
-            + 4;
+            + non_empty_nodes
+            + usize::from(any_empty)
+            + loop_extra(cond, sub_lens[0])
+            + loop_extra(invariant_pred, sub_lens[1])
+            + loop_extra(fuel_measure, sub_lens[2])
+            + loop_extra(body, sub_lens[3]);
         let mut pool = SlotPool::with_capacity(total);
 
         let inits = if init_vars.is_empty() {
@@ -1523,26 +1637,28 @@ impl Region {
             Span { start, len: state_vars.len() as u32 }
         };
 
-        let mut push_sub = |sub: &Region, slen: usize| -> RegionNodeId {
-            let node = if slen == 0 {
-                RegionNode::Block(Span::EMPTY)
-            } else {
-                let off = pool.len() as u32;
-                let mut i = 0;
-                while i < slen {
-                    pool.push(sub.pool[i].shift(off));
-                    i += 1;
-                }
-                sub.root.shift(off)
-            };
-            let id = RegionNodeId(pool.len() as u32);
-            pool.push(IrSlot::from_node(node));
-            id
+        let shared_empty = if any_empty {
+            pool.push_node(RegionNode::Block(Span::EMPTY))
+        } else {
+            RegionNodeId(0)
         };
-        let cond_id = push_sub(subs[0], sub_lens[0]);
-        let inv_id = push_sub(subs[1], sub_lens[1]);
-        let fuel_id = push_sub(subs[2], sub_lens[2]);
-        let body_id = push_sub(subs[3], sub_lens[3]);
+        let mut push_sub = |sub: &Region, slen: usize| -> RegionNodeId {
+            if slen == 0 {
+                return shared_empty;
+            }
+            let off = pool.len() as u32;
+            let mut i = 0;
+            while i < slen {
+                pool.push(sub.pool[i].shift(off));
+                i += 1;
+            }
+            let node = sub.root.shift(off);
+            pool.push_node(node)
+        };
+        let cond_id = push_sub(cond, sub_lens[0]);
+        let inv_id = push_sub(invariant_pred, sub_lens[1]);
+        let fuel_id = push_sub(fuel_measure, sub_lens[2]);
+        let body_id = push_sub(body, sub_lens[3]);
 
         Self {
             root: RegionNode::InvariantLoop {
@@ -1558,15 +1674,18 @@ impl Region {
     }
 
     pub fn try_node(&self, id: RegionNodeId) -> Option<RegionNode> {
-        self.pool.get(id.0 as usize)?.to_node()
+        let idx = id.0 as usize;
+        let slice = self.pool.as_slice();
+        slice.get(idx)?.to_node_with_pool(idx, slice)
     }
 
     pub fn try_node_below(&self, id: RegionNodeId, limit: usize) -> Option<RegionNode> {
         let idx = id.0 as usize;
-        if idx >= limit || idx >= self.pool.len() {
+        let slice = self.pool.as_slice();
+        if idx >= limit || idx >= slice.len() {
             return None;
         }
-        self.pool[idx].to_node()
+        slice[idx].to_node_with_pool(idx, slice)
     }
 
     pub fn try_stmt_slot(&self, span: Span, idx: u32) -> Option<IrSlot> {
@@ -1975,9 +2094,7 @@ impl RegionBuilder {
     }
 
     pub fn alloc_node(&mut self, node: RegionNode) -> RegionNodeId {
-        let id = RegionNodeId(self.pool.len() as u32);
-        self.pool.push(IrSlot::from_node(node));
-        id
+        self.pool.push_node(node)
     }
 
     pub fn alloc_block(&mut self, stmts: &[Stmt]) -> RegionNodeId {

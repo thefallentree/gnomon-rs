@@ -544,6 +544,8 @@ enum FastRunner {
     I64x2ToI64(TypedFunc<(i64, i64), i64>),
     I64x3ToI64(TypedFunc<(i64, i64, i64), i64>),
     I32ToI64(TypedFunc<i32, i64>),
+    I32x2ToI64(TypedFunc<(i32, i32), i64>),
+    I32x3ToI64(TypedFunc<(i32, i32, i32), i64>),
     I64ToI32(TypedFunc<i64, i32>),
     I32I64ToI32(TypedFunc<(i32, i64), i32>),
     I64I32ToI32(TypedFunc<(i64, i32), i32>),
@@ -611,6 +613,8 @@ fn make_runner(store: &mut Store<()>, func: Func, sig: &FuncSig) -> FastRunner {
         ([I64, I64], [I64]) => func.typed::<(i64, i64), i64>(&mut *store).map(FastRunner::I64x2ToI64).unwrap_or(FastRunner::Generic(func)),
         ([I64, I64, I64], [I64]) => func.typed::<(i64, i64, i64), i64>(&mut *store).map(FastRunner::I64x3ToI64).unwrap_or(FastRunner::Generic(func)),
         ([I32], [I64]) => func.typed::<i32, i64>(&mut *store).map(FastRunner::I32ToI64).unwrap_or(FastRunner::Generic(func)),
+        ([I32, I32], [I64]) => func.typed::<(i32, i32), i64>(&mut *store).map(FastRunner::I32x2ToI64).unwrap_or(FastRunner::Generic(func)),
+        ([I32, I32, I32], [I64]) => func.typed::<(i32, i32, i32), i64>(&mut *store).map(FastRunner::I32x3ToI64).unwrap_or(FastRunner::Generic(func)),
         ([I64], [I32]) => func.typed::<i64, i32>(&mut *store).map(FastRunner::I64ToI32).unwrap_or(FastRunner::Generic(func)),
         ([I32, I64], [I32]) => func.typed::<(i32, i64), i32>(&mut *store).map(FastRunner::I32I64ToI32).unwrap_or(FastRunner::Generic(func)),
         ([I64, I32], [I32]) => func.typed::<(i64, i32), i32>(&mut *store).map(FastRunner::I64I32ToI32).unwrap_or(FastRunner::Generic(func)),
@@ -843,6 +847,22 @@ impl CompiledInstance {
                 .map(|r| out[0] = Val::I64(r)),
             FastRunner::I32ToI64(f) => f
                 .call(&mut self.store, args[0].as_i32().unwrap())
+                .map(|r| out[0] = Val::I64(r)),
+            FastRunner::I32x2ToI64(f) => f
+                .call(
+                    &mut self.store,
+                    (args[0].as_i32().unwrap(), args[1].as_i32().unwrap()),
+                )
+                .map(|r| out[0] = Val::I64(r)),
+            FastRunner::I32x3ToI64(f) => f
+                .call(
+                    &mut self.store,
+                    (
+                        args[0].as_i32().unwrap(),
+                        args[1].as_i32().unwrap(),
+                        args[2].as_i32().unwrap(),
+                    ),
+                )
                 .map(|r| out[0] = Val::I64(r)),
             FastRunner::I64ToI32(f) => f
                 .call(&mut self.store, args[0].as_i64().unwrap())

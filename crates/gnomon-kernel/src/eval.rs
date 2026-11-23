@@ -183,15 +183,32 @@ enum Flow {
     Return(SmallVals),
 }
 
+const ENV_INLINE: usize = 16;
+const ENV_UNDEF: u8 = 0;
+const ENV_I32: u8 = 1;
+const ENV_I64: u8 = 2;
+
 struct Env {
-    inline: [(ValId, Val); 16],
-    len: usize,
+    slot_val: [u64; ENV_INLINE],
+    slot_tag: [u8; ENV_INLINE],
+    trail_val: [u64; ENV_INLINE],
+    trail_meta: [u8; ENV_INLINE],
+    inline_len: usize,
+    total_len: usize,
     spill: Vec<(ValId, Val)>,
 }
 
 impl Env {
     fn with_cap(_cap: usize) -> Self {
-        Self { inline: [(ValId(0), Val::I32(0)); 16], len: 0, spill: Vec::new() }
+        Self {
+            slot_val: [0; ENV_INLINE],
+            slot_tag: [ENV_UNDEF; ENV_INLINE],
+            trail_val: [0; ENV_INLINE],
+            trail_meta: [0; ENV_INLINE],
+            inline_len: 0,
+            total_len: 0,
+            spill: Vec::new(),
+        }
     }
 
     fn from_bindings_cap(bindings: &[(ValId, Val)], extra: usize) -> Self {
@@ -205,14 +222,27 @@ impl Env {
     }
 
     fn len(&self) -> usize {
-        self.len
+        self.total_len
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn truncate_spill(&mut self, saved: usize) {
+        self.spill.truncate(saved.saturating_sub(self.inline_len));
     }
 
     fn truncate(&mut self, saved: usize) {
-        self.len = saved;
         if !self.spill.is_empty() {
-            self.spill.truncate(saved.saturating_sub(16));
+            self.truncate_spill(saved);
         }
+        while self.inline_len > saved {
+            self.inline_len -= 1;
+            let meta = self.trail_meta[self.inline_len];
+            let idx = (meta >> 4) as usize;
+            self.slot_tag[idx] = meta & 0x0f;
+            self.slot_val[idx] = self.trail_val[self.inline_len];
+        }
+        self.total_len = saved;
     }
 
     #[cold]
@@ -222,12 +252,21 @@ impl Env {
     }
 
     fn push(&mut self, id: ValId, val: Val) -> Result<(), TrapCode> {
-        if self.len < 16 {
-            self.inline[self.len] = (id, val);
+        let idx = id.0 as usize;
+        if self.spill.is_empty() && self.inline_len < ENV_INLINE && idx < ENV_INLINE {
+            let (tag, bits) = match val {
+                Val::I32(x) => (ENV_I32, x as u32 as u64),
+                Val::I64(x) => (ENV_I64, x as u64),
+            };
+            self.trail_meta[self.inline_len] = ((idx as u8) << 4) | self.slot_tag[idx];
+            self.trail_val[self.inline_len] = self.slot_val[idx];
+            self.slot_tag[idx] = tag;
+            self.slot_val[idx] = bits;
+            self.inline_len += 1;
         } else {
             self.push_spill(id, val);
         }
-        self.len += 1;
+        self.total_len += 1;
         Ok(())
     }
 
@@ -250,11 +289,12 @@ impl Env {
         {
             return Ok(v);
         }
-        let mut i = self.len.min(16);
-        while i > 0 {
-            i -= 1;
-            if self.inline[i].0 == id {
-                return Ok(self.inline[i].1);
+        let idx = id.0 as usize;
+        if idx < ENV_INLINE {
+            match self.slot_tag[idx] {
+                ENV_I32 => return Ok(Val::I32(self.slot_val[idx] as u32 as i32)),
+                ENV_I64 => return Ok(Val::I64(self.slot_val[idx] as i64)),
+                _ => {}
             }
         }
         Err(TrapCode::Unreachable)
@@ -730,7 +770,9 @@ fn eval_node(
                         allow_host,
                     )?
                 } else {
-                    let cond_node = cond_slot.to_node().ok_or(TrapCode::Unreachable)?;
+                    let cond_node = cond_slot
+                        .to_node_with_pool(cond_idx, reg.pool.as_slice())
+                        .ok_or(TrapCode::Unreachable)?;
                     eval_node(
                         module,
                         registry,
@@ -781,7 +823,9 @@ fn eval_node(
                         allow_host,
                     )?
                 } else {
-                    let body_node = body_slot.to_node().ok_or(TrapCode::Unreachable)?;
+                    let body_node = body_slot
+                        .to_node_with_pool(body_idx, reg.pool.as_slice())
+                        .ok_or(TrapCode::Unreachable)?;
                     eval_node(
                         module,
                         registry,

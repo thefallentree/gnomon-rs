@@ -222,12 +222,12 @@ fn check_node_slot_ro_o1(slot: IrSlot, limit: usize, slots: &[RoSlot]) -> bool {
             t < limit && e < limit && slots[t].ro && slots[e].ro
         }
         TAG_NODE_BLOOP => {
-            let b = slot.w5 as usize;
+            let b = slot.w0 as usize;
             b < limit && slots[b].ro
         }
         TAG_NODE_ILOOP => {
             let (c, i, f, b) =
-                (slot.w4 as usize, slot.w5 as usize, slot.w6 as usize, slot.w7 as usize);
+                (slot.w0 as usize, slot.w1 as usize, slot.w2 as usize, slot.w3 as usize);
             c < limit
                 && i < limit
                 && f < limit
@@ -307,7 +307,7 @@ pub(crate) fn validate_ro_upto(
     limit: usize,
     registry: Option<&StratumRegistry>,
 ) -> bool {
-    validate_ro_slot_upto(region, IrSlot::from_node(node), limit, registry)
+    validate_ro_slot_upto(region, IrSlot::from_node_head(node), limit, registry)
 }
 
 fn bump_id(v: ValId, m: &mut u32) {
@@ -354,12 +354,7 @@ pub(crate) fn max_val_id_in_region(region: &Region) -> u32 {
                     bump_id(ValId(slot.w1), &mut max);
                     bump_id(ValId(slot.w3), &mut max);
                 }
-                EFF_MEM_COPY => {
-                    bump_id(ValId(slot.w2), &mut max);
-                    bump_id(ValId(slot.w3), &mut max);
-                    bump_id(ValId(slot.w4), &mut max);
-                }
-                EFF_MEM_FILL => {
+                EFF_MEM_COPY | EFF_MEM_FILL => {
                     bump_id(ValId(slot.w1), &mut max);
                     bump_id(ValId(slot.w2), &mut max);
                     bump_id(ValId(slot.w3), &mut max);
@@ -457,7 +452,7 @@ fn compute_flow_o1(root_slot: IrSlot, limit: usize, slots: &[FlowSlot]) -> (Flow
             (m, m)
         }
         TAG_NODE_BLOOP => {
-            let b_i = root_slot.w5 as usize;
+            let b_i = root_slot.w0 as usize;
             if b_i >= limit {
                 return (FlowMask::BAD, FlowMask::BAD);
             }
@@ -467,10 +462,10 @@ fn compute_flow_o1(root_slot: IrSlot, limit: usize, slots: &[FlowSlot]) -> (Flow
         }
         TAG_NODE_ILOOP => {
             let (c_i, inv_i, f_i, b_i) = (
-                root_slot.w4 as usize,
-                root_slot.w5 as usize,
-                root_slot.w6 as usize,
-                root_slot.w7 as usize,
+                root_slot.w0 as usize,
+                root_slot.w1 as usize,
+                root_slot.w2 as usize,
+                root_slot.w3 as usize,
             );
             if c_i >= limit || inv_i >= limit || f_i >= limit || b_i >= limit {
                 return (FlowMask::BAD, FlowMask::BAD);
@@ -598,7 +593,7 @@ fn has_escaping_flow_upto(
     limit: usize,
     as_loop_body_root: bool,
 ) -> bool {
-    has_escaping_flow_slot_upto(region, IrSlot::from_node(node), limit, as_loop_body_root)
+    has_escaping_flow_slot_upto(region, IrSlot::from_node_head(node), limit, as_loop_body_root)
 }
 
 enum ScopeBuf {
@@ -709,9 +704,50 @@ impl ExactPool {
         }
     }
     fn alloc_node(&mut self, n: RegionNode) -> RegionNodeId {
-        let id = RegionNodeId(self.len as u32);
-        self.push(IrSlot::from_node(n));
-        id
+        match n {
+            RegionNode::Block(_) | RegionNode::IfElse { .. } => {
+                let id = RegionNodeId(self.len as u32);
+                self.push(IrSlot::from_node_head(n));
+                id
+            }
+            RegionNode::BoundedLoop { max_iters, init_vars, state_vars, body } => {
+                let aux_id = self.len as u32;
+                self.push(IrSlot::node_aux_bloop(state_vars));
+                let id = RegionNodeId(self.len as u32);
+                let mut head = IrSlot::from_node_head(RegionNode::BoundedLoop {
+                    max_iters,
+                    init_vars,
+                    state_vars,
+                    body,
+                });
+                head.w4 = aux_id;
+                self.push(head);
+                id
+            }
+            RegionNode::InvariantLoop {
+                init_vars,
+                state_vars,
+                cond,
+                invariant_pred,
+                fuel_measure,
+                body,
+            } => {
+                let aux_id = self.len as u32;
+                self.push(IrSlot::node_aux_iloop(init_vars, state_vars));
+                let id = RegionNodeId(self.len as u32);
+                let mut head = IrSlot::from_node_head(RegionNode::InvariantLoop {
+                    init_vars,
+                    state_vars,
+                    cond,
+                    invariant_pred,
+                    fuel_measure,
+                    body,
+                });
+                head.w4 = aux_id;
+                self.push(head);
+                id
+            }
+        }
     }
     fn alloc_stmts(&mut self, stmts: &[Stmt]) -> Span {
         if stmts.is_empty() {
@@ -1124,7 +1160,7 @@ fn remap_slot(
             return Region::yield_vals(&[mapped]);
         }
     }
-    let Some(root) = root_slot.to_node() else {
+    let Some(root) = root_slot.to_node_with_pool(limit, src.pool.as_slice()) else {
         return Region::empty();
     };
     remap_node(src, root, limit, initial_map, next_fresh, norm_root_continue)

@@ -198,17 +198,26 @@ fn check_law_digest(d: &[u8; 32]) -> Result<(), RegistryError> {
     if nz == 0 { Err(RegistryError::EmptyProofDigest) } else { Ok(()) }
 }
 
+const TENV_INLINE: usize = 16;
+const TENV_UNDEF: u8 = 0;
+const TENV_I32: u8 = 1;
+const TENV_I64: u8 = 2;
+
 struct TypeEnv {
-    inline: [(ValId, ValType); 16],
-    len: usize,
+    slot_tag: [u8; TENV_INLINE],
+    trail_meta: [u8; TENV_INLINE],
+    inline_len: usize,
+    total_len: usize,
     spill: Vec<(ValId, ValType)>,
 }
 
 impl TypeEnv {
     fn new(params: &[(ValId, ValType)]) -> Self {
         let mut env = Self {
-            inline: [(ValId(0), ValType::I32); 16],
-            len: 0,
+            slot_tag: [TENV_UNDEF; TENV_INLINE],
+            trail_meta: [0; TENV_INLINE],
+            inline_len: 0,
+            total_len: 0,
             spill: Vec::new(),
         };
         let mut i = 0;
@@ -220,21 +229,47 @@ impl TypeEnv {
     }
 
     fn len(&self) -> usize {
-        self.len
+        self.total_len
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn truncate_spill(&mut self, saved: usize) {
+        self.spill.truncate(saved.saturating_sub(self.inline_len));
     }
 
     fn truncate(&mut self, saved: usize) {
-        self.len = saved;
-        self.spill.truncate(saved.saturating_sub(16));
+        if !self.spill.is_empty() {
+            self.truncate_spill(saved);
+        }
+        while self.inline_len > saved {
+            self.inline_len -= 1;
+            let meta = self.trail_meta[self.inline_len];
+            self.slot_tag[(meta >> 4) as usize] = meta & 0x0f;
+        }
+        self.total_len = saved;
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn push_spill(&mut self, id: ValId, ty: ValType) {
+        self.spill.push((id, ty));
     }
 
     fn push(&mut self, id: ValId, ty: ValType) {
-        if self.len < 16 {
-            self.inline[self.len] = (id, ty);
+        let idx = id.0 as usize;
+        if self.spill.is_empty() && self.inline_len < TENV_INLINE && idx < TENV_INLINE {
+            let tag = match ty {
+                ValType::I32 => TENV_I32,
+                ValType::I64 => TENV_I64,
+            };
+            self.trail_meta[self.inline_len] = ((idx as u8) << 4) | self.slot_tag[idx];
+            self.slot_tag[idx] = tag;
+            self.inline_len += 1;
         } else {
-            self.spill.push((id, ty));
+            self.push_spill(id, ty);
         }
-        self.len += 1;
+        self.total_len += 1;
     }
 
     fn extend_vars(&mut self, reg: &Region, span: Span) -> Result<(), RegistryError> {
@@ -247,19 +282,31 @@ impl TypeEnv {
         Ok(())
     }
 
-    fn lookup(&self, id: ValId) -> Result<ValType, RegistryError> {
+    #[cold]
+    #[inline(never)]
+    fn lookup_spill(&self, id: ValId) -> Option<ValType> {
         let mut s = self.spill.len();
         while s > 0 {
             s -= 1;
             if self.spill[s].0 == id {
-                return Ok(self.spill[s].1);
+                return Some(self.spill[s].1);
             }
         }
-        let mut i = self.len.min(16);
-        while i > 0 {
-            i -= 1;
-            if self.inline[i].0 == id {
-                return Ok(self.inline[i].1);
+        None
+    }
+
+    fn lookup(&self, id: ValId) -> Result<ValType, RegistryError> {
+        if !self.spill.is_empty()
+            && let Some(ty) = self.lookup_spill(id)
+        {
+            return Ok(ty);
+        }
+        let idx = id.0 as usize;
+        if idx < TENV_INLINE {
+            match self.slot_tag[idx] {
+                TENV_I32 => return Ok(ValType::I32),
+                TENV_I64 => return Ok(ValType::I64),
+                _ => {}
             }
         }
         Err(RegistryError::UndefinedVal(id))

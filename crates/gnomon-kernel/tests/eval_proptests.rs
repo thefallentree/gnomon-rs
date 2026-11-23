@@ -671,7 +671,7 @@ fn test_adversarial_audit_regressions() {
 
 #[test]
 fn test_ir_slot_lossless_round_trip() {
-    assert_eq!(core::mem::size_of::<IrSlot>(), 36);
+    assert_eq!(core::mem::size_of::<IrSlot>(), 24);
     assert_eq!(core::mem::align_of::<IrSlot>(), 4);
 
     assert_eq!(IrSlot::val(ValId(42)).to_val(), Some(ValId(42)));
@@ -888,8 +888,29 @@ fn test_ir_slot_lossless_round_trip() {
         },
     ];
     for n in nodes {
-        assert_eq!(IrSlot::from_node(n).to_node(), Some(n));
+        let mut pool = SlotPool::new();
+        let id = pool.push_node(n);
+        let reg = Region { pool, root: n };
+        assert_eq!(reg.try_node(id), Some(n));
     }
+
+    // Exercise Env lexical shadowing across inline (<16) and spill (>=16) ValIds.
+    let m = Module::default();
+    let r = StratumRegistry::new();
+    let shadow_reg = Region::build(|b| {
+        b.push_let(ValId(0), ValType::I32, Op::ConstI32(10));
+        b.push_let(ValId(20), ValType::I64, Op::ConstI64(-7));
+        let inner = Region::build(|ib| {
+            ib.push_let(ValId(0), ValType::I64, Op::ConstI64(99));
+            ib.push_let(ValId(20), ValType::I32, Op::ConstI32(-3));
+            ib.push_yield(&[ValId(0), ValId(20)]);
+        });
+        b.push_subregion(&[(ValId(1), ValType::I64), (ValId(2), ValType::I32)], &inner);
+        b.push_yield(&[ValId(0), ValId(20), ValId(1), ValId(2)]);
+    });
+    let heap = HeapState::from_module(&m, 1000).unwrap();
+    let (vals, _) = eval_region(&m, &r, &shadow_reg, &[], heap).unwrap();
+    assert_eq!(vals, vec![Val::I32(10), Val::I64(-7), Val::I64(99), Val::I32(-3)]);
 }
 
 #[test]

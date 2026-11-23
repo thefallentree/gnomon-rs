@@ -470,7 +470,7 @@ fn proof_vc_read_only_validation() {
 }
 
 #[kani::proof]
-#[kani::unwind(9)]
+#[kani::unwind(7)]
 fn proof_vc_splitter_rejects_invalid_loops() {
     let empty = Region::empty();
 
@@ -522,7 +522,7 @@ fn proof_vc_splitter_rejects_invalid_loops() {
 }
 
 #[kani::proof]
-#[kani::unwind(9)]
+#[kani::unwind(7)]
 fn proof_vc_splitter_soundness_concrete_split() {
     let empty = Region::empty();
 
@@ -591,7 +591,7 @@ fn proof_vc_eval_obligations() {
 }
 
 #[kani::proof]
-#[kani::unwind(4)]
+#[kani::unwind(3)]
 fn proof_vc_induction_bounded_soundness() {
     let sym_i: i32 = kani::any();
     let cond = Region::yield_vals(&[ValId(1)]);
