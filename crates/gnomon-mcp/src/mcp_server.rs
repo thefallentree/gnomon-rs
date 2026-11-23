@@ -379,7 +379,7 @@ impl GnomonMcpServer {
 
     #[tool(
         name = "gnomon_check_goal",
-        description = "Check equivalence or loop-invariant VCs by running bounded egglog cancellation with proved Strata laws followed by residual Bitwuzla QF_ABV proving."
+        description = "Check equivalence or InvariantLoop VCs by running bounded egglog cancellation with proved Strata laws, sound Ackermann UF congruence CEGAR for shared pure-total Strata, and residual Bitwuzla QF_ABV proving."
     )]
     async fn gnomon_check_goal(
         &self,
@@ -468,7 +468,12 @@ impl ServerHandler for GnomonMcpServer {
     fn get_info(&self) -> ServerConfig {
         let mut info = ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
             .with_instructions(
-                "Gnomon deterministic Wasm verification, trace, and recursive Stratum abstraction server.",
+                "Gnomon deterministic wasm32 formal verification and recursive Stratum abstraction server. \
+                 Workflow: (1) gnomon_lift_check to lift .wasm/.ir, (2) gnomon_run_trace to inspect concrete outputs/traps/memory diffs, \
+                 (3) gnomon_define_op to decompose hard nonlinear/stateful tasks into Layer-k Strata, \
+                 (4) gnomon_prove_law to prove algebraic or unconditional MemoryFrame laws (Wasmtime -> Bitwuzla QF_ABV -> kernel TCB), \
+                 (5) gnomon_check_goal to verify composite goals via egglog + Ackermann UF CEGAR + Bitwuzla (or 3-way InvariantLoop VC split), \
+                 (6) gnomon_consolidate to prune low-MDL ops (stitch_core) and redundant laws (<=3 egglog steps) into a compact AutoDoc.",
             );
         info.server_info = Implementation::new("gnomon", env!("CARGO_PKG_VERSION"));
         info
