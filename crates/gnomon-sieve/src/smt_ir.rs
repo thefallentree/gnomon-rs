@@ -1,11 +1,13 @@
 //! Shared `GnomonIR` -> `QF_ABV` symbolic execution and verification condition encoder.
 
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
+use std::rc::Rc;
 
 use gnomon_kernel::{
     BinOp, CallTarget, EffectOp, GlobalId, HostContract, MAX_CALL_DEPTH, MAX_WASM_PAGES, MemId,
-    MemWidth, Module, Op, Region, RegionNode, RegionRef, SliceBound, Span, Stmt, StratumRegistry,
-    TrapCode, UnOp, Val, ValId, ValType, VcObligation, WASM_PAGE_SIZE,
+    MemWidth, Module, Op, Region, RegionNode, RegionRef, SliceBound, Span, Stmt, StratumId,
+    StratumRegistry, TrapCode, UnOp, Val, ValId, ValType, VcObligation, WASM_PAGE_SIZE,
     validate_read_only_with_registry,
 };
 
@@ -14,6 +16,91 @@ use crate::{SieveError, SmtModel, SmtResult};
 const MAX_CONST_MEM_OP_BYTES: usize = 1024;
 const MAX_SYM_MEM_OP_BYTES: usize = 64;
 const MAX_SMT_LOOP_UNROLL: u32 = 64;
+const MAX_UF_CALLS_PER_STRATUM: usize = 64;
+
+/// Shared Ackermann Uninterpreted-Function (UF) congruence table for pure-total Strata.
+///
+/// Soundness: every `StratumId` in `abstract_strata` is statically verified to be pure,
+/// state-independent, deterministic, and trap-free (`is_pure_total_stratum`). Therefore
+/// the concrete function satisfies all Ackermann congruence axioms; an `UNSAT` result under
+/// UF abstraction strictly implies `UNSAT` under exact Layer-0 inlining. A `SAT` result may
+/// be spurious and triggers exact concrete Layer-0 fallback (CEGAR).
+type UfCallRecord<T> = (Vec<SymVal<T>>, Vec<SymVal<T>>);
+
+struct UfTable<T> {
+    abstract_strata: BTreeSet<StratumId>,
+    prefix: String,
+    next_id: u32,
+    calls: BTreeMap<StratumId, Vec<UfCallRecord<T>>>,
+    overflow: bool,
+}
+
+impl<T: Clone> UfTable<T> {
+    fn new(abstract_strata: BTreeSet<StratumId>, prefix: String) -> Rc<RefCell<Self>> {
+        Rc::new(RefCell::new(Self {
+            abstract_strata,
+            prefix,
+            next_id: 0,
+            calls: BTreeMap::new(),
+            overflow: false,
+        }))
+    }
+
+    fn apply<B: SmtTarget<Term = T>>(
+        &mut self,
+        b: &mut B,
+        sid: StratumId,
+        args: &[SymVal<T>],
+        result_tys: &[ValType],
+    ) -> Vec<SymVal<T>> {
+        let cid = self.next_id;
+        self.next_id += 1;
+        let outs: Vec<SymVal<T>> = result_tys
+            .iter()
+            .enumerate()
+            .map(|(r, &ty)| SymVal {
+                ty,
+                term: b.fresh_bv(&format!("{}_uf_{}_{}_{}", self.prefix, sid.0, cid, r), bits_of(ty)),
+                konst: None,
+            })
+            .collect();
+        let entry = self.calls.entry(sid).or_default();
+        if entry.len() >= MAX_UF_CALLS_PER_STRATUM {
+            self.overflow = true;
+        } else {
+            entry.push((args.to_vec(), outs.clone()));
+        }
+        outs
+    }
+
+    fn assert_congruence_axioms<B: SmtTarget<Term = T>>(&self, b: &mut B) -> Result<(), SieveError> {
+        for records in self.calls.values() {
+            for i in 0..records.len() {
+                for j in (i + 1)..records.len() {
+                    let (args_i, outs_i) = &records[i];
+                    let (args_j, outs_j) = &records[j];
+                    if args_i.len() != args_j.len() || outs_i.len() != outs_j.len() {
+                        continue;
+                    }
+                    let mut all_args_eq = SymBool::from_const(b, true);
+                    for (ai, aj) in args_i.iter().zip(args_j.iter()) {
+                        let eq_t = b.eq(&ai.term, &aj.term);
+                        all_args_eq = all_args_eq.and(b, &SymBool::symbolic(eq_t));
+                    }
+                    let mut all_outs_eq = SymBool::from_const(b, true);
+                    for (oi, oj) in outs_i.iter().zip(outs_j.iter()) {
+                        let eq_t = b.eq(&oi.term, &oj.term);
+                        all_outs_eq = all_outs_eq.and(b, &SymBool::symbolic(eq_t));
+                    }
+                    let not_args = all_args_eq.not(b);
+                    let axiom = not_args.or(b, &all_outs_eq);
+                    b.assert_formula(&axiom.term)?;
+                }
+            }
+        }
+        Ok(())
+    }
+}
 
 /// Deterministic 8-bit encoding of `TrapCode` (`0` means no trap).
 pub(crate) fn trap_code_byte(code: TrapCode) -> u8 {
@@ -202,6 +289,7 @@ struct ExecState<T> {
     globals: BTreeMap<GlobalId, GlobalSym<T>>,
     env: BTreeMap<ValId, SymVal<T>>,
     fresh_counter: u32,
+    uf_table: Option<Rc<RefCell<UfTable<T>>>>,
 }
 
 #[derive(Clone)]
@@ -358,6 +446,7 @@ impl<T: Clone> ExecState<T> {
             globals,
             env: BTreeMap::new(),
             fresh_counter: 0,
+            uf_table: None,
         })
     }
 
@@ -1672,7 +1761,16 @@ fn eval_block_stmts_raw<B: SmtTarget>(
                             state.trap_if(b, &active_before, TrapCode::Unreachable);
                             continue;
                         };
-                        eval_body(b, module, registry, state, &op.params, &op.results, &op.body, &arg_vals, depth + 1)?
+                        let use_uf = state.uf_table.as_ref().is_some_and(|rc| {
+                            rc.borrow().abstract_strata.contains(&sid)
+                        }) && arg_vals.len() == op.params.len()
+                            && arg_vals.iter().zip(&op.params).all(|(a, &(_, t))| a.ty == t);
+                        if use_uf {
+                            let rc = state.uf_table.as_ref().unwrap().clone();
+                            rc.borrow_mut().apply(b, sid, &arg_vals, &op.results)
+                        } else {
+                            eval_body(b, module, registry, state, &op.params, &op.results, &op.body, &arg_vals, depth + 1)?
+                        }
                     }
                     CallTarget::Host(hid) => {
                         let Some(hc) = module.host_contract(hid) else {
@@ -2413,6 +2511,141 @@ pub(crate) fn run_check_vc<B: SmtTarget>(
     solve_with_overflow_guard(b, &violated.term, &overflow, &param_syms, &mem_extractions)
 }
 
+fn is_pure_total_region(r: RegionRef<'_>, registry: &StratumRegistry, depth: u32) -> bool {
+    if depth > MAX_CALL_DEPTH {
+        return false;
+    }
+    match r.node {
+        RegionNode::Block(span) => {
+            for i in 0..span.len {
+                let Some(stmt) = r.region.try_stmt(span, i) else {
+                    return false;
+                };
+                match stmt {
+                    Stmt::Let { op, .. } => match op {
+                        Op::ConstI32(_)
+                        | Op::ConstI64(_)
+                        | Op::Copy(_)
+                        | Op::Un(_, _)
+                        | Op::Select { .. } => {}
+                        Op::Bin(b, _, _) => {
+                            if matches!(
+                                b,
+                                BinOp::I32DivS
+                                    | BinOp::I32DivU
+                                    | BinOp::I32RemS
+                                    | BinOp::I32RemU
+                                    | BinOp::I64DivS
+                                    | BinOp::I64DivU
+                                    | BinOp::I64RemS
+                                    | BinOp::I64RemU
+                            ) {
+                                return false;
+                            }
+                        }
+                        Op::Load { .. }
+                        | Op::GlobalGet(_)
+                        | Op::MemorySize(_)
+                        | Op::MemoryGrow { .. } => return false,
+                    },
+                    Stmt::Effect(EffectOp::Nop) => {}
+                    Stmt::Effect(_) => return false,
+                    Stmt::Call { target: CallTarget::Stratum(callee), .. } => {
+                        if !is_pure_total_stratum(callee, registry, depth + 1) {
+                            return false;
+                        }
+                    }
+                    Stmt::Call { .. } => return false,
+                    Stmt::Region { region, .. } => {
+                        let Some(sub) = r.child(region) else {
+                            return false;
+                        };
+                        if !is_pure_total_region(sub, registry, depth + 1) {
+                            return false;
+                        }
+                    }
+                    Stmt::Yield(_) | Stmt::Return(_) | Stmt::Break { .. } | Stmt::Continue { .. } => {}
+                }
+            }
+            true
+        }
+        RegionNode::IfElse { then_region, else_region, .. } => {
+            r.child(then_region).is_some_and(|s| is_pure_total_region(s, registry, depth + 1))
+                && r.child(else_region).is_some_and(|s| is_pure_total_region(s, registry, depth + 1))
+        }
+        RegionNode::BoundedLoop { max_iters, body, .. } => {
+            max_iters <= MAX_SMT_LOOP_UNROLL
+                && r.child(body).is_some_and(|s| is_pure_total_region(s, registry, depth + 1))
+        }
+        RegionNode::InvariantLoop { .. } => false,
+    }
+}
+
+fn is_pure_total_stratum(sid: StratumId, registry: &StratumRegistry, depth: u32) -> bool {
+    if depth > MAX_CALL_DEPTH {
+        return false;
+    }
+    let Some(op) = registry.get_op(sid) else {
+        return false;
+    };
+    if op.results.is_empty() {
+        return false;
+    }
+    is_pure_total_region(op.body.as_ref(), registry, depth + 1)
+}
+
+fn collect_pure_total_strata(region: &Region, registry: &StratumRegistry, out: &mut BTreeSet<StratumId>) {
+    fn walk(r: RegionRef<'_>, registry: &StratumRegistry, out: &mut BTreeSet<StratumId>, depth: u32) {
+        if depth > MAX_CALL_DEPTH {
+            return;
+        }
+        match r.node {
+            RegionNode::Block(span) => {
+                for i in 0..span.len {
+                    if let Some(stmt) = r.region.try_stmt(span, i) {
+                        match stmt {
+                            Stmt::Call { target: CallTarget::Stratum(sid), .. } => {
+                                if is_pure_total_stratum(sid, registry, 0) {
+                                    out.insert(sid);
+                                } else if let Some(op) = registry.get_op(sid) {
+                                    walk(op.body.as_ref(), registry, out, depth + 1);
+                                }
+                            }
+                            Stmt::Region { region, .. } => {
+                                if let Some(sub) = r.child(region) {
+                                    walk(sub, registry, out, depth + 1);
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            RegionNode::IfElse { then_region, else_region, .. } => {
+                if let Some(s) = r.child(then_region) {
+                    walk(s, registry, out, depth + 1);
+                }
+                if let Some(s) = r.child(else_region) {
+                    walk(s, registry, out, depth + 1);
+                }
+            }
+            RegionNode::BoundedLoop { body, .. } => {
+                if let Some(s) = r.child(body) {
+                    walk(s, registry, out, depth + 1);
+                }
+            }
+            RegionNode::InvariantLoop { cond, invariant_pred, fuel_measure, body, .. } => {
+                for id in [cond, invariant_pred, fuel_measure, body] {
+                    if let Some(s) = r.child(id) {
+                        walk(s, registry, out, depth + 1);
+                    }
+                }
+            }
+        }
+    }
+    walk(region.as_ref(), registry, out, 0);
+}
+
 pub(crate) fn run_check_equivalence<B: SmtTarget>(
     b: &mut B,
     module: &Module,
@@ -2422,8 +2655,52 @@ pub(crate) fn run_check_equivalence<B: SmtTarget>(
     precondition: Option<&Region>,
     query_prefix: &str,
 ) -> Result<SmtResult, SieveError> {
+    // Stage 2a (CEGAR): if LHS and RHS share pure-total Strata, attempt a fast UF congruence
+    // pass first. If UNSAT, equivalence is 100% proved without bit-blasting the Stratum bodies;
+    // if SAT or Unknown (possibly spurious), pop and fall back to exact Layer-0 inlining.
+    let mut lhs_pure = BTreeSet::new();
+    let mut rhs_pure = BTreeSet::new();
+    collect_pure_total_strata(lhs, registry, &mut lhs_pure);
+    collect_pure_total_strata(rhs, registry, &mut rhs_pure);
+    let shared_uf: BTreeSet<StratumId> = lhs_pure.intersection(&rhs_pure).copied().collect();
+
+    if !shared_uf.is_empty() {
+        b.push()?;
+        let uf_prefix = format!("{query_prefix}_uf");
+        let uf_res = run_check_equivalence_inner(
+            b,
+            module,
+            registry,
+            lhs,
+            rhs,
+            precondition,
+            &uf_prefix,
+            Some(shared_uf),
+        );
+        b.pop()?;
+        if let Ok(SmtResult::Unsat) = uf_res {
+            return Ok(SmtResult::Unsat);
+        }
+    }
+
+    run_check_equivalence_inner(b, module, registry, lhs, rhs, precondition, query_prefix, None)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_check_equivalence_inner<B: SmtTarget>(
+    b: &mut B,
+    module: &Module,
+    registry: &StratumRegistry,
+    lhs: &Region,
+    rhs: &Region,
+    precondition: Option<&Region>,
+    query_prefix: &str,
+    uf_strata: Option<BTreeSet<StratumId>>,
+) -> Result<SmtResult, SieveError> {
     let params = infer_equiv_params(module, registry, lhs, rhs, precondition)?;
     let mut base_state = ExecState::from_module(b, module, query_prefix)?;
+    let uf_table = uf_strata.map(|set| UfTable::new(set, query_prefix.to_string()));
+    base_state.uf_table = uf_table.clone();
     let mut param_syms = Vec::with_capacity(params.len());
     for &(id, ty) in &params {
         let term = b.fresh_bv(&format!("{query_prefix}_v_{}", id.0), bits_of(ty));
@@ -2553,6 +2830,14 @@ pub(crate) fn run_check_equivalence<B: SmtTarget>(
         .iter()
         .map(|o| MemExtraction { id: o.id, mem: &o.mem, witness: o.witness.clone() })
         .collect();
+
+    if let Some(ref rc) = uf_table {
+        let tbl = rc.borrow();
+        if tbl.overflow {
+            return Ok(SmtResult::Unknown("uf call cap exceeded".into()));
+        }
+        tbl.assert_congruence_axioms(b)?;
+    }
 
     solve_with_overflow_guard(b, &diff.term, &overflow, &param_syms, &refs)
 }

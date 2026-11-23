@@ -1134,3 +1134,102 @@ fn test_adversarial_sieve_soundness_regressions() {
         SmtResult::Unsat
     );
 }
+
+#[test]
+fn test_uf_congruence_cegar_soundness_and_speed() {
+    // Pure-total 64-bit nonlinear mixer Stratum (MurmurHash3 fmix64).
+    let module = Module::default();
+    let mut reg = StratumRegistry::new();
+    let fmix_body = Region::build(|b| {
+        b.push_let(ValId(1), ValType::I64, Op::ConstI64(33));
+        b.push_let(ValId(2), ValType::I64, Op::Bin(BinOp::I64ShrU, ValId(0), ValId(1)));
+        b.push_let(ValId(3), ValType::I64, Op::Bin(BinOp::I64Xor, ValId(0), ValId(2)));
+        b.push_let(ValId(4), ValType::I64, Op::ConstI64(0xff51_afd7_ed55_8ccdu64 as i64));
+        b.push_let(ValId(5), ValType::I64, Op::Bin(BinOp::I64Mul, ValId(3), ValId(4)));
+        b.push_let(ValId(6), ValType::I64, Op::Bin(BinOp::I64ShrU, ValId(5), ValId(1)));
+        b.push_let(ValId(7), ValType::I64, Op::Bin(BinOp::I64Xor, ValId(5), ValId(6)));
+        b.push_let(ValId(8), ValType::I64, Op::ConstI64(0xc4ce_b9fe_1a85_ec53u64 as i64));
+        b.push_let(ValId(9), ValType::I64, Op::Bin(BinOp::I64Mul, ValId(7), ValId(8)));
+        b.push_let(ValId(10), ValType::I64, Op::Bin(BinOp::I64ShrU, ValId(9), ValId(1)));
+        b.push_let(ValId(11), ValType::I64, Op::Bin(BinOp::I64Xor, ValId(9), ValId(10)));
+        b.push_yield(&[ValId(11)]);
+    });
+    let fmix_call = Region::build(|b| {
+        b.push_call(&[(ValId(1), ValType::I64)], CallTarget::Stratum(StratumId(70)), &[ValId(0)]);
+        b.push_yield(&[ValId(1)]);
+    });
+    reg.promote_stratum(Stratum {
+        op: StratumOp {
+            id: StratumId(70),
+            name: "fmix64_cegar".into(),
+            layer: 1,
+            params: vec![(ValId(0), ValType::I64)],
+            results: vec![ValType::I64],
+            body: fmix_body,
+            docstring: "Nonlinear 64-bit mixer".into(),
+        },
+        laws: LawList::single(Law {
+            name: "fmix64_refl".into(),
+            kind: LawKind::Algebraic,
+            params: vec![(ValId(0), ValType::I64)],
+            precondition: Region::empty(),
+            lhs: fmix_call.clone(),
+            rhs: fmix_call,
+            proof_digest: [0x70; 32],
+        }),
+    })
+    .unwrap();
+
+    // 1. True equivalence with nontrivial algebraic input difference:
+    //    fmix64^4((x << 1) + x + y) == fmix64^4(x * 3 + y)
+    let lhs = Region::build(|b| {
+        b.push_let(ValId(2), ValType::I64, Op::ConstI64(1));
+        b.push_let(ValId(3), ValType::I64, Op::Bin(BinOp::I64Shl, ValId(0), ValId(2)));
+        b.push_let(ValId(4), ValType::I64, Op::Bin(BinOp::I64Add, ValId(3), ValId(0)));
+        b.push_let(ValId(5), ValType::I64, Op::Bin(BinOp::I64Add, ValId(4), ValId(1)));
+        let mut cur = ValId(5);
+        for nid in 10u32..14 {
+            b.push_call(&[(ValId(nid), ValType::I64)], CallTarget::Stratum(StratumId(70)), &[cur]);
+            cur = ValId(nid);
+        }
+        b.push_yield(&[cur]);
+    });
+    let rhs = Region::build(|b| {
+        b.push_let(ValId(2), ValType::I64, Op::ConstI64(3));
+        b.push_let(ValId(3), ValType::I64, Op::Bin(BinOp::I64Mul, ValId(0), ValId(2)));
+        b.push_let(ValId(4), ValType::I64, Op::Bin(BinOp::I64Add, ValId(3), ValId(1)));
+        let mut cur = ValId(4);
+        for nid in 10u32..14 {
+            b.push_call(&[(ValId(nid), ValType::I64)], CallTarget::Stratum(StratumId(70)), &[cur]);
+            cur = ValId(nid);
+        }
+        b.push_yield(&[cur]);
+    });
+
+    // Both native and pipe backends must prove UNSAT quickly via UF congruence CEGAR!
+    let mut native = BitwuzlaNativeBackend::with_time_limit_ms(5_000);
+    assert_eq!(native.check_equivalence(&module, &reg, &lhs, &rhs, None).unwrap(), SmtResult::Unsat);
+    let mut pipe = BitwuzlaPipeBackend::new().unwrap();
+    assert_eq!(pipe.check_equivalence(&module, &reg, &lhs, &rhs, None).unwrap(), SmtResult::Unsat);
+
+    // 2. Soundness check: injecting a 1-bit bug (x * 3 + y + 1) MUST fall back to concrete
+    //    and return a real SAT counterexample verified in gnomon-kernel!
+    let buggy = Region::build(|b| {
+        b.push_let(ValId(2), ValType::I64, Op::ConstI64(3));
+        b.push_let(ValId(3), ValType::I64, Op::Bin(BinOp::I64Mul, ValId(0), ValId(2)));
+        b.push_let(ValId(4), ValType::I64, Op::Bin(BinOp::I64Add, ValId(3), ValId(1)));
+        b.push_let(ValId(5), ValType::I64, Op::ConstI64(1));
+        b.push_let(ValId(6), ValType::I64, Op::Bin(BinOp::I64Add, ValId(4), ValId(5)));
+        b.push_call(&[(ValId(10), ValType::I64)], CallTarget::Stratum(StratumId(70)), &[ValId(6)]);
+        b.push_yield(&[ValId(10)]);
+    });
+    let ok_1 = Region::build(|b| {
+        b.push_let(ValId(2), ValType::I64, Op::ConstI64(3));
+        b.push_let(ValId(3), ValType::I64, Op::Bin(BinOp::I64Mul, ValId(0), ValId(2)));
+        b.push_let(ValId(4), ValType::I64, Op::Bin(BinOp::I64Add, ValId(3), ValId(1)));
+        b.push_call(&[(ValId(10), ValType::I64)], CallTarget::Stratum(StratumId(70)), &[ValId(4)]);
+        b.push_yield(&[ValId(10)]);
+    });
+    let sat_res = native.check_equivalence(&module, &reg, &buggy, &ok_1, None).unwrap();
+    assert!(matches!(sat_res, SmtResult::Sat(_)), "expected concrete SAT counterexample, got {sat_res:?}");
+}
