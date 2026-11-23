@@ -33,7 +33,8 @@ impl From<CliInputType> for InputType {
 #[command(
     name = "gnomon",
     version,
-    about = "Gnomon deterministic Wasm verification, sieve, CLI, and MCP server"
+    about = "Gnomon deterministic Wasm verification, sieve, CLI, and MCP server",
+    after_help = "Exit codes:\n  0  Success / PROVED / OK\n  1  FALSIFIED / TRAP / UNKNOWN\n  2  CLI, I/O, parse, or TCB admission error\n\nRun `gnomon schema` to print a concise `.ir` JSON reference for regions, ops, and stratum calls."
 )]
 struct Cli {
     /// Input type for .wasm / .ir / stdin payloads (`auto`, `wasm`, `ir`).
@@ -166,6 +167,9 @@ enum Commands {
 
     /// Start the single Gnomon MCP server over stdio (rmcp + tokio).
     Mcp,
+
+    /// Print a compact `.ir` JSON schema & examples (regions, ops, stratum calls, loops).
+    Schema,
 }
 
 fn load_cli_artifact(
@@ -176,9 +180,52 @@ fn load_cli_artifact(
     load_artifact_bytes(&bytes, kind, resolved_path)
 }
 
+fn parse_cli_inputs(raw: &str) -> Result<Vec<IrVal>, GnomonError> {
+    if let Ok(vals) = serde_json::from_str::<Vec<IrVal>>(raw) {
+        return Ok(vals);
+    }
+    // Also accept `check-goal` / `prove-law` counterexample `[[param_id, {"ty":...,"val":...}]]` shape!
+    if let Ok(mut pairs) = serde_json::from_str::<Vec<(u32, IrVal)>>(raw) {
+        pairs.sort_by_key(|(id, _)| *id);
+        return Ok(pairs.into_iter().map(|(_, v)| v).collect());
+    }
+    Err(GnomonError::InvalidInput(
+        "invalid --inputs JSON (expected [{\"ty\":\"i32\",\"val\":1}] or [[0,{\"ty\":\"i32\",\"val\":1}]])".into(),
+    ))
+}
+
+const IR_SCHEMA_DOC: &str = r#"{
+  "doc": "Gnomon .ir JSON wire format (pass via file or stdin with -t ir or -t auto)",
+  "region_example": {
+    "kind": "region",
+    "params": [{"id": 0, "ty": "i32"}, {"id": 1, "ty": "i32"}],
+    "results": ["i32"],
+    "region": {
+      "node": "block",
+      "stmts": [
+        {"stmt": "let", "dst": 2, "ty": "i32", "op": {"op": "const_i32", "val": 1}},
+        {"stmt": "let", "dst": 3, "ty": "i32", "op": {"op": "bin", "binop": "i32_add", "lhs": 0, "rhs": 2}},
+        {"stmt": "call", "results": [{"id": 4, "ty": "i32"}], "target": {"kind": "stratum", "id": 1}, "args": [3, 1]},
+        {"stmt": "yield", "vals": [4]}
+      ]
+    }
+  },
+  "nodes": ["block { stmts }", "if_else { cond, then_region, else_region, results }", "bounded_loop { max_iters, init_vars, state_vars, body }", "invariant_loop { init_vars, state_vars, cond, invariant_pred, fuel_measure, body }"],
+  "stmts": ["let { dst, ty, op }", "effect { effect }", "region { results, region }", "call { results, target: {kind: func|host|stratum, id}, args }", "yield { vals }", "break { depth, cond?, values }", "continue { depth, cond?, values }", "return { vals }"],
+  "ops": ["const_i32 { val }", "const_i64 { val }", "copy { src }", "un { unop, arg }", "bin { binop, lhs, rhs }", "select { cond, true_val, false_val }", "load { mem, addr, offset, width: b1|b2|b4|b8, signed, result_ty }", "global_get { id }", "memory_size { mem }", "memory_grow { mem, delta }"],
+  "effects": ["store { mem, addr, offset, width, val }", "memory_copy { dst_mem, src_mem, dst, src, len }", "memory_fill { mem, dst, val, len }", "global_set { id, val }", "trap { code }", "nop"],
+  "binops_i32": ["i32_eq","i32_ne","i32_lt_s","i32_lt_u","i32_gt_s","i32_gt_u","i32_le_s","i32_le_u","i32_ge_s","i32_ge_u","i32_add","i32_sub","i32_mul","i32_div_s","i32_div_u","i32_rem_s","i32_rem_u","i32_and","i32_or","i32_xor","i32_shl","i32_shr_s","i32_shr_u","i32_rotl","i32_rotr"],
+  "binops_i64": ["i64_eq","i64_ne","i64_lt_s","i64_lt_u","i64_gt_s","i64_gt_u","i64_le_s","i64_le_u","i64_ge_s","i64_ge_u","i64_add","i64_sub","i64_mul","i64_div_s","i64_div_u","i64_rem_s","i64_rem_u","i64_and","i64_or","i64_xor","i64_shl","i64_shr_s","i64_shr_u","i64_rotl","i64_rotr"],
+  "unops": ["i32_eqz","i64_eqz","i32_clz","i32_ctz","i32_popcnt","i64_clz","i64_ctz","i64_popcnt","i32_wrap_i64","i64_extend_i32_s","i64_extend_i32_u","i32_extend8_s","i32_extend16_s","i64_extend8_s","i64_extend16_s","i64_extend32_s"]
+}"#;
+
 fn run(cli: Cli) -> Result<bool, GnomonError> {
     let input_type: InputType = cli.input_type.into();
     match cli.command {
+        Commands::Schema => {
+            println!("{IR_SCHEMA_DOC}");
+            Ok(true)
+        }
         Commands::Mcp => {
             let server = GnomonMcpServer::new(cli.state)?;
             let rt = tokio::runtime::Builder::new_multi_thread()
@@ -217,8 +264,7 @@ fn run(cli: Cli) -> Result<bool, GnomonError> {
                 Some(p) => GnomonEngine::load_state_file(p)?,
                 None => GnomonEngine::new(),
             };
-            let parsed_inputs: Vec<IrVal> = serde_json::from_str(&inputs)
-                .map_err(|e| GnomonError::InvalidInput(format!("invalid --inputs JSON: {e}")))?;
+            let parsed_inputs = parse_cli_inputs(&inputs)?;
             let art_override = if input.is_none()
                 && std::io::stdin().is_terminal()
                 && eng.active_module.is_some()

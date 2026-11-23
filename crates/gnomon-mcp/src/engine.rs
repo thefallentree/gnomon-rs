@@ -627,6 +627,7 @@ impl GnomonEngine {
                 }
             }
             self.verified_solutions.push(candidate.clone());
+            dedup_preserve_order(&mut all_laws_fired);
             return Ok(CheckGoalOutput {
                 status: "PROVED".into(),
                 laws_fired: all_laws_fired,
@@ -648,6 +649,7 @@ impl GnomonEngine {
             .map_err(|e| GnomonError::Sieve(e.to_string()))?;
         let mut laws_fired = rep_cand.laws_fired;
         laws_fired.extend(rep_spec.laws_fired);
+        dedup_preserve_order(&mut laws_fired);
 
         let nodes_before = rep_cand.nodes_before + rep_spec.nodes_before;
         let nodes_after = rep_cand.nodes_after + rep_spec.nodes_after;
@@ -1247,6 +1249,11 @@ fn compute_law_digest(
         out[0] = 1;
     }
     out
+}
+
+fn dedup_preserve_order(items: &mut Vec<String>) {
+    let mut seen = std::collections::HashSet::new();
+    items.retain(|x| seen.insert(x.clone()));
 }
 
 fn hex_encode(bytes: &[u8]) -> String {
