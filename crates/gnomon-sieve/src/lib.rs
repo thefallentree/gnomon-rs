@@ -5,11 +5,17 @@
 
 use gnomon_kernel::{MemId, Module, Region, StratumRegistry, Val, ValId, VcObligation};
 
+pub mod consolidate;
 pub mod eqsat;
 pub mod smt_bitwuzla;
 mod smt_ir;
 pub mod smt_pipe;
 
+pub use consolidate::{
+    ConsolidationConfig, ConsolidationReport, DiscoveredAbstraction, LawRedundancyReport,
+    OpMdlReport, consolidate_registry, discover_candidate_inventions, encode_region_as_stitch_expr,
+    render_autodoc,
+};
 pub use eqsat::EgglogSimplifier;
 pub use smt_bitwuzla::BitwuzlaNativeBackend;
 pub use smt_pipe::BitwuzlaPipeBackend;

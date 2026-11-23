@@ -4,10 +4,23 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[[bin]]
+name = "gnomon"
+path = "src/bin/gnomon.rs"
+
 [dependencies]
 gnomon-kernel.workspace = true
 gnomon-wasm.workspace = true
 gnomon-sieve.workspace = true
+rmcp = { version = "3.11.0", features = ["server", "macros", "transport-io"] }
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+schemars = "1"
+clap = { version = "4", features = ["derive"] }
+sha2 = "0.10"
+base64 = "0.22"
+thiserror.workspace = true
 
 [lints]
 workspace = true
