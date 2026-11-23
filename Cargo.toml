@@ -21,7 +21,7 @@ unused_workspace_dependencies = "allow"
 unused_dependencies = "allow"
 
 [workspace.metadata.kani]
-flags = { jobs = "8", output-format = "terse", no-assertion-reach-checks = true }
+flags = { jobs = "1" }
 
 [workspace.dependencies]
 gnomon-kernel = { path = "crates/gnomon-kernel" }

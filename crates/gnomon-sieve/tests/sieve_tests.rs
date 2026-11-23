@@ -1,6 +1,6 @@
 use gnomon_kernel::{
     BinOp, CallTarget, EffectOp, GlobalDef, GlobalId, HeapState, HostCallId, HostContract,
-    Law, LawKind, MemId, MemWidth, MemoryDef, Module, OffsetRange, Op, Region, SliceBound, Stmt,
+    Law, LawKind, LawList, MemId, MemWidth, MemoryDef, Module, OffsetRange, Op, Region, SliceBound,
     Stratum, StratumId, StratumOp, StratumRegistry, TrapCode, UnOp, Val, ValId, ValType,
     WASM_PAGE_SIZE, eval_region, split_invariant_loop,
 };
@@ -39,46 +39,46 @@ fn test_algebraic_equivalences_both_backends() {
     let reg = StratumRegistry::new();
 
     // 1. (a + b) * 2 == (a << 1) + (b << 1)
-    let lhs = Region::Block(vec![
-        Stmt::Let { dst: ValId(2), ty: ValType::I32, op: Op::Bin(BinOp::I32Add, ValId(0), ValId(1)) },
-        Stmt::Let { dst: ValId(3), ty: ValType::I32, op: Op::ConstI32(2) },
-        Stmt::Let { dst: ValId(4), ty: ValType::I32, op: Op::Bin(BinOp::I32Mul, ValId(2), ValId(3)) },
-        Stmt::Yield(vec![ValId(4)]),
-    ]);
-    let rhs = Region::Block(vec![
-        Stmt::Let { dst: ValId(10), ty: ValType::I32, op: Op::ConstI32(1) },
-        Stmt::Let { dst: ValId(11), ty: ValType::I32, op: Op::Bin(BinOp::I32Shl, ValId(0), ValId(10)) },
-        Stmt::Let { dst: ValId(12), ty: ValType::I32, op: Op::Bin(BinOp::I32Shl, ValId(1), ValId(10)) },
-        Stmt::Let { dst: ValId(13), ty: ValType::I32, op: Op::Bin(BinOp::I32Add, ValId(11), ValId(12)) },
-        Stmt::Yield(vec![ValId(13)]),
-    ]);
+    let lhs = Region::build(|b| {
+        b.push_let(ValId(2), ValType::I32, Op::Bin(BinOp::I32Add, ValId(0), ValId(1)));
+        b.push_let(ValId(3), ValType::I32, Op::ConstI32(2));
+        b.push_let(ValId(4), ValType::I32, Op::Bin(BinOp::I32Mul, ValId(2), ValId(3)));
+        b.push_yield(&[ValId(4)]);
+    });
+    let rhs = Region::build(|b| {
+        b.push_let(ValId(10), ValType::I32, Op::ConstI32(1));
+        b.push_let(ValId(11), ValType::I32, Op::Bin(BinOp::I32Shl, ValId(0), ValId(10)));
+        b.push_let(ValId(12), ValType::I32, Op::Bin(BinOp::I32Shl, ValId(1), ValId(10)));
+        b.push_let(ValId(13), ValType::I32, Op::Bin(BinOp::I32Add, ValId(11), ValId(12)));
+        b.push_yield(&[ValId(13)]);
+    });
 
     // 2. Masked shift & rotate identities: rotl(x, 35) == rotl(x, 3) and (x << 33) == (x << 1)
-    let rot_lhs = Region::Block(vec![
-        Stmt::Let { dst: ValId(1), ty: ValType::I64, op: Op::ConstI64(67) },
-        Stmt::Let { dst: ValId(2), ty: ValType::I64, op: Op::Bin(BinOp::I64Rotl, ValId(0), ValId(1)) },
-        Stmt::Let { dst: ValId(3), ty: ValType::I64, op: Op::ConstI64(65) },
-        Stmt::Let { dst: ValId(4), ty: ValType::I64, op: Op::Bin(BinOp::I64Shl, ValId(2), ValId(3)) },
-        Stmt::Yield(vec![ValId(4)]),
-    ]);
-    let rot_rhs = Region::Block(vec![
-        Stmt::Let { dst: ValId(1), ty: ValType::I64, op: Op::ConstI64(3) },
-        Stmt::Let { dst: ValId(2), ty: ValType::I64, op: Op::Bin(BinOp::I64Rotl, ValId(0), ValId(1)) },
-        Stmt::Let { dst: ValId(3), ty: ValType::I64, op: Op::ConstI64(1) },
-        Stmt::Let { dst: ValId(4), ty: ValType::I64, op: Op::Bin(BinOp::I64Shl, ValId(2), ValId(3)) },
-        Stmt::Yield(vec![ValId(4)]),
-    ]);
+    let rot_lhs = Region::build(|b| {
+        b.push_let(ValId(1), ValType::I64, Op::ConstI64(67));
+        b.push_let(ValId(2), ValType::I64, Op::Bin(BinOp::I64Rotl, ValId(0), ValId(1)));
+        b.push_let(ValId(3), ValType::I64, Op::ConstI64(65));
+        b.push_let(ValId(4), ValType::I64, Op::Bin(BinOp::I64Shl, ValId(2), ValId(3)));
+        b.push_yield(&[ValId(4)]);
+    });
+    let rot_rhs = Region::build(|b| {
+        b.push_let(ValId(1), ValType::I64, Op::ConstI64(3));
+        b.push_let(ValId(2), ValType::I64, Op::Bin(BinOp::I64Rotl, ValId(0), ValId(1)));
+        b.push_let(ValId(3), ValType::I64, Op::ConstI64(1));
+        b.push_let(ValId(4), ValType::I64, Op::Bin(BinOp::I64Shl, ValId(2), ValId(3)));
+        b.push_yield(&[ValId(4)]);
+    });
 
     // 3. rem_s(x, -1) == 0 with NO trap (even when x == i32::MIN!)
-    let rem_lhs = Region::Block(vec![
-        Stmt::Let { dst: ValId(1), ty: ValType::I32, op: Op::ConstI32(-1) },
-        Stmt::Let { dst: ValId(2), ty: ValType::I32, op: Op::Bin(BinOp::I32RemS, ValId(0), ValId(1)) },
-        Stmt::Yield(vec![ValId(2)]),
-    ]);
-    let rem_rhs = Region::Block(vec![
-        Stmt::Let { dst: ValId(1), ty: ValType::I32, op: Op::ConstI32(0) },
-        Stmt::Yield(vec![ValId(1)]),
-    ]);
+    let rem_lhs = Region::build(|b| {
+        b.push_let(ValId(1), ValType::I32, Op::ConstI32(-1));
+        b.push_let(ValId(2), ValType::I32, Op::Bin(BinOp::I32RemS, ValId(0), ValId(1)));
+        b.push_yield(&[ValId(2)]);
+    });
+    let rem_rhs = Region::build(|b| {
+        b.push_let(ValId(1), ValType::I32, Op::ConstI32(0));
+        b.push_yield(&[ValId(1)]);
+    });
 
     with_both_backends(|backend, name| {
         assert_eq!(
@@ -106,20 +106,20 @@ fn test_div_s_min_neg1_counterexample_both_backends() {
 
     // lhs = div_s(x, y), rhs = 0 - x (does NOT trap on (MIN, -1) or y == 0!)
     // Precondition: y == -1, so ONLY (MIN, -1) distinguishes lhs (IntOverflow trap) from rhs (returns MIN).
-    let pre = Region::Block(vec![
-        Stmt::Let { dst: ValId(10), ty: ValType::I32, op: Op::ConstI32(-1) },
-        Stmt::Let { dst: ValId(11), ty: ValType::I32, op: Op::Bin(BinOp::I32Eq, ValId(1), ValId(10)) },
-        Stmt::Yield(vec![ValId(11)]),
-    ]);
-    let lhs = Region::Block(vec![
-        Stmt::Let { dst: ValId(2), ty: ValType::I32, op: Op::Bin(BinOp::I32DivS, ValId(0), ValId(1)) },
-        Stmt::Yield(vec![ValId(2)]),
-    ]);
-    let rhs = Region::Block(vec![
-        Stmt::Let { dst: ValId(2), ty: ValType::I32, op: Op::ConstI32(0) },
-        Stmt::Let { dst: ValId(3), ty: ValType::I32, op: Op::Bin(BinOp::I32Sub, ValId(2), ValId(0)) },
-        Stmt::Yield(vec![ValId(3)]),
-    ]);
+    let pre = Region::build(|b| {
+        b.push_let(ValId(10), ValType::I32, Op::ConstI32(-1));
+        b.push_let(ValId(11), ValType::I32, Op::Bin(BinOp::I32Eq, ValId(1), ValId(10)));
+        b.push_yield(&[ValId(11)]);
+    });
+    let lhs = Region::build(|b| {
+        b.push_let(ValId(2), ValType::I32, Op::Bin(BinOp::I32DivS, ValId(0), ValId(1)));
+        b.push_yield(&[ValId(2)]);
+    });
+    let rhs = Region::build(|b| {
+        b.push_let(ValId(2), ValType::I32, Op::ConstI32(0));
+        b.push_let(ValId(3), ValType::I32, Op::Bin(BinOp::I32Sub, ValId(2), ValId(0)));
+        b.push_yield(&[ValId(3)]);
+    });
 
     with_both_backends(|backend, name| {
         let res = backend
@@ -156,16 +156,16 @@ fn test_signed_rem_bvsrem_not_bvsmod() {
     let reg = StratumRegistry::new();
 
     // (-7) % 3 == -1 in Wasm/bvsrem (whereas bvsmod would be +2).
-    let lhs = Region::Block(vec![
-        Stmt::Let { dst: ValId(0), ty: ValType::I32, op: Op::ConstI32(-7) },
-        Stmt::Let { dst: ValId(1), ty: ValType::I32, op: Op::ConstI32(3) },
-        Stmt::Let { dst: ValId(2), ty: ValType::I32, op: Op::Bin(BinOp::I32RemS, ValId(0), ValId(1)) },
-        Stmt::Yield(vec![ValId(2)]),
-    ]);
-    let rhs = Region::Block(vec![
-        Stmt::Let { dst: ValId(0), ty: ValType::I32, op: Op::ConstI32(-1) },
-        Stmt::Yield(vec![ValId(0)]),
-    ]);
+    let lhs = Region::build(|b| {
+        b.push_let(ValId(0), ValType::I32, Op::ConstI32(-7));
+        b.push_let(ValId(1), ValType::I32, Op::ConstI32(3));
+        b.push_let(ValId(2), ValType::I32, Op::Bin(BinOp::I32RemS, ValId(0), ValId(1)));
+        b.push_yield(&[ValId(2)]);
+    });
+    let rhs = Region::build(|b| {
+        b.push_let(ValId(0), ValType::I32, Op::ConstI32(-1));
+        b.push_yield(&[ValId(0)]);
+    });
 
     with_both_backends(|backend, name| {
         assert_eq!(
@@ -182,139 +182,119 @@ fn test_multi_memory_non_interference_and_witness() {
     let reg = StratumRegistry::new();
 
     // Non-interference: storing into MemId(0) at in-bounds addr does not change Load from MemId(1).
-    let pre = Region::Block(vec![
-        Stmt::Let { dst: ValId(10), ty: ValType::I32, op: Op::ConstI32(65_532) },
-        Stmt::Let { dst: ValId(11), ty: ValType::I32, op: Op::Bin(BinOp::I32LeU, ValId(0), ValId(10)) },
-        Stmt::Yield(vec![ValId(11)]),
-    ]);
-    let lhs = Region::Block(vec![
-        Stmt::Let { dst: ValId(5), ty: ValType::I32, op: Op::ConstI32(0x1234_5678) },
-        Stmt::Effect(EffectOp::Store {
+    let pre = Region::build(|b| {
+        b.push_let(ValId(10), ValType::I32, Op::ConstI32(65_532));
+        b.push_let(ValId(11), ValType::I32, Op::Bin(BinOp::I32LeU, ValId(0), ValId(10)));
+        b.push_yield(&[ValId(11)]);
+    });
+    let lhs = Region::build(|b| {
+        b.push_let(ValId(5), ValType::I32, Op::ConstI32(0x1234_5678));
+        b.push_effect(EffectOp::Store {
             mem: MemId(0),
             addr: ValId(0),
             offset: 0,
             width: MemWidth::B4,
             val: ValId(5),
-        }),
-        Stmt::Let {
-            dst: ValId(6),
-            ty: ValType::I32,
-            op: Op::Load {
+        });
+        b.push_let(ValId(6), ValType::I32, Op::Load {
                 mem: MemId(1),
                 addr: ValId(1),
                 offset: 0,
                 width: MemWidth::B4,
                 signed: false,
                 result_ty: ValType::I32,
-            },
-        },
-        Stmt::Yield(vec![ValId(6)]),
-    ]);
-    let rhs = Region::Block(vec![
-        Stmt::Let {
-            dst: ValId(5),
-            ty: ValType::I32,
-            op: Op::ConstI32(0x1234_5678),
-        },
-        Stmt::Effect(EffectOp::Store {
+            });
+        b.push_yield(&[ValId(6)]);
+    });
+    let rhs = Region::build(|b| {
+        b.push_let(ValId(5), ValType::I32, Op::ConstI32(0x1234_5678));
+        b.push_effect(EffectOp::Store {
             mem: MemId(0),
             addr: ValId(0),
             offset: 0,
             width: MemWidth::B4,
             val: ValId(5),
-        }),
-        Stmt::Let {
-            dst: ValId(6),
-            ty: ValType::I32,
-            op: Op::Load {
+        });
+        b.push_let(ValId(6), ValType::I32, Op::Load {
                 mem: MemId(1),
                 addr: ValId(1),
                 offset: 0,
                 width: MemWidth::B4,
                 signed: false,
                 result_ty: ValType::I32,
-            },
-        },
-        Stmt::Yield(vec![ValId(6)]),
-    ]);
+            });
+        b.push_yield(&[ValId(6)]);
+    });
 
     // Also test Load(MemId(1)) BEFORE vs AFTER Store(MemId(0)) when Store(MemId(0)) is in-bounds
     // (compare returned MemId(1) load value only, while MemId(0) differs -> wait: if MemId(0) IS
     // mutated in lhs and not in rhs, check_equivalence detects MemId(0) diff! So compare two
     // different stores to MemId(0) or same store, OR check a VC that asserts Load(1) == Load(1)!).
-    let same_store_diff_val_check_vc_lhs = Region::Block(vec![
-        Stmt::Let {
-            dst: ValId(6),
-            ty: ValType::I32,
-            op: Op::Load {
+    let same_store_diff_val_check_vc_lhs = Region::build(|b| {
+        b.push_let(ValId(6), ValType::I32, Op::Load {
                 mem: MemId(1),
                 addr: ValId(1),
                 offset: 0,
                 width: MemWidth::B4,
                 signed: false,
                 result_ty: ValType::I32,
-            },
-        },
-        Stmt::Let { dst: ValId(5), ty: ValType::I32, op: Op::ConstI32(0x1234_5678) },
-        Stmt::Effect(EffectOp::Store {
+            });
+        b.push_let(ValId(5), ValType::I32, Op::ConstI32(0x1234_5678));
+        b.push_effect(EffectOp::Store {
             mem: MemId(0),
             addr: ValId(0),
             offset: 0,
             width: MemWidth::B4,
             val: ValId(5),
-        }),
-        Stmt::Let {
-            dst: ValId(7),
-            ty: ValType::I32,
-            op: Op::Load {
+        });
+        b.push_let(ValId(7), ValType::I32, Op::Load {
                 mem: MemId(1),
                 addr: ValId(1),
                 offset: 0,
                 width: MemWidth::B4,
                 signed: false,
                 result_ty: ValType::I32,
-            },
-        },
-        Stmt::Let { dst: ValId(8), ty: ValType::I32, op: Op::Bin(BinOp::I32Eq, ValId(6), ValId(7)) },
-        Stmt::Yield(vec![ValId(8)]),
-    ]);
-    let always_true = Region::Block(vec![
-        Stmt::Let { dst: ValId(6), ty: ValType::I32, op: Op::ConstI32(1) },
-        Stmt::Yield(vec![ValId(6)]),
-    ]);
-    let pre_both_in_bounds = Region::Block(vec![
-        Stmt::Let { dst: ValId(10), ty: ValType::I32, op: Op::ConstI32(65_532) },
-        Stmt::Let { dst: ValId(11), ty: ValType::I32, op: Op::Bin(BinOp::I32LeU, ValId(0), ValId(10)) },
-        Stmt::Let { dst: ValId(12), ty: ValType::I32, op: Op::Bin(BinOp::I32LeU, ValId(1), ValId(10)) },
-        Stmt::Let { dst: ValId(13), ty: ValType::I32, op: Op::Bin(BinOp::I32And, ValId(11), ValId(12)) },
-        Stmt::Yield(vec![ValId(13)]),
-    ]);
+            });
+        b.push_let(ValId(8), ValType::I32, Op::Bin(BinOp::I32Eq, ValId(6), ValId(7)));
+        b.push_yield(&[ValId(8)]);
+    });
+    let always_true = Region::build(|b| {
+        b.push_let(ValId(6), ValType::I32, Op::ConstI32(1));
+        b.push_yield(&[ValId(6)]);
+    });
+    let pre_both_in_bounds = Region::build(|b| {
+        b.push_let(ValId(10), ValType::I32, Op::ConstI32(65_532));
+        b.push_let(ValId(11), ValType::I32, Op::Bin(BinOp::I32LeU, ValId(0), ValId(10)));
+        b.push_let(ValId(12), ValType::I32, Op::Bin(BinOp::I32LeU, ValId(1), ValId(10)));
+        b.push_let(ValId(13), ValType::I32, Op::Bin(BinOp::I32And, ValId(11), ValId(12)));
+        b.push_yield(&[ValId(13)]);
+    });
 
     // Interference witness when BOTH write different values into MemId(0) at offset 8 -> Sat with witness byte!
-    let store_a = Region::Block(vec![
-        Stmt::Let { dst: ValId(0), ty: ValType::I32, op: Op::ConstI32(8) },
-        Stmt::Let { dst: ValId(1), ty: ValType::I32, op: Op::ConstI32(0xaa) },
-        Stmt::Effect(EffectOp::Store {
+    let store_a = Region::build(|b| {
+        b.push_let(ValId(0), ValType::I32, Op::ConstI32(8));
+        b.push_let(ValId(1), ValType::I32, Op::ConstI32(0xaa));
+        b.push_effect(EffectOp::Store {
             mem: MemId(0),
             addr: ValId(0),
             offset: 0,
             width: MemWidth::B1,
             val: ValId(1),
-        }),
-        Stmt::Yield(vec![]),
-    ]);
-    let store_b = Region::Block(vec![
-        Stmt::Let { dst: ValId(0), ty: ValType::I32, op: Op::ConstI32(8) },
-        Stmt::Let { dst: ValId(1), ty: ValType::I32, op: Op::ConstI32(0xbb) },
-        Stmt::Effect(EffectOp::Store {
+        });
+        b.push_yield(&[]);
+    });
+    let store_b = Region::build(|b| {
+        b.push_let(ValId(0), ValType::I32, Op::ConstI32(8));
+        b.push_let(ValId(1), ValType::I32, Op::ConstI32(0xbb));
+        b.push_effect(EffectOp::Store {
             mem: MemId(0),
             addr: ValId(0),
             offset: 0,
             width: MemWidth::B1,
             val: ValId(1),
-        }),
-        Stmt::Yield(vec![]),
-    ]);
+        });
+        b.push_yield(&[]);
+    });
 
     with_both_backends(|backend, name| {
         assert_eq!(
@@ -328,7 +308,7 @@ fn test_multi_memory_non_interference_and_witness() {
         let vc = gnomon_kernel::VcObligation {
             kind: gnomon_kernel::VcKind::Init,
             params: vec![(ValId(0), ValType::I32), (ValId(1), ValType::I32)],
-            assumptions: vec![pre_both_in_bounds.clone()],
+            assumptions: gnomon_kernel::RegionList::single(pre_both_in_bounds.clone()),
             goal: same_store_diff_val_check_vc_lhs.clone(),
         };
         assert_eq!(
@@ -372,69 +352,62 @@ fn test_invariant_loop_vcs_valid_and_broken_both_backends() {
         let n = ValId(0);
         let i = ValId(10);
         let acc = ValId(11);
-        let cond = Region::Block(vec![
-            Stmt::Let { dst: ValId(20), ty: ValType::I32, op: Op::ConstI32(0) },
-            Stmt::Let { dst: ValId(21), ty: ValType::I32, op: Op::Bin(BinOp::I32GtS, i, ValId(20)) },
-            Stmt::Yield(vec![ValId(21)]),
-        ]);
+        let cond = Region::build(|b| {
+        b.push_let(ValId(20), ValType::I32, Op::ConstI32(0));
+        b.push_let(ValId(21), ValType::I32, Op::Bin(BinOp::I32GtS, i, ValId(20)));
+        b.push_yield(&[ValId(21)]);
+    });
         let invariant_pred = if bad_inv {
             // Broken invariant: acc < 5 fails on preservation when acc == 4, i > 0.
-            Region::Block(vec![
-                Stmt::Let { dst: ValId(30), ty: ValType::I32, op: Op::ConstI32(5) },
-                Stmt::Let { dst: ValId(31), ty: ValType::I32, op: Op::Bin(BinOp::I32LtS, acc, ValId(30)) },
-                Stmt::Yield(vec![ValId(31)]),
-            ])
+            Region::build(|b| {
+        b.push_let(ValId(30), ValType::I32, Op::ConstI32(5));
+        b.push_let(ValId(31), ValType::I32, Op::Bin(BinOp::I32LtS, acc, ValId(30)));
+        b.push_yield(&[ValId(31)]);
+    })
         } else {
-            Region::Block(vec![
-                Stmt::Let { dst: ValId(30), ty: ValType::I32, op: Op::ConstI32(0) },
-                Stmt::Let { dst: ValId(31), ty: ValType::I32, op: Op::Bin(BinOp::I32GeS, i, ValId(30)) },
-                Stmt::Let { dst: ValId(32), ty: ValType::I32, op: Op::Bin(BinOp::I32Sub, n, i) },
-                Stmt::Let { dst: ValId(33), ty: ValType::I32, op: Op::Bin(BinOp::I32Eq, acc, ValId(32)) },
-                Stmt::Let { dst: ValId(34), ty: ValType::I32, op: Op::Bin(BinOp::I32And, ValId(31), ValId(33)) },
-                Stmt::Yield(vec![ValId(34)]),
-            ])
+            Region::build(|b| {
+        b.push_let(ValId(30), ValType::I32, Op::ConstI32(0));
+        b.push_let(ValId(31), ValType::I32, Op::Bin(BinOp::I32GeS, i, ValId(30)));
+        b.push_let(ValId(32), ValType::I32, Op::Bin(BinOp::I32Sub, n, i));
+        b.push_let(ValId(33), ValType::I32, Op::Bin(BinOp::I32Eq, acc, ValId(32)));
+        b.push_let(ValId(34), ValType::I32, Op::Bin(BinOp::I32And, ValId(31), ValId(33)));
+        b.push_yield(&[ValId(34)]);
+    })
         };
         let fuel_measure = if bad_fuel {
-            Region::Block(vec![
-                Stmt::Let { dst: ValId(40), ty: ValType::I64, op: Op::ConstI64(1) },
-                Stmt::Yield(vec![ValId(40)]),
-            ])
+            Region::build(|b| {
+        b.push_let(ValId(40), ValType::I64, Op::ConstI64(1));
+        b.push_yield(&[ValId(40)]);
+    })
         } else {
-            Region::Block(vec![
-                Stmt::Let { dst: ValId(40), ty: ValType::I64, op: Op::Un(UnOp::I64ExtendI32U, i) },
-                Stmt::Yield(vec![ValId(40)]),
-            ])
+            Region::build(|b| {
+        b.push_let(ValId(40), ValType::I64, Op::Un(UnOp::I64ExtendI32U, i));
+        b.push_yield(&[ValId(40)]);
+    })
         };
-        let body = Region::Block(vec![
-            Stmt::Let { dst: ValId(50), ty: ValType::I32, op: Op::ConstI32(1) },
-            Stmt::Let { dst: ValId(51), ty: ValType::I32, op: Op::Bin(BinOp::I32Sub, i, ValId(50)) },
-            Stmt::Let { dst: ValId(52), ty: ValType::I32, op: Op::Bin(BinOp::I32Add, acc, ValId(50)) },
-            Stmt::Yield(vec![ValId(51), ValId(52)]),
-        ]);
-        Region::InvariantLoop {
-            init_vars: vec![ValId(0), ValId(1)],
-            state_vars: vec![(i, ValType::I32), (acc, ValType::I32)],
-            cond: Box::new(cond),
-            invariant_pred: Box::new(invariant_pred),
-            fuel_measure: Box::new(fuel_measure),
-            body: Box::new(body),
-        }
+        let body = Region::build(|b| {
+        b.push_let(ValId(50), ValType::I32, Op::ConstI32(1));
+        b.push_let(ValId(51), ValType::I32, Op::Bin(BinOp::I32Sub, i, ValId(50)));
+        b.push_let(ValId(52), ValType::I32, Op::Bin(BinOp::I32Add, acc, ValId(50)));
+        b.push_yield(&[ValId(51), ValId(52)]);
+    });
+        Region::invariant_loop(&[ValId(0), ValId(1)], &[(i, ValType::I32), (acc, ValType::I32)], &cond, &invariant_pred, &fuel_measure, &body)
     };
 
-    let pre = Region::Block(vec![
-        Stmt::Let { dst: ValId(60), ty: ValType::I32, op: Op::ConstI32(0) },
-        Stmt::Let { dst: ValId(61), ty: ValType::I32, op: Op::Bin(BinOp::I32GeS, ValId(0), ValId(60)) },
-        Stmt::Let { dst: ValId(62), ty: ValType::I32, op: Op::Bin(BinOp::I32Eq, ValId(1), ValId(60)) },
-        Stmt::Let { dst: ValId(63), ty: ValType::I32, op: Op::Bin(BinOp::I32And, ValId(61), ValId(62)) },
-        Stmt::Yield(vec![ValId(63)]),
-    ]);
-    let post = Region::Block(vec![
-        Stmt::Let { dst: ValId(70), ty: ValType::I32, op: Op::ConstI32(0) },
-        Stmt::Let { dst: ValId(71), ty: ValType::I32, op: Op::Bin(BinOp::I32Eq, ValId(10), ValId(70)) },
-        Stmt::Let { dst: ValId(72), ty: ValType::I32, op: Op::Bin(BinOp::I32Eq, ValId(11), ValId(0)) },
-        Stmt::Let { dst: ValId(73), ty: ValType::I32, op: Op::Bin(BinOp::I32And, ValId(71), ValId(72)) },
-        Stmt::Yield(vec![ValId(73)]),
-    ]);
+    let pre = Region::build(|b| {
+        b.push_let(ValId(60), ValType::I32, Op::ConstI32(0));
+        b.push_let(ValId(61), ValType::I32, Op::Bin(BinOp::I32GeS, ValId(0), ValId(60)));
+        b.push_let(ValId(62), ValType::I32, Op::Bin(BinOp::I32Eq, ValId(1), ValId(60)));
+        b.push_let(ValId(63), ValType::I32, Op::Bin(BinOp::I32And, ValId(61), ValId(62)));
+        b.push_yield(&[ValId(63)]);
+    });
+    let post = Region::build(|b| {
+        b.push_let(ValId(70), ValType::I32, Op::ConstI32(0));
+        b.push_let(ValId(71), ValType::I32, Op::Bin(BinOp::I32Eq, ValId(10), ValId(70)));
+        b.push_let(ValId(72), ValType::I32, Op::Bin(BinOp::I32Eq, ValId(11), ValId(0)));
+        b.push_let(ValId(73), ValType::I32, Op::Bin(BinOp::I32And, ValId(71), ValId(72)));
+        b.push_yield(&[ValId(73)]);
+    });
 
     let valid_vcs = split_invariant_loop(
         vec![(ValId(0), ValType::I32), (ValId(1), ValType::I32)],
@@ -482,151 +455,123 @@ fn test_bit_ops_mem_bounds_copy_fill_grow_loop_control_flow() {
     let reg = StratumRegistry::new();
 
     // Test effective address BV64 overflow check: u32::MAX + offset 1 must trap OutOfBoundsMem!
-    let oob_load = Region::Block(vec![
-        Stmt::Let { dst: ValId(0), ty: ValType::I32, op: Op::ConstI32(-1) },
-        Stmt::Let {
-            dst: ValId(1),
-            ty: ValType::I32,
-            op: Op::Load {
+    let oob_load = Region::build(|b| {
+        b.push_let(ValId(0), ValType::I32, Op::ConstI32(-1));
+        b.push_let(ValId(1), ValType::I32, Op::Load {
                 mem: MemId(0),
                 addr: ValId(0),
                 offset: 1,
                 width: MemWidth::B1,
                 signed: false,
                 result_ty: ValType::I32,
-            },
-        },
-        Stmt::Yield(vec![ValId(1)]),
-    ]);
-    let explicit_oob_trap = Region::Block(vec![
-        Stmt::Effect(EffectOp::Trap(TrapCode::OutOfBoundsMem)),
-        Stmt::Let { dst: ValId(0), ty: ValType::I32, op: Op::ConstI32(0) },
-        Stmt::Yield(vec![ValId(0)]),
-    ]);
+            });
+        b.push_yield(&[ValId(1)]);
+    });
+    let explicit_oob_trap = Region::build(|b| {
+        b.push_effect(EffectOp::Trap(TrapCode::OutOfBoundsMem));
+        b.push_let(ValId(0), ValType::I32, Op::ConstI32(0));
+        b.push_yield(&[ValId(0)]);
+    });
 
     // Test MemoryGrow zero-initialization + MemorySize + GlobalGet/GlobalSet
     // Precondition: initial MemorySize(0) == 1 page so growing by 1 allocates page 1 as all zeros!
-    let pre_size_1 = Region::Block(vec![
-        Stmt::Let { dst: ValId(10), ty: ValType::I32, op: Op::MemorySize(MemId(0)) },
-        Stmt::Let { dst: ValId(11), ty: ValType::I32, op: Op::ConstI32(1) },
-        Stmt::Let { dst: ValId(12), ty: ValType::I32, op: Op::Bin(BinOp::I32Eq, ValId(10), ValId(11)) },
-        Stmt::Yield(vec![ValId(12)]),
-    ]);
-    let grow_and_read = Region::Block(vec![
-        Stmt::Let { dst: ValId(0), ty: ValType::I32, op: Op::ConstI32(1) },
-        Stmt::Let { dst: ValId(1), ty: ValType::I32, op: Op::MemoryGrow { mem: MemId(0), delta: ValId(0) } },
-        Stmt::Let { dst: ValId(2), ty: ValType::I32, op: Op::ConstI32(WASM_PAGE_SIZE as i32 + 16) },
-        Stmt::Let {
-            dst: ValId(3),
-            ty: ValType::I32,
-            op: Op::Load {
+    let pre_size_1 = Region::build(|b| {
+        b.push_let(ValId(10), ValType::I32, Op::MemorySize(MemId(0)));
+        b.push_let(ValId(11), ValType::I32, Op::ConstI32(1));
+        b.push_let(ValId(12), ValType::I32, Op::Bin(BinOp::I32Eq, ValId(10), ValId(11)));
+        b.push_yield(&[ValId(12)]);
+    });
+    let grow_and_read = Region::build(|b| {
+        b.push_let(ValId(0), ValType::I32, Op::ConstI32(1));
+        b.push_let(ValId(1), ValType::I32, Op::MemoryGrow { mem: MemId(0), delta: ValId(0) });
+        b.push_let(ValId(2), ValType::I32, Op::ConstI32(WASM_PAGE_SIZE as i32 + 16));
+        b.push_let(ValId(3), ValType::I32, Op::Load {
                 mem: MemId(0),
                 addr: ValId(2),
                 offset: 0,
                 width: MemWidth::B4,
                 signed: false,
                 result_ty: ValType::I32,
-            },
-        },
-        Stmt::Let { dst: ValId(4), ty: ValType::I32, op: Op::GlobalGet(GlobalId(1)) },
-        Stmt::Let { dst: ValId(5), ty: ValType::I32, op: Op::Bin(BinOp::I32Add, ValId(3), ValId(4)) },
-        Stmt::Yield(vec![ValId(1), ValId(5)]),
-    ]);
-    let grow_expected = Region::Block(vec![
-        Stmt::Let { dst: ValId(0), ty: ValType::I32, op: Op::ConstI32(1) },
-        Stmt::Let { dst: ValId(1), ty: ValType::I32, op: Op::MemoryGrow { mem: MemId(0), delta: ValId(0) } },
-        Stmt::Let { dst: ValId(2), ty: ValType::I32, op: Op::ConstI32(7) },
-        Stmt::Yield(vec![ValId(1), ValId(2)]),
-    ]);
+            });
+        b.push_let(ValId(4), ValType::I32, Op::GlobalGet(GlobalId(1)));
+        b.push_let(ValId(5), ValType::I32, Op::Bin(BinOp::I32Add, ValId(3), ValId(4)));
+        b.push_yield(&[ValId(1), ValId(5)]);
+    });
+    let grow_expected = Region::build(|b| {
+        b.push_let(ValId(0), ValType::I32, Op::ConstI32(1));
+        b.push_let(ValId(1), ValType::I32, Op::MemoryGrow { mem: MemId(0), delta: ValId(0) });
+        b.push_let(ValId(2), ValType::I32, Op::ConstI32(7));
+        b.push_yield(&[ValId(1), ValId(2)]);
+    });
 
     // Test BoundedLoop finite unrolling + OutOfFuel when loop continues past max_iters
-    let bounded_sum = |max_iters: u32| Region::Block(vec![
-        Stmt::Let { dst: ValId(1), ty: ValType::I32, op: Op::ConstI32(0) },
-        Stmt::Region {
-            results: vec![(ValId(10), ValType::I32)],
-            region: Region::BoundedLoop {
-                max_iters,
-                init_vars: vec![ValId(0), ValId(1)],
-                state_vars: vec![(ValId(2), ValType::I32), (ValId(3), ValType::I32)],
-                body: Box::new(Region::Block(vec![
-                    Stmt::Let { dst: ValId(4), ty: ValType::I32, op: Op::ConstI32(0) },
-                    Stmt::Let { dst: ValId(5), ty: ValType::I32, op: Op::Bin(BinOp::I32GtS, ValId(2), ValId(4)) },
-                    Stmt::Region {
-                        results: vec![],
-                        region: Region::IfElse {
-                            cond: ValId(5),
-                            then_region: Box::new(Region::Block(vec![
-                                Stmt::Let { dst: ValId(6), ty: ValType::I32, op: Op::Bin(BinOp::I32Add, ValId(3), ValId(2)) },
-                                Stmt::Let { dst: ValId(7), ty: ValType::I32, op: Op::ConstI32(1) },
-                                Stmt::Let { dst: ValId(8), ty: ValType::I32, op: Op::Bin(BinOp::I32Sub, ValId(2), ValId(7)) },
-                                Stmt::Continue { depth: 1, cond: None, values: vec![ValId(8), ValId(6)] },
-                            ])),
-                            else_region: Box::new(Region::Block(vec![])),
-                            results: vec![],
-                        },
-                    },
-                    Stmt::Yield(vec![ValId(3)]),
-                ])),
-            },
-        },
-        Stmt::Yield(vec![ValId(10)]),
-    ]);
-    let pre_n_3 = Region::Block(vec![
-        Stmt::Let { dst: ValId(20), ty: ValType::I32, op: Op::ConstI32(3) },
-        Stmt::Let { dst: ValId(21), ty: ValType::I32, op: Op::Bin(BinOp::I32Eq, ValId(0), ValId(20)) },
-        Stmt::Yield(vec![ValId(21)]),
-    ]);
-    let const_6 = Region::Block(vec![
-        Stmt::Let { dst: ValId(1), ty: ValType::I32, op: Op::ConstI32(6) },
-        Stmt::Yield(vec![ValId(1)]),
-    ]);
-    let trap_fuel = Region::Block(vec![
-        Stmt::Effect(EffectOp::Trap(TrapCode::OutOfFuel)),
-        Stmt::Let { dst: ValId(1), ty: ValType::I32, op: Op::ConstI32(0) },
-        Stmt::Yield(vec![ValId(1)]),
-    ]);
+    let bounded_sum = |max_iters: u32| Region::build(|b| {
+        b.push_let(ValId(1), ValType::I32, Op::ConstI32(0));
+        b.push_subregion(&[(ValId(10), ValType::I32)], &Region::bounded_loop(max_iters, &[ValId(0), ValId(1)], &[(ValId(2), ValType::I32), (ValId(3), ValType::I32)], &Region::build(|b| {
+        b.push_let(ValId(4), ValType::I32, Op::ConstI32(0));
+        b.push_let(ValId(5), ValType::I32, Op::Bin(BinOp::I32GtS, ValId(2), ValId(4)));
+        b.push_subregion(&[], &Region::if_else(ValId(5), &Region::build(|b| {
+        b.push_let(ValId(6), ValType::I32, Op::Bin(BinOp::I32Add, ValId(3), ValId(2)));
+        b.push_let(ValId(7), ValType::I32, Op::ConstI32(1));
+        b.push_let(ValId(8), ValType::I32, Op::Bin(BinOp::I32Sub, ValId(2), ValId(7)));
+        b.push_continue(1, None, &[ValId(8), ValId(6)]);
+    }), &Region::empty(), &[]));
+        b.push_yield(&[ValId(3)]);
+    })));
+        b.push_yield(&[ValId(10)]);
+    });
+    let pre_n_3 = Region::build(|b| {
+        b.push_let(ValId(20), ValType::I32, Op::ConstI32(3));
+        b.push_let(ValId(21), ValType::I32, Op::Bin(BinOp::I32Eq, ValId(0), ValId(20)));
+        b.push_yield(&[ValId(21)]);
+    });
+    let const_6 = Region::build(|b| {
+        b.push_let(ValId(1), ValType::I32, Op::ConstI32(6));
+        b.push_yield(&[ValId(1)]);
+    });
+    let trap_fuel = Region::build(|b| {
+        b.push_effect(EffectOp::Trap(TrapCode::OutOfFuel));
+        b.push_let(ValId(1), ValType::I32, Op::ConstI32(0));
+        b.push_yield(&[ValId(1)]);
+    });
 
     // Test clz / ctz / popcnt / sign-extend
-    let unop_lhs = Region::Block(vec![
-        Stmt::Let { dst: ValId(0), ty: ValType::I32, op: Op::ConstI32(0x00ff_0010u32 as i32) },
-        Stmt::Let { dst: ValId(1), ty: ValType::I32, op: Op::Un(UnOp::I32Clz, ValId(0)) },
-        Stmt::Let { dst: ValId(2), ty: ValType::I32, op: Op::Un(UnOp::I32Ctz, ValId(0)) },
-        Stmt::Let { dst: ValId(3), ty: ValType::I32, op: Op::Un(UnOp::I32Popcnt, ValId(0)) },
-        Stmt::Let { dst: ValId(4), ty: ValType::I32, op: Op::Un(UnOp::I32Extend8S, ValId(0)) },
-        Stmt::Yield(vec![ValId(1), ValId(2), ValId(3), ValId(4)]),
-    ]);
-    let unop_rhs = Region::Block(vec![
-        Stmt::Let { dst: ValId(1), ty: ValType::I32, op: Op::ConstI32(8) },
-        Stmt::Let { dst: ValId(2), ty: ValType::I32, op: Op::ConstI32(4) },
-        Stmt::Let { dst: ValId(3), ty: ValType::I32, op: Op::ConstI32(9) },
-        Stmt::Let { dst: ValId(4), ty: ValType::I32, op: Op::ConstI32(0x10) },
-        Stmt::Yield(vec![ValId(1), ValId(2), ValId(3), ValId(4)]),
-    ]);
+    let unop_lhs = Region::build(|b| {
+        b.push_let(ValId(0), ValType::I32, Op::ConstI32(0x00ff_0010u32 as i32));
+        b.push_let(ValId(1), ValType::I32, Op::Un(UnOp::I32Clz, ValId(0)));
+        b.push_let(ValId(2), ValType::I32, Op::Un(UnOp::I32Ctz, ValId(0)));
+        b.push_let(ValId(3), ValType::I32, Op::Un(UnOp::I32Popcnt, ValId(0)));
+        b.push_let(ValId(4), ValType::I32, Op::Un(UnOp::I32Extend8S, ValId(0)));
+        b.push_yield(&[ValId(1), ValId(2), ValId(3), ValId(4)]);
+    });
+    let unop_rhs = Region::build(|b| {
+        b.push_let(ValId(1), ValType::I32, Op::ConstI32(8));
+        b.push_let(ValId(2), ValType::I32, Op::ConstI32(4));
+        b.push_let(ValId(3), ValType::I32, Op::ConstI32(9));
+        b.push_let(ValId(4), ValType::I32, Op::ConstI32(0x10));
+        b.push_yield(&[ValId(1), ValId(2), ValId(3), ValId(4)]);
+    });
 
     // Overlapping intra-memory MemoryCopy & MemoryFill
-    let mem_copy_lhs = Region::Block(vec![
-        Stmt::Let { dst: ValId(0), ty: ValType::I32, op: Op::ConstI32(0) },
-        Stmt::Let { dst: ValId(1), ty: ValType::I32, op: Op::ConstI32(0x1122_3344) },
-        Stmt::Effect(EffectOp::Store { mem: MemId(0), addr: ValId(0), offset: 0, width: MemWidth::B4, val: ValId(1) }),
-        Stmt::Let { dst: ValId(2), ty: ValType::I32, op: Op::ConstI32(2) },
-        Stmt::Let { dst: ValId(3), ty: ValType::I32, op: Op::ConstI32(4) },
-        Stmt::Effect(EffectOp::MemoryCopy { dst_mem: MemId(0), src_mem: MemId(0), dst: ValId(2), src: ValId(0), len: ValId(3) }),
-        Stmt::Let {
-            dst: ValId(4),
-            ty: ValType::I32,
-            op: Op::Load { mem: MemId(0), addr: ValId(2), offset: 0, width: MemWidth::B4, signed: false, result_ty: ValType::I32 },
-        },
-        Stmt::Effect(EffectOp::MemoryFill { mem: MemId(0), dst: ValId(0), val: ValId(0), len: ValId(3) }),
-        Stmt::Effect(EffectOp::MemoryFill { mem: MemId(0), dst: ValId(2), val: ValId(0), len: ValId(3) }),
-        Stmt::Yield(vec![ValId(4)]),
-    ]);
-    let mem_copy_rhs = Region::Block(vec![
-        Stmt::Let { dst: ValId(0), ty: ValType::I32, op: Op::ConstI32(0) },
-        Stmt::Let { dst: ValId(1), ty: ValType::I32, op: Op::ConstI32(6) },
-        Stmt::Effect(EffectOp::MemoryFill { mem: MemId(0), dst: ValId(0), val: ValId(0), len: ValId(1) }),
-        Stmt::Let { dst: ValId(2), ty: ValType::I32, op: Op::ConstI32(0x1122_3344) },
-        Stmt::Yield(vec![ValId(2)]),
-    ]);
+    let mem_copy_lhs = Region::build(|b| {
+        b.push_let(ValId(0), ValType::I32, Op::ConstI32(0));
+        b.push_let(ValId(1), ValType::I32, Op::ConstI32(0x1122_3344));
+        b.push_effect(EffectOp::Store { mem: MemId(0), addr: ValId(0), offset: 0, width: MemWidth::B4, val: ValId(1) });
+        b.push_let(ValId(2), ValType::I32, Op::ConstI32(2));
+        b.push_let(ValId(3), ValType::I32, Op::ConstI32(4));
+        b.push_effect(EffectOp::MemoryCopy { dst_mem: MemId(0), src_mem: MemId(0), dst: ValId(2), src: ValId(0), len: ValId(3) });
+        b.push_let(ValId(4), ValType::I32, Op::Load { mem: MemId(0), addr: ValId(2), offset: 0, width: MemWidth::B4, signed: false, result_ty: ValType::I32 });
+        b.push_effect(EffectOp::MemoryFill { mem: MemId(0), dst: ValId(0), val: ValId(0), len: ValId(3) });
+        b.push_effect(EffectOp::MemoryFill { mem: MemId(0), dst: ValId(2), val: ValId(0), len: ValId(3) });
+        b.push_yield(&[ValId(4)]);
+    });
+    let mem_copy_rhs = Region::build(|b| {
+        b.push_let(ValId(0), ValType::I32, Op::ConstI32(0));
+        b.push_let(ValId(1), ValType::I32, Op::ConstI32(6));
+        b.push_effect(EffectOp::MemoryFill { mem: MemId(0), dst: ValId(0), val: ValId(0), len: ValId(1) });
+        b.push_let(ValId(2), ValType::I32, Op::ConstI32(0x1122_3344));
+        b.push_yield(&[ValId(2)]);
+    });
 
     with_both_backends(|backend, name| {
         assert_eq!(
@@ -674,36 +619,32 @@ fn test_egglog_simplifier_rewrites_stratum_laws_and_trap_safety() {
         layer: 1,
         params: vec![(ValId(0), ValType::I32)],
         results: vec![ValType::I32],
-        body: Region::Block(vec![
-            Stmt::Let { dst: ValId(1), ty: ValType::I32, op: Op::Bin(BinOp::I32Add, ValId(0), ValId(0)) },
-            Stmt::Yield(vec![ValId(1)]),
-        ]),
+        body: Region::build(|b| {
+        b.push_let(ValId(1), ValType::I32, Op::Bin(BinOp::I32Add, ValId(0), ValId(0)));
+        b.push_yield(&[ValId(1)]);
+    }),
         docstring: "doubles x".into(),
     };
     let double_law = Law {
         name: "double_plus_zero".into(),
         kind: LawKind::Algebraic,
         params: vec![(ValId(0), ValType::I32)],
-        precondition: None,
-        lhs: Region::Block(vec![
-            Stmt::Call {
-                results: vec![(ValId(1), ValType::I32)],
-                target: CallTarget::Stratum(StratumId(1)),
-                args: vec![ValId(0)],
-            },
-            Stmt::Let { dst: ValId(2), ty: ValType::I32, op: Op::ConstI32(0) },
-            Stmt::Let { dst: ValId(3), ty: ValType::I32, op: Op::Bin(BinOp::I32Add, ValId(1), ValId(2)) },
-            Stmt::Yield(vec![ValId(3)]),
-        ]),
-        rhs: Region::Block(vec![
-            Stmt::Let { dst: ValId(1), ty: ValType::I32, op: Op::ConstI32(1) },
-            Stmt::Let { dst: ValId(2), ty: ValType::I32, op: Op::Bin(BinOp::I32Shl, ValId(0), ValId(1)) },
-            Stmt::Yield(vec![ValId(2)]),
-        ]),
+        precondition: Region::empty(),
+        lhs: Region::build(|b| {
+        b.push_call(&[(ValId(1), ValType::I32)], CallTarget::Stratum(StratumId(1)), &[ValId(0)]);
+        b.push_let(ValId(2), ValType::I32, Op::ConstI32(0));
+        b.push_let(ValId(3), ValType::I32, Op::Bin(BinOp::I32Add, ValId(1), ValId(2)));
+        b.push_yield(&[ValId(3)]);
+    }),
+        rhs: Region::build(|b| {
+        b.push_let(ValId(1), ValType::I32, Op::ConstI32(1));
+        b.push_let(ValId(2), ValType::I32, Op::Bin(BinOp::I32Shl, ValId(0), ValId(1)));
+        b.push_yield(&[ValId(2)]);
+    }),
         proof_digest: [0xab; 32],
     };
     reg.register_candidate_op(double_op.clone()).unwrap();
-    reg.promote_stratum(Stratum { op: double_op, laws: vec![double_law] })
+    reg.promote_stratum(Stratum { op: double_op, laws: LawList::single(double_law) })
         .unwrap();
 
     // Also register a mutating Stratum on MemId(0) with a MemoryFrame law proving MemId(1) untouched.
@@ -713,56 +654,48 @@ fn test_egglog_simplifier_rewrites_stratum_laws_and_trap_safety() {
         layer: 1,
         params: vec![(ValId(0), ValType::I32)],
         results: vec![ValType::I32],
-        body: Region::Block(vec![
-            Stmt::Effect(EffectOp::Store {
+        body: Region::build(|b| {
+        b.push_effect(EffectOp::Store {
                 mem: MemId(0),
                 addr: ValId(0),
                 offset: 0,
                 width: MemWidth::B4,
                 val: ValId(0),
-            }),
-            Stmt::Yield(vec![ValId(0)]),
-        ]),
+            });
+        b.push_yield(&[ValId(0)]);
+    }),
         docstring: "stores x at mem0[x]".into(),
     };
     let poke_frame_law = Law {
         name: "poke_mem0_preserves_mem1".into(),
         kind: LawKind::MemoryFrame { untouched_mem: MemId(1) },
         params: vec![(ValId(0), ValType::I32)],
-        precondition: None,
-        lhs: Region::Block(vec![
-            Stmt::Call {
-                results: vec![(ValId(1), ValType::I32)],
-                target: CallTarget::Stratum(StratumId(2)),
-                args: vec![ValId(0)],
-            },
-            Stmt::Yield(vec![ValId(1)]),
-        ]),
-        rhs: Region::Block(vec![
-            Stmt::Call {
-                results: vec![(ValId(1), ValType::I32)],
-                target: CallTarget::Stratum(StratumId(2)),
-                args: vec![ValId(0)],
-            },
-            Stmt::Yield(vec![ValId(1)]),
-        ]),
+        precondition: Region::empty(),
+        lhs: Region::build(|b| {
+        b.push_call(&[(ValId(1), ValType::I32)], CallTarget::Stratum(StratumId(2)), &[ValId(0)]);
+        b.push_yield(&[ValId(1)]);
+    }),
+        rhs: Region::build(|b| {
+        b.push_call(&[(ValId(1), ValType::I32)], CallTarget::Stratum(StratumId(2)), &[ValId(0)]);
+        b.push_yield(&[ValId(1)]);
+    }),
         proof_digest: [0xcd; 32],
     };
     reg.register_candidate_op(poke_mem0_op.clone()).unwrap();
-    reg.promote_stratum(Stratum { op: poke_mem0_op, laws: vec![poke_frame_law] })
+    reg.promote_stratum(Stratum { op: poke_mem0_op, laws: LawList::single(poke_frame_law) })
         .unwrap();
 
     let simplifier = EgglogSimplifier::new(EqSatConfig { max_iters: 5, max_nodes: 5_000, timeout_ms: 500 });
 
     // 1. Algebraic simplification + node reduction + Stratum law firing
-    let expr_region = Region::Block(vec![
-        Stmt::Let { dst: ValId(1), ty: ValType::I32, op: Op::ConstI32(0) },
-        Stmt::Let { dst: ValId(2), ty: ValType::I32, op: Op::Bin(BinOp::I32Add, ValId(0), ValId(1)) },
-        Stmt::Let { dst: ValId(3), ty: ValType::I32, op: Op::ConstI32(1) },
-        Stmt::Let { dst: ValId(4), ty: ValType::I32, op: Op::Bin(BinOp::I32Mul, ValId(2), ValId(3)) },
-        Stmt::Let { dst: ValId(5), ty: ValType::I32, op: Op::Bin(BinOp::I32Xor, ValId(4), ValId(1)) },
-        Stmt::Yield(vec![ValId(5)]),
-    ]);
+    let expr_region = Region::build(|b| {
+        b.push_let(ValId(1), ValType::I32, Op::ConstI32(0));
+        b.push_let(ValId(2), ValType::I32, Op::Bin(BinOp::I32Add, ValId(0), ValId(1)));
+        b.push_let(ValId(3), ValType::I32, Op::ConstI32(1));
+        b.push_let(ValId(4), ValType::I32, Op::Bin(BinOp::I32Mul, ValId(2), ValId(3)));
+        b.push_let(ValId(5), ValType::I32, Op::Bin(BinOp::I32Xor, ValId(4), ValId(1)));
+        b.push_yield(&[ValId(5)]);
+    });
     let (simp, report) = simplifier.simplify_region(&expr_region, &reg).unwrap();
     assert!(report.iters_run <= 5 && report.iters_run >= 1);
     assert!(
@@ -774,33 +707,17 @@ fn test_egglog_simplifier_rewrites_stratum_laws_and_trap_safety() {
     assert!(!report.laws_fired.is_empty(), "expected laws to fire");
 
     // 2. Stratum Algebraic law + MemoryFrame law + disjoint memory-frame rule firing
-    let frame_region = Region::Block(vec![
-        Stmt::Let {
-            dst: ValId(2),
-            ty: ValType::I32,
-            op: Op::Load { mem: MemId(1), addr: ValId(0), offset: 0, width: MemWidth::B4, signed: false, result_ty: ValType::I32 },
-        },
-        Stmt::Call {
-            results: vec![(ValId(3), ValType::I32)],
-            target: CallTarget::Stratum(StratumId(1)),
-            args: vec![ValId(1)],
-        },
-        Stmt::Let { dst: ValId(6), ty: ValType::I32, op: Op::ConstI32(0) },
-        Stmt::Let { dst: ValId(7), ty: ValType::I32, op: Op::Bin(BinOp::I32Add, ValId(3), ValId(6)) },
-        Stmt::Effect(EffectOp::Store { mem: MemId(0), addr: ValId(0), offset: 0, width: MemWidth::B4, val: ValId(7) }),
-        Stmt::Call {
-            results: vec![(ValId(8), ValType::I32)],
-            target: CallTarget::Stratum(StratumId(2)),
-            args: vec![ValId(0)],
-        },
-        Stmt::Let {
-            dst: ValId(4),
-            ty: ValType::I32,
-            op: Op::Load { mem: MemId(1), addr: ValId(0), offset: 0, width: MemWidth::B4, signed: false, result_ty: ValType::I32 },
-        },
-        Stmt::Let { dst: ValId(5), ty: ValType::I32, op: Op::Bin(BinOp::I32Sub, ValId(2), ValId(4)) },
-        Stmt::Yield(vec![ValId(5)]),
-    ]);
+    let frame_region = Region::build(|b| {
+        b.push_let(ValId(2), ValType::I32, Op::Load { mem: MemId(1), addr: ValId(0), offset: 0, width: MemWidth::B4, signed: false, result_ty: ValType::I32 });
+        b.push_call(&[(ValId(3), ValType::I32)], CallTarget::Stratum(StratumId(1)), &[ValId(1)]);
+        b.push_let(ValId(6), ValType::I32, Op::ConstI32(0));
+        b.push_let(ValId(7), ValType::I32, Op::Bin(BinOp::I32Add, ValId(3), ValId(6)));
+        b.push_effect(EffectOp::Store { mem: MemId(0), addr: ValId(0), offset: 0, width: MemWidth::B4, val: ValId(7) });
+        b.push_call(&[(ValId(8), ValType::I32)], CallTarget::Stratum(StratumId(2)), &[ValId(0)]);
+        b.push_let(ValId(4), ValType::I32, Op::Load { mem: MemId(1), addr: ValId(0), offset: 0, width: MemWidth::B4, signed: false, result_ty: ValType::I32 });
+        b.push_let(ValId(5), ValType::I32, Op::Bin(BinOp::I32Sub, ValId(2), ValId(4)));
+        b.push_yield(&[ValId(5)]);
+    });
     let (frame_simp, frame_report) = simplifier.simplify_region(&frame_region, &reg).unwrap();
     assert!(
         frame_report.laws_fired.iter().any(|l| l == "disjoint-mem-load-store"),
@@ -819,23 +736,19 @@ fn test_egglog_simplifier_rewrites_stratum_laws_and_trap_safety() {
     );
 
     // 3. Trap preservation: div_s(MIN, -1), div_s(x, y) followed by v - v, Load followed by v - v!
-    let div_trap_region = Region::Block(vec![
-        Stmt::Let { dst: ValId(0), ty: ValType::I32, op: Op::ConstI32(i32::MIN) },
-        Stmt::Let { dst: ValId(1), ty: ValType::I32, op: Op::ConstI32(-1) },
-        Stmt::Let { dst: ValId(2), ty: ValType::I32, op: Op::Bin(BinOp::I32DivS, ValId(0), ValId(1)) },
-        Stmt::Yield(vec![ValId(2)]),
-    ]);
+    let div_trap_region = Region::build(|b| {
+        b.push_let(ValId(0), ValType::I32, Op::ConstI32(i32::MIN));
+        b.push_let(ValId(1), ValType::I32, Op::ConstI32(-1));
+        b.push_let(ValId(2), ValType::I32, Op::Bin(BinOp::I32DivS, ValId(0), ValId(1)));
+        b.push_yield(&[ValId(2)]);
+    });
     let (div_simp, _) = simplifier.simplify_region(&div_trap_region, &reg).unwrap();
 
-    let dead_load_region = Region::Block(vec![
-        Stmt::Let {
-            dst: ValId(1),
-            ty: ValType::I32,
-            op: Op::Load { mem: MemId(0), addr: ValId(0), offset: 0, width: MemWidth::B4, signed: false, result_ty: ValType::I32 },
-        },
-        Stmt::Let { dst: ValId(2), ty: ValType::I32, op: Op::Bin(BinOp::I32Sub, ValId(1), ValId(1)) },
-        Stmt::Yield(vec![ValId(2)]),
-    ]);
+    let dead_load_region = Region::build(|b| {
+        b.push_let(ValId(1), ValType::I32, Op::Load { mem: MemId(0), addr: ValId(0), offset: 0, width: MemWidth::B4, signed: false, result_ty: ValType::I32 });
+        b.push_let(ValId(2), ValType::I32, Op::Bin(BinOp::I32Sub, ValId(1), ValId(1)));
+        b.push_yield(&[ValId(2)]);
+    });
     let (dead_load_simp, _) = simplifier.simplify_region(&dead_load_region, &reg).unwrap();
 
     // Verify ALL simplified regions are semantically equivalent to originals in Bitwuzla!
@@ -858,41 +771,37 @@ fn test_host_contract_and_func_call_smt() {
         field_name: "inc".into(),
         params: vec![(ValId(0), ValType::I32)],
         results: vec![(ValId(1), ValType::I32)],
-        precondition: Region::Block(vec![
-            Stmt::Let { dst: ValId(10), ty: ValType::I32, op: Op::ConstI32(100) },
-            Stmt::Let { dst: ValId(11), ty: ValType::I32, op: Op::Bin(BinOp::I32LtS, ValId(0), ValId(10)) },
-            Stmt::Yield(vec![ValId(11)]),
-        ]),
+        precondition: Region::build(|b| {
+        b.push_let(ValId(10), ValType::I32, Op::ConstI32(100));
+        b.push_let(ValId(11), ValType::I32, Op::Bin(BinOp::I32LtS, ValId(0), ValId(10)));
+        b.push_yield(&[ValId(11)]);
+    }),
         read_footprints: vec![(MemId(0), OffsetRange { base: SliceBound::Const(0), len: SliceBound::Const(4) })],
         write_footprints: vec![],
-        postcondition: Region::Block(vec![
-            Stmt::Let { dst: ValId(12), ty: ValType::I32, op: Op::ConstI32(1) },
-            Stmt::Let { dst: ValId(13), ty: ValType::I32, op: Op::Bin(BinOp::I32Add, ValId(0), ValId(12)) },
-            Stmt::Let { dst: ValId(14), ty: ValType::I32, op: Op::Bin(BinOp::I32Eq, ValId(1), ValId(13)) },
-            Stmt::Yield(vec![ValId(14)]),
-        ]),
+        postcondition: Region::build(|b| {
+        b.push_let(ValId(12), ValType::I32, Op::ConstI32(1));
+        b.push_let(ValId(13), ValType::I32, Op::Bin(BinOp::I32Add, ValId(0), ValId(12)));
+        b.push_let(ValId(14), ValType::I32, Op::Bin(BinOp::I32Eq, ValId(1), ValId(13)));
+        b.push_yield(&[ValId(14)]);
+    }),
         sim_body: None,
     });
     let reg = StratumRegistry::new();
 
-    let pre = Region::Block(vec![
-        Stmt::Let { dst: ValId(10), ty: ValType::I32, op: Op::ConstI32(100) },
-        Stmt::Let { dst: ValId(11), ty: ValType::I32, op: Op::Bin(BinOp::I32LtS, ValId(0), ValId(10)) },
-        Stmt::Yield(vec![ValId(11)]),
-    ]);
-    let lhs = Region::Block(vec![
-        Stmt::Call {
-            results: vec![(ValId(1), ValType::I32)],
-            target: CallTarget::Host(HostCallId(0)),
-            args: vec![ValId(0)],
-        },
-        Stmt::Yield(vec![ValId(1)]),
-    ]);
-    let rhs = Region::Block(vec![
-        Stmt::Let { dst: ValId(1), ty: ValType::I32, op: Op::ConstI32(1) },
-        Stmt::Let { dst: ValId(2), ty: ValType::I32, op: Op::Bin(BinOp::I32Add, ValId(0), ValId(1)) },
-        Stmt::Yield(vec![ValId(2)]),
-    ]);
+    let pre = Region::build(|b| {
+        b.push_let(ValId(10), ValType::I32, Op::ConstI32(100));
+        b.push_let(ValId(11), ValType::I32, Op::Bin(BinOp::I32LtS, ValId(0), ValId(10)));
+        b.push_yield(&[ValId(11)]);
+    });
+    let lhs = Region::build(|b| {
+        b.push_call(&[(ValId(1), ValType::I32)], CallTarget::Host(HostCallId(0)), &[ValId(0)]);
+        b.push_yield(&[ValId(1)]);
+    });
+    let rhs = Region::build(|b| {
+        b.push_let(ValId(1), ValType::I32, Op::ConstI32(1));
+        b.push_let(ValId(2), ValType::I32, Op::Bin(BinOp::I32Add, ValId(0), ValId(1)));
+        b.push_yield(&[ValId(2)]);
+    });
 
     with_both_backends(|backend, name| {
         assert_eq!(
@@ -909,22 +818,22 @@ fn test_symbolic_memory_fill_and_persistent_pipe_reuse() {
     let reg = StratumRegistry::new();
 
     // Symbolic len <= 8: MemoryFill(0, 0, val, len) followed by MemoryFill(0, 0, val, len) is idempotent -> Unsat!
-    let pre = Region::Block(vec![
-        Stmt::Let { dst: ValId(10), ty: ValType::I32, op: Op::ConstI32(8) },
-        Stmt::Let { dst: ValId(11), ty: ValType::I32, op: Op::Bin(BinOp::I32LeU, ValId(1), ValId(10)) },
-        Stmt::Yield(vec![ValId(11)]),
-    ]);
-    let fill_once = Region::Block(vec![
-        Stmt::Let { dst: ValId(2), ty: ValType::I32, op: Op::ConstI32(0) },
-        Stmt::Effect(EffectOp::MemoryFill { mem: MemId(0), dst: ValId(2), val: ValId(0), len: ValId(1) }),
-        Stmt::Yield(vec![]),
-    ]);
-    let fill_twice = Region::Block(vec![
-        Stmt::Let { dst: ValId(2), ty: ValType::I32, op: Op::ConstI32(0) },
-        Stmt::Effect(EffectOp::MemoryFill { mem: MemId(0), dst: ValId(2), val: ValId(0), len: ValId(1) }),
-        Stmt::Effect(EffectOp::MemoryFill { mem: MemId(0), dst: ValId(2), val: ValId(0), len: ValId(1) }),
-        Stmt::Yield(vec![]),
-    ]);
+    let pre = Region::build(|b| {
+        b.push_let(ValId(10), ValType::I32, Op::ConstI32(8));
+        b.push_let(ValId(11), ValType::I32, Op::Bin(BinOp::I32LeU, ValId(1), ValId(10)));
+        b.push_yield(&[ValId(11)]);
+    });
+    let fill_once = Region::build(|b| {
+        b.push_let(ValId(2), ValType::I32, Op::ConstI32(0));
+        b.push_effect(EffectOp::MemoryFill { mem: MemId(0), dst: ValId(2), val: ValId(0), len: ValId(1) });
+        b.push_yield(&[]);
+    });
+    let fill_twice = Region::build(|b| {
+        b.push_let(ValId(2), ValType::I32, Op::ConstI32(0));
+        b.push_effect(EffectOp::MemoryFill { mem: MemId(0), dst: ValId(2), val: ValId(0), len: ValId(1) });
+        b.push_effect(EffectOp::MemoryFill { mem: MemId(0), dst: ValId(2), val: ValId(0), len: ValId(1) });
+        b.push_yield(&[]);
+    });
 
     // Unbounded symbolic len without precondition must NEVER unsoundly return Unsat!
     let mut pipe = BitwuzlaPipeBackend::new().expect("spawn pipe");
@@ -968,25 +877,25 @@ fn test_egglog_div_rem_trap_preservation_and_caps() {
     let simplifier = EgglogSimplifier::new(EqSatConfig { max_iters: 10, max_nodes: 10_000, timeout_ms: 500 });
 
     // div_s(0, x) and div_s(x, x) and rem_u(x, x) MUST NOT drop potential DivByZero/IntOverflow traps!
-    let div_zero_x = Region::Block(vec![
-        Stmt::Let { dst: ValId(1), ty: ValType::I32, op: Op::ConstI32(0) },
-        Stmt::Let { dst: ValId(2), ty: ValType::I32, op: Op::Bin(BinOp::I32DivS, ValId(1), ValId(0)) },
-        Stmt::Yield(vec![ValId(2)]),
-    ]);
-    let div_x_x = Region::Block(vec![
-        Stmt::Let { dst: ValId(2), ty: ValType::I32, op: Op::Bin(BinOp::I32DivS, ValId(0), ValId(0)) },
-        Stmt::Yield(vec![ValId(2)]),
-    ]);
-    let rem_x_x = Region::Block(vec![
-        Stmt::Let { dst: ValId(2), ty: ValType::I32, op: Op::Bin(BinOp::I32RemU, ValId(0), ValId(0)) },
-        Stmt::Yield(vec![ValId(2)]),
-    ]);
+    let div_zero_x = Region::build(|b| {
+        b.push_let(ValId(1), ValType::I32, Op::ConstI32(0));
+        b.push_let(ValId(2), ValType::I32, Op::Bin(BinOp::I32DivS, ValId(1), ValId(0)));
+        b.push_yield(&[ValId(2)]);
+    });
+    let div_x_x = Region::build(|b| {
+        b.push_let(ValId(2), ValType::I32, Op::Bin(BinOp::I32DivS, ValId(0), ValId(0)));
+        b.push_yield(&[ValId(2)]);
+    });
+    let rem_x_x = Region::build(|b| {
+        b.push_let(ValId(2), ValType::I32, Op::Bin(BinOp::I32RemU, ValId(0), ValId(0)));
+        b.push_yield(&[ValId(2)]);
+    });
     // div_s(x, 1) CAN be safely simplified to x!
-    let div_x_one = Region::Block(vec![
-        Stmt::Let { dst: ValId(1), ty: ValType::I32, op: Op::ConstI32(1) },
-        Stmt::Let { dst: ValId(2), ty: ValType::I32, op: Op::Bin(BinOp::I32DivS, ValId(0), ValId(1)) },
-        Stmt::Yield(vec![ValId(2)]),
-    ]);
+    let div_x_one = Region::build(|b| {
+        b.push_let(ValId(1), ValType::I32, Op::ConstI32(1));
+        b.push_let(ValId(2), ValType::I32, Op::Bin(BinOp::I32DivS, ValId(0), ValId(1)));
+        b.push_yield(&[ValId(2)]);
+    });
 
     let mut backend = BitwuzlaNativeBackend::new();
     for region in [&div_zero_x, &div_x_x, &rem_x_x, &div_x_one] {
@@ -1013,32 +922,28 @@ fn test_adversarial_sieve_soundness_regressions() {
 
     // 1. i64.store32 (val: I64, width: B4) followed by i32.load (width: B4, result_ty: I32)
     // must NOT misfire store-load-forward-b4 into an ill-typed I64 value!
-    let mixed_store_load = Region::Block(vec![
-        Stmt::Effect(EffectOp::Store {
+    let mixed_store_load = Region::build(|b| {
+        b.push_effect(EffectOp::Store {
             mem: MemId(0),
             addr: ValId(0),
             offset: 0,
             width: MemWidth::B4,
             val: ValId(1), // ValType::I64!
-        }),
-        Stmt::Let {
-            dst: ValId(2),
-            ty: ValType::I32,
-            op: Op::Load {
+        });
+        b.push_let(ValId(2), ValType::I32, Op::Load {
                 mem: MemId(0),
                 addr: ValId(0),
                 offset: 0,
                 width: MemWidth::B4,
                 signed: false,
                 result_ty: ValType::I32,
-            },
-        },
-        Stmt::Let { dst: ValId(3), ty: ValType::I64, op: Op::ConstI64(1) },
-        Stmt::Let { dst: ValId(4), ty: ValType::I64, op: Op::Bin(BinOp::I64Add, ValId(1), ValId(3)) },
-        Stmt::Let { dst: ValId(5), ty: ValType::I32, op: Op::Un(UnOp::I32WrapI64, ValId(4)) },
-        Stmt::Let { dst: ValId(6), ty: ValType::I32, op: Op::Bin(BinOp::I32Add, ValId(2), ValId(5)) },
-        Stmt::Yield(vec![ValId(6)]),
-    ]);
+            });
+        b.push_let(ValId(3), ValType::I64, Op::ConstI64(1));
+        b.push_let(ValId(4), ValType::I64, Op::Bin(BinOp::I64Add, ValId(1), ValId(3)));
+        b.push_let(ValId(5), ValType::I32, Op::Un(UnOp::I32WrapI64, ValId(4)));
+        b.push_let(ValId(6), ValType::I32, Op::Bin(BinOp::I32Add, ValId(2), ValId(5)));
+        b.push_yield(&[ValId(6)]);
+    });
     let (mixed_simp, _) = simplifier.simplify_region(&mixed_store_load, &reg).unwrap();
     assert_eq!(
         backend.check_equivalence(&module, &reg, &mixed_store_load, &mixed_simp, None).unwrap(),
@@ -1052,40 +957,36 @@ fn test_adversarial_sieve_soundness_regressions() {
         layer: 1,
         params: vec![(ValId(0), ValType::I32)],
         results: vec![ValType::I32],
-        body: Region::Block(vec![
-            Stmt::Let {
-                dst: ValId(1),
-                ty: ValType::I32,
-                op: Op::Load { mem: MemId(0), addr: ValId(0), offset: 0, width: MemWidth::B4, signed: false, result_ty: ValType::I32 },
-            },
-            Stmt::Yield(vec![ValId(1)]),
-        ]),
+        body: Region::build(|b| {
+        b.push_let(ValId(1), ValType::I32, Op::Load { mem: MemId(0), addr: ValId(0), offset: 0, width: MemWidth::B4, signed: false, result_ty: ValType::I32 });
+        b.push_yield(&[ValId(1)]);
+    }),
         docstring: String::new(),
     };
     let refl_law = Law {
         name: "refl_read_m0".into(),
         kind: LawKind::Algebraic,
         params: vec![(ValId(0), ValType::I32)],
-        precondition: None,
-        lhs: Region::Block(vec![
-            Stmt::Call { results: vec![(ValId(1), ValType::I32)], target: CallTarget::Stratum(StratumId(50)), args: vec![ValId(0)] },
-            Stmt::Yield(vec![ValId(1)]),
-        ]),
-        rhs: Region::Block(vec![
-            Stmt::Call { results: vec![(ValId(1), ValType::I32)], target: CallTarget::Stratum(StratumId(50)), args: vec![ValId(0)] },
-            Stmt::Yield(vec![ValId(1)]),
-        ]),
+        precondition: Region::empty(),
+        lhs: Region::build(|b| {
+        b.push_call(&[(ValId(1), ValType::I32)], CallTarget::Stratum(StratumId(50)), &[ValId(0)]);
+        b.push_yield(&[ValId(1)]);
+    }),
+        rhs: Region::build(|b| {
+        b.push_call(&[(ValId(1), ValType::I32)], CallTarget::Stratum(StratumId(50)), &[ValId(0)]);
+        b.push_yield(&[ValId(1)]);
+    }),
         proof_digest: [0x77; 32],
     };
-    reg.promote_stratum(Stratum { op: load_op, laws: vec![refl_law] }).unwrap();
+    reg.promote_stratum(Stratum { op: load_op, laws: LawList::single(refl_law) }).unwrap();
 
-    let stratum_across_store = Region::Block(vec![
-        Stmt::Call { results: vec![(ValId(2), ValType::I32)], target: CallTarget::Stratum(StratumId(50)), args: vec![ValId(0)] },
-        Stmt::Effect(EffectOp::Store { mem: MemId(0), addr: ValId(0), offset: 0, width: MemWidth::B4, val: ValId(1) }),
-        Stmt::Call { results: vec![(ValId(3), ValType::I32)], target: CallTarget::Stratum(StratumId(50)), args: vec![ValId(0)] },
-        Stmt::Let { dst: ValId(4), ty: ValType::I32, op: Op::Bin(BinOp::I32Sub, ValId(3), ValId(2)) },
-        Stmt::Yield(vec![ValId(4)]),
-    ]);
+    let stratum_across_store = Region::build(|b| {
+        b.push_call(&[(ValId(2), ValType::I32)], CallTarget::Stratum(StratumId(50)), &[ValId(0)]);
+        b.push_effect(EffectOp::Store { mem: MemId(0), addr: ValId(0), offset: 0, width: MemWidth::B4, val: ValId(1) });
+        b.push_call(&[(ValId(3), ValType::I32)], CallTarget::Stratum(StratumId(50)), &[ValId(0)]);
+        b.push_let(ValId(4), ValType::I32, Op::Bin(BinOp::I32Sub, ValId(3), ValId(2)));
+        b.push_yield(&[ValId(4)]);
+    });
     let (across_simp, _) = simplifier.simplify_region(&stratum_across_store, &reg).unwrap();
     assert_eq!(
         backend.check_equivalence(&module, &reg, &stratum_across_store, &across_simp, None).unwrap(),
@@ -1094,21 +995,16 @@ fn test_adversarial_sieve_soundness_regressions() {
     );
 
     // 3. Multi-block IfElse must still report iters_run <= 5, and nested trap inside UnOp must be preserved!
-    let multi_block = Region::IfElse {
-        cond: ValId(0),
-        results: vec![ValType::I32],
-        then_region: Box::new(Region::Block(vec![
-            Stmt::Let { dst: ValId(2), ty: ValType::I32, op: Op::Bin(BinOp::I32DivS, ValId(0), ValId(1)) },
-            Stmt::Let { dst: ValId(3), ty: ValType::I32, op: Op::Un(UnOp::I32Eqz, ValId(2)) },
-            Stmt::Let { dst: ValId(4), ty: ValType::I32, op: Op::Bin(BinOp::I32Sub, ValId(3), ValId(3)) },
-            Stmt::Yield(vec![ValId(4)]),
-        ])),
-        else_region: Box::new(Region::Block(vec![
-            Stmt::Let { dst: ValId(5), ty: ValType::I32, op: Op::ConstI32(0) },
-            Stmt::Let { dst: ValId(6), ty: ValType::I32, op: Op::Bin(BinOp::I32Add, ValId(1), ValId(5)) },
-            Stmt::Yield(vec![ValId(6)]),
-        ])),
-    };
+    let multi_block = Region::if_else(ValId(0), &Region::build(|b| {
+        b.push_let(ValId(2), ValType::I32, Op::Bin(BinOp::I32DivS, ValId(0), ValId(1)));
+        b.push_let(ValId(3), ValType::I32, Op::Un(UnOp::I32Eqz, ValId(2)));
+        b.push_let(ValId(4), ValType::I32, Op::Bin(BinOp::I32Sub, ValId(3), ValId(3)));
+        b.push_yield(&[ValId(4)]);
+    }), &Region::build(|b| {
+        b.push_let(ValId(5), ValType::I32, Op::ConstI32(0));
+        b.push_let(ValId(6), ValType::I32, Op::Bin(BinOp::I32Add, ValId(1), ValId(5)));
+        b.push_yield(&[ValId(6)]);
+    }), &[ValType::I32]);
     let (mb_simp, mb_rep) = simplifier.simplify_region(&multi_block, &reg).unwrap();
     assert!(mb_rep.iters_run <= 5, "multi-block iters_run {} exceeded 5", mb_rep.iters_run);
     assert_eq!(
@@ -1123,36 +1019,36 @@ fn test_adversarial_sieve_soundness_regressions() {
         field_name: "rogue_sim".into(),
         params: vec![(ValId(0), ValType::I32)],
         results: vec![(ValId(1), ValType::I32)],
-        precondition: Region::Block(vec![
-            Stmt::Let { dst: ValId(2), ty: ValType::I32, op: Op::ConstI32(1) },
-            Stmt::Yield(vec![ValId(2)]),
-        ]),
+        precondition: Region::build(|b| {
+        b.push_let(ValId(2), ValType::I32, Op::ConstI32(1));
+        b.push_yield(&[ValId(2)]);
+    }),
         read_footprints: vec![],
         write_footprints: vec![(MemId(0), OffsetRange { base: SliceBound::Const(0), len: SliceBound::Const(4) })],
-        postcondition: Region::Block(vec![
-            Stmt::Let { dst: ValId(2), ty: ValType::I32, op: Op::ConstI32(1) },
-            Stmt::Yield(vec![ValId(2)]),
-        ]),
+        postcondition: Region::build(|b| {
+        b.push_let(ValId(2), ValType::I32, Op::ConstI32(1));
+        b.push_yield(&[ValId(2)]);
+    }),
         // Writes at offset 8 (OUTSIDE write_footprints [0..4))!
-        sim_body: Some(Region::Block(vec![
-            Stmt::Let { dst: ValId(3), ty: ValType::I32, op: Op::ConstI32(8) },
-            Stmt::Let { dst: ValId(4), ty: ValType::I32, op: Op::ConstI32(0x7F) },
-            Stmt::Effect(EffectOp::Store { mem: MemId(0), addr: ValId(3), offset: 0, width: MemWidth::B1, val: ValId(4) }),
-            Stmt::Yield(vec![ValId(0)]),
-        ])),
+        sim_body: Some(Region::build(|b| {
+        b.push_let(ValId(3), ValType::I32, Op::ConstI32(8));
+        b.push_let(ValId(4), ValType::I32, Op::ConstI32(0x7F));
+        b.push_effect(EffectOp::Store { mem: MemId(0), addr: ValId(3), offset: 0, width: MemWidth::B1, val: ValId(4) });
+        b.push_yield(&[ValId(0)]);
+    })),
     });
-    let call_rogue = Region::Block(vec![
-        Stmt::Let { dst: ValId(3), ty: ValType::I32, op: Op::ConstI32(8) },
-        Stmt::Let { dst: ValId(4), ty: ValType::I32, op: Op::ConstI32(0) },
-        Stmt::Effect(EffectOp::Store { mem: MemId(0), addr: ValId(3), offset: 0, width: MemWidth::B1, val: ValId(4) }),
-        Stmt::Call { results: vec![(ValId(1), ValType::I32)], target: CallTarget::Host(HostCallId(9)), args: vec![ValId(0)] },
-        Stmt::Yield(vec![ValId(1)]),
-    ]);
-    let explicit_trap = Region::Block(vec![
-        Stmt::Effect(EffectOp::Trap(TrapCode::HostContractViolation)),
-        Stmt::Let { dst: ValId(1), ty: ValType::I32, op: Op::Copy(ValId(0)) },
-        Stmt::Yield(vec![ValId(1)]),
-    ]);
+    let call_rogue = Region::build(|b| {
+        b.push_let(ValId(3), ValType::I32, Op::ConstI32(8));
+        b.push_let(ValId(4), ValType::I32, Op::ConstI32(0));
+        b.push_effect(EffectOp::Store { mem: MemId(0), addr: ValId(3), offset: 0, width: MemWidth::B1, val: ValId(4) });
+        b.push_call(&[(ValId(1), ValType::I32)], CallTarget::Host(HostCallId(9)), &[ValId(0)]);
+        b.push_yield(&[ValId(1)]);
+    });
+    let explicit_trap = Region::build(|b| {
+        b.push_effect(EffectOp::Trap(TrapCode::HostContractViolation));
+        b.push_let(ValId(1), ValType::I32, Op::Copy(ValId(0)));
+        b.push_yield(&[ValId(1)]);
+    });
     assert_eq!(
         backend.check_equivalence(&module, &reg, &call_rogue, &explicit_trap, None).unwrap(),
         SmtResult::Unsat
@@ -1160,29 +1056,24 @@ fn test_adversarial_sieve_soundness_regressions() {
 
     // 5. BoundedLoop with max_iters = u32::MAX (lifted Wasm loop):
     // proves bounded exit Unsat and returns Unknown when unbounded!
-    let wasm_loop = Region::BoundedLoop {
-        max_iters: u32::MAX,
-        init_vars: vec![ValId(0)],
-        state_vars: vec![(ValId(1), ValType::I32)],
-        body: Box::new(Region::Block(vec![
-            Stmt::Let { dst: ValId(2), ty: ValType::I32, op: Op::ConstI32(0) },
-            Stmt::Let { dst: ValId(3), ty: ValType::I32, op: Op::Bin(BinOp::I32Eq, ValId(1), ValId(2)) },
-            Stmt::Break { depth: 0, cond: Some(ValId(3)), values: vec![ValId(2)] },
-            Stmt::Let { dst: ValId(4), ty: ValType::I32, op: Op::ConstI32(1) },
-            Stmt::Let { dst: ValId(5), ty: ValType::I32, op: Op::Bin(BinOp::I32Sub, ValId(1), ValId(4)) },
-            Stmt::Continue { depth: 0, cond: None, values: vec![ValId(5)] },
-        ])),
-    };
-    let const_zero = Region::Block(vec![
-        Stmt::Let { dst: ValId(2), ty: ValType::I32, op: Op::ConstI32(0) },
-        Stmt::Let { dst: ValId(3), ty: ValType::I32, op: Op::Bin(BinOp::I32And, ValId(0), ValId(2)) },
-        Stmt::Yield(vec![ValId(3)]),
-    ]);
-    let pre_small = Region::Block(vec![
-        Stmt::Let { dst: ValId(2), ty: ValType::I32, op: Op::ConstI32(4) },
-        Stmt::Let { dst: ValId(3), ty: ValType::I32, op: Op::Bin(BinOp::I32LeU, ValId(0), ValId(2)) },
-        Stmt::Yield(vec![ValId(3)]),
-    ]);
+    let wasm_loop = Region::bounded_loop(u32::MAX, &[ValId(0)], &[(ValId(1), ValType::I32)], &Region::build(|b| {
+        b.push_let(ValId(2), ValType::I32, Op::ConstI32(0));
+        b.push_let(ValId(3), ValType::I32, Op::Bin(BinOp::I32Eq, ValId(1), ValId(2)));
+        b.push_break(0, Some(ValId(3)), &[ValId(2)]);
+        b.push_let(ValId(4), ValType::I32, Op::ConstI32(1));
+        b.push_let(ValId(5), ValType::I32, Op::Bin(BinOp::I32Sub, ValId(1), ValId(4)));
+        b.push_continue(0, None, &[ValId(5)]);
+    }));
+    let const_zero = Region::build(|b| {
+        b.push_let(ValId(2), ValType::I32, Op::ConstI32(0));
+        b.push_let(ValId(3), ValType::I32, Op::Bin(BinOp::I32And, ValId(0), ValId(2)));
+        b.push_yield(&[ValId(3)]);
+    });
+    let pre_small = Region::build(|b| {
+        b.push_let(ValId(2), ValType::I32, Op::ConstI32(4));
+        b.push_let(ValId(3), ValType::I32, Op::Bin(BinOp::I32LeU, ValId(0), ValId(2)));
+        b.push_yield(&[ValId(3)]);
+    });
     assert_eq!(
         backend.check_equivalence(&module, &reg, &wasm_loop, &const_zero, Some(&pre_small)).unwrap(),
         SmtResult::Unsat
@@ -1200,42 +1091,34 @@ fn test_adversarial_sieve_soundness_regressions() {
         layer: 1,
         params: vec![(ValId(0), ValType::I32), (ValId(1), ValType::I32)],
         results: vec![ValType::I32],
-        body: Region::Block(vec![
-            Stmt::Let { dst: ValId(2), ty: ValType::I32, op: Op::Bin(BinOp::I32DivS, ValId(0), ValId(1)) },
-            Stmt::Yield(vec![ValId(2)]),
-        ]),
+        body: Region::build(|b| {
+        b.push_let(ValId(2), ValType::I32, Op::Bin(BinOp::I32DivS, ValId(0), ValId(1)));
+        b.push_yield(&[ValId(2)]);
+    }),
         docstring: String::new(),
     };
     let div_inline_law = Law {
         name: "inline_checked_quot".into(),
         kind: LawKind::Algebraic,
         params: vec![(ValId(0), ValType::I32), (ValId(1), ValType::I32)],
-        precondition: None,
-        lhs: Region::Block(vec![
-            Stmt::Call {
-                results: vec![(ValId(2), ValType::I32)],
-                target: CallTarget::Stratum(StratumId(60)),
-                args: vec![ValId(0), ValId(1)],
-            },
-            Stmt::Yield(vec![ValId(2)]),
-        ]),
-        rhs: Region::Block(vec![
-            Stmt::Let { dst: ValId(2), ty: ValType::I32, op: Op::Bin(BinOp::I32DivS, ValId(0), ValId(1)) },
-            Stmt::Yield(vec![ValId(2)]),
-        ]),
+        precondition: Region::empty(),
+        lhs: Region::build(|b| {
+        b.push_call(&[(ValId(2), ValType::I32)], CallTarget::Stratum(StratumId(60)), &[ValId(0), ValId(1)]);
+        b.push_yield(&[ValId(2)]);
+    }),
+        rhs: Region::build(|b| {
+        b.push_let(ValId(2), ValType::I32, Op::Bin(BinOp::I32DivS, ValId(0), ValId(1)));
+        b.push_yield(&[ValId(2)]);
+    }),
         proof_digest: [0x60; 32],
     };
-    reg.promote_stratum(Stratum { op: div_stratum_op, laws: vec![div_inline_law] }).unwrap();
+    reg.promote_stratum(Stratum { op: div_stratum_op, laws: LawList::single(div_inline_law) }).unwrap();
 
-    let stratum_div_cancel = Region::Block(vec![
-        Stmt::Call {
-            results: vec![(ValId(2), ValType::I32)],
-            target: CallTarget::Stratum(StratumId(60)),
-            args: vec![ValId(0), ValId(1)],
-        },
-        Stmt::Let { dst: ValId(3), ty: ValType::I32, op: Op::Bin(BinOp::I32Sub, ValId(2), ValId(2)) },
-        Stmt::Yield(vec![ValId(3)]),
-    ]);
+    let stratum_div_cancel = Region::build(|b| {
+        b.push_call(&[(ValId(2), ValType::I32)], CallTarget::Stratum(StratumId(60)), &[ValId(0), ValId(1)]);
+        b.push_let(ValId(3), ValType::I32, Op::Bin(BinOp::I32Sub, ValId(2), ValId(2)));
+        b.push_yield(&[ValId(3)]);
+    });
     let (stratum_div_simp, _) = simplifier.simplify_region(&stratum_div_cancel, &reg).unwrap();
     // Evaluating simplified region on divisor x == 0 MUST still trap with DivByZero!
     let trap_res = gnomon_kernel::eval_region(

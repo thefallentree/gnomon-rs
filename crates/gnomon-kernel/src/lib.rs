@@ -2,8 +2,8 @@
 #![forbid(unsafe_code)]
 
 //! Trusted Computing Base (TCB) for Project Gnomon (`gnomon-rs`).
-//! Contains the `GnomonIR` data model, deterministic small-step reference
-//! interpreter, loop VC splitter, and Stratum admission registry.
+//! Contains the flat arena-backed `GnomonIR` data model, deterministic small-step
+//! continuation interpreter, loop VC splitter, and Stratum admission registry.
 
 extern crate alloc;
 
@@ -18,8 +18,8 @@ pub use eval::{
     HeapState, MAX_CALL_DEPTH, MAX_WASM_PAGES, MemoryState, WASM_PAGE_SIZE, eval_func, eval_region,
 };
 pub use ir::*;
-pub use registry::{Law, LawKind, RegistryError, Stratum, StratumOp, StratumRegistry};
+pub use registry::{Law, LawKind, LawList, RegistryError, Stratum, StratumOp, StratumRegistry};
 pub use vc::{
-    LoopVcs, VcError, VcEvalResult, VcKind, VcObligation, eval_vc, remap_region_vals,
+    LoopVcs, RegionList, VcError, VcEvalResult, VcKind, VcObligation, eval_vc, remap_region_vals,
     split_invariant_loop, validate_read_only, validate_read_only_with_registry,
 };

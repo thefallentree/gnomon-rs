@@ -7,18 +7,20 @@
 | **OS** | Ubuntu 22.04.5 LTS (`jammy`), `x86_64` | `glibc 2.35` (`ldd 2.35-0ubuntu3.18`) |
 | **CPU** | Intel Xeon Gold 6132 @ 2.60 GHz (8 cores) | SIMD/bit flags: `avx2`, `avx512f`, `avx512dq`, `avx512cd`, `avx512bw`, `avx512vl`, `bmi1`, `bmi2`, `popcnt` |
 | **Memory / Disk** | 23 GiB RAM, 275 GiB free | Measured at Milestone 1.0 audit |
-| **Rust Compiler** | `rustc 1.100.0 (0ef1bc386 2026-11-09)` | Installed via `rustup 1.29.3 (edbc831ce 2026-11-02)` |
+| **Rust Compiler** | `rustc 1.100.0 (0ef1bc386 2026-11-09)` | Installed via `rustup 1.29.3 (edbc831ce 2026-11-02)` (bundled LLVM `23.1.5`) |
 | **Cargo** | `cargo 1.100.0 (3acc79c0c 2026-11-05)` | Workspace Edition `2024`, Resolver `2` |
 | **Rust Targets** | `x86_64-unknown-linux-gnu`, `wasm32-unknown-unknown` | Includes `clippy` and `rustfmt` |
 | **Kani Verifier** | `Kani Rust Verifier 0.68.0 (cargo plugin)` / `CBMC 6.11.0` | Installed in `~/.cargo/bin` + `~/.kani/kani-0.68.0` |
 | **Bitwuzla SMT** | `0.11.0` (source-built static release) | Built with static PIC `GMP 6.3.0` (`--enable-cxx`) + `MPFR 4.2.1` into `~/.local/bitwuzla` (required because upstream prebuilt zip targets `GLIBC_2.38`/`GLIBCXX_3.4.32`) |
-| **C/C++ & Build** | `gcc 11.4.0`, `clang 23.0.0`, `cmake 3.22.1`, `meson 1.12.1`, `ninja 1.13.2`, `pkg-config 0.29.2` | `clang-15` / `libclang` also present for `bindgen` |
+| **C/C++ & Build** | `gcc 11.4.0`, `clang 23.0.0`, `llvm-23`, `cmake 3.22.1`, `meson 1.12.1`, `ninja 1.13.2`, `pkg-config 0.29.2` | `libclang-23` (`/usr/lib/llvm-23/lib`) used for `bindgen` / `libbitwuzla-sys` |
 
 ### Environment Variables for Builds & Verification
 ```bash
-export PATH="$HOME/.cargo/bin:$HOME/.local/bitwuzla/bin:$HOME/.local/bin:$PATH"
+export PATH="/usr/lib/llvm-23/bin:$HOME/.cargo/bin:$HOME/.local/bitwuzla/bin:$HOME/.local/bin:$PATH"
 export PKG_CONFIG_PATH="$HOME/.local/bitwuzla/lib/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
-export LIBCLANG_PATH="/usr/lib/llvm-15/lib"
+export LIBCLANG_PATH="/usr/lib/llvm-23/lib"
+export CC="/usr/lib/llvm-23/bin/clang"
+export CXX="/usr/lib/llvm-23/bin/clang++"
 ```
 `~/.local/bitwuzla/lib/` provides `libbitwuzla.a`, `libgmp.a`, `libgmpxx.a`, `libmpfr.a`, headers in `~/.local/bitwuzla/include/`, and `bitwuzla.pc`, `gmp.pc`, `gmpxx.pc`, `mpfr.pc` in `pkgconfig/`.
 

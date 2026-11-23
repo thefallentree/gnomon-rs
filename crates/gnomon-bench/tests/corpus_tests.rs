@@ -7,7 +7,7 @@ use gnomon_bench::{
     verify_counterexample_in_kernel,
 };
 use gnomon_kernel::{
-    BinOp, FuncDef, FuncId, Module, Op, Region, Stmt, Val, ValId, ValType,
+    BinOp, FuncDef, FuncId, Module, Op, Region, Val, ValId, ValType,
 };
 use gnomon_wasm::{Counterexample, ExecOutcome};
 
@@ -142,14 +142,10 @@ fn synthetic_add_or_sub_module(is_sub: bool) -> Module {
             export_name: Some("f".into()),
             params: vec![(ValId(0), ValType::I32), (ValId(1), ValType::I32)],
             results: vec![ValType::I32],
-            body: Region::Block(vec![
-                Stmt::Let {
-                    dst: ValId(2),
-                    ty: ValType::I32,
-                    op: Op::Bin(op, ValId(0), ValId(1)),
-                },
-                Stmt::Yield(vec![ValId(2)]),
-            ]),
+            body: Region::build(|b| {
+                b.push_let(ValId(2), ValType::I32, Op::Bin(op, ValId(0), ValId(1)));
+                b.push_yield(&[ValId(2)]);
+            }),
         }],
         ..Module::default()
     }

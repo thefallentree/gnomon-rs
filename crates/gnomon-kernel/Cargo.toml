@@ -14,4 +14,4 @@ unsafe_code = "forbid"
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }
 
 [package.metadata.kani]
-flags = { jobs = "8", output-format = "terse", no-assertion-reach-checks = true }
+flags = { jobs = "1" }

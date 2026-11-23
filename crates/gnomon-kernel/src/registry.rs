@@ -1,307 +1,992 @@
-//! Stratum admission checker and Layer-0 DAG lowering gate.
+//! Stratum admission checker and iterative Layer-0 DAG lowering gate.
 
-use alloc::{boxed::Box, string::String, vec::Vec};
+use alloc::{string::String, vec::Vec};
 use crate::ir::*;
 use crate::vc::{max_val_id_in_region, remap_region_vals, validate_read_only_with_registry};
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)] pub enum LawKind { Algebraic, MemoryFrame { untouched_mem: MemId } }
+const MAX_CHECK_DEPTH: usize = 64;
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum LawKind {
+    Algebraic,
+    MemoryFrame { untouched_mem: MemId },
+}
 
 /// Machine-proved rewrite or memory-frame law bundled with a promoted `Stratum`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Law {
-    pub name: String, pub kind: LawKind, pub params: Vec<(ValId, ValType)>,
-    pub precondition: Option<Region>, pub lhs: Region, pub rhs: Region, pub proof_digest: [u8; 32],
+    pub name: String,
+    pub kind: LawKind,
+    pub params: Vec<(ValId, ValType)>,
+    pub precondition: Region,
+    pub lhs: Region,
+    pub rhs: Region,
+    pub proof_digest: [u8; 32],
+}
+
+impl Law {
+    const fn empty_placeholder() -> Self {
+        Self {
+            name: String::new(),
+            kind: LawKind::Algebraic,
+            params: Vec::new(),
+            precondition: Region::empty(),
+            lhs: Region::empty(),
+            rhs: Region::empty(),
+            proof_digest: [0u8; 32],
+        }
+    }
+
+    /// Returns `true` if this law carries an explicit precondition guard.
+    pub fn has_precondition(&self) -> bool {
+        !self.precondition.pool.is_empty() || !self.precondition.is_empty_block()
+    }
+}
+
+/// Compact list of proved `Law`s storing the primary law inline (zero heap
+/// allocation for the common 1-law `Stratum`) with `Vec<Law>` overflow.
+#[derive(Clone, Debug)]
+pub struct LawList {
+    has_first: bool,
+    first: Law,
+    rest: Vec<Law>,
+}
+
+impl LawList {
+    pub const fn empty() -> Self {
+        Self { has_first: false, first: Law::empty_placeholder(), rest: Vec::new() }
+    }
+
+    pub fn single(law: Law) -> Self {
+        Self { has_first: true, first: law, rest: Vec::new() }
+    }
+
+    pub fn from_vec(mut laws: Vec<Law>) -> Self {
+        if laws.is_empty() {
+            Self::empty()
+        } else {
+            let first = laws.remove(0);
+            Self { has_first: true, first, rest: laws }
+        }
+    }
+
+    pub fn push(&mut self, law: Law) {
+        if !self.has_first {
+            self.first = law;
+            self.has_first = true;
+        } else {
+            self.rest.push(law);
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        !self.has_first
+    }
+
+    pub fn len(&self) -> usize {
+        if self.has_first { 1 + self.rest.len() } else { 0 }
+    }
+
+    pub fn first(&self) -> Option<&Law> {
+        if self.has_first { Some(&self.first) } else { None }
+    }
+
+    pub fn rest(&self) -> &[Law] {
+        &self.rest
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = &Law> {
+        self.first().into_iter().chain(self.rest.iter())
+    }
+}
+
+impl Default for LawList {
+    fn default() -> Self {
+        Self::empty()
+    }
+}
+
+impl PartialEq for LawList {
+    fn eq(&self, other: &Self) -> bool {
+        if self.has_first != other.has_first {
+            return false;
+        }
+        if !self.has_first {
+            return true;
+        }
+        self.first == other.first && self.rest == other.rest
+    }
+}
+
+impl Eq for LawList {}
+
+impl From<Law> for LawList {
+    fn from(law: Law) -> Self {
+        Self::single(law)
+    }
+}
+
+impl From<Vec<Law>> for LawList {
+    fn from(laws: Vec<Law>) -> Self {
+        Self::from_vec(laws)
+    }
 }
 
 /// Named typed operation defined acyclically over Layer `0 .. layer - 1`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StratumOp {
-    pub id: StratumId, pub name: String, pub layer: u16,
-    pub params: Vec<(ValId, ValType)>, pub results: Vec<ValType>, pub body: Region, pub docstring: String,
+    pub id: StratumId,
+    pub name: String,
+    pub layer: u16,
+    pub params: Vec<(ValId, ValType)>,
+    pub results: Vec<ValType>,
+    pub body: Region,
+    pub docstring: String,
+}
+
+impl StratumOp {
+    const fn empty_placeholder() -> Self {
+        Self {
+            id: StratumId(0),
+            name: String::new(),
+            layer: 0,
+            params: Vec::new(),
+            results: Vec::new(),
+            body: Region::empty(),
+            docstring: String::new(),
+        }
+    }
 }
 
 /// Paired sub-abstraction: acyclic Layer-`k` op + proved shortcut/frame law(s).
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Stratum { pub op: StratumOp, pub laws: Vec<Law> }
+pub struct Stratum {
+    pub op: StratumOp,
+    pub laws: LawList,
+}
 
-impl Drop for Stratum {
-    fn drop(&mut self) {
-        if !self.laws.is_empty() && self.laws.len() <= 2 {
-            let _ = self.laws.pop();
-            let _ = self.laws.pop();
-        }
+impl Stratum {
+    const fn empty_placeholder() -> Self {
+        Self { op: StratumOp::empty_placeholder(), laws: LawList::empty() }
     }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum RegistryError {
-    InvalidLayerZero, DuplicateName, DuplicateId, UnknownStratum(StratumId),
+    InvalidLayerZero,
+    DuplicateName,
+    DuplicateId,
+    UnknownStratum(StratumId),
     NonAcyclicLayer { caller_layer: u16, callee: StratumId, callee_layer: u16 },
-    MissingProvedLaw, EmptyProofDigest, TypeMismatch, UndefinedVal(ValId),
-}
-
-fn check_layer_non_zero(layer: u16) -> Result<(), RegistryError> {
-    if layer == 0 { Err(RegistryError::InvalidLayerZero) } else { Ok(()) }
+    MissingProvedLaw,
+    EmptyProofDigest,
+    TypeMismatch,
+    UndefinedVal(ValId),
 }
 
 fn check_law_digest(d: &[u8; 32]) -> Result<(), RegistryError> {
-    let nz = (d[0] | d[1] | d[2] | d[3] | d[4] | d[5] | d[6] | d[7])
-        | (d[8] | d[9] | d[10] | d[11] | d[12] | d[13] | d[14] | d[15])
-        | (d[16] | d[17] | d[18] | d[19] | d[20] | d[21] | d[22] | d[23])
-        | (d[24] | d[25] | d[26] | d[27] | d[28] | d[29] | d[30] | d[31]);
+    let [
+        b0, b1, b2, b3, b4, b5, b6, b7,
+        b8, b9, b10, b11, b12, b13, b14, b15,
+        b16, b17, b18, b19, b20, b21, b22, b23,
+        b24, b25, b26, b27, b28, b29, b30, b31,
+    ] = *d;
+    let nz = (b0 | b1 | b2 | b3 | b4 | b5 | b6 | b7)
+        | (b8 | b9 | b10 | b11 | b12 | b13 | b14 | b15)
+        | (b16 | b17 | b18 | b19 | b20 | b21 | b22 | b23)
+        | (b24 | b25 | b26 | b27 | b28 | b29 | b30 | b31);
     if nz == 0 { Err(RegistryError::EmptyProofDigest) } else { Ok(()) }
 }
 
-fn check_callee_layer(caller_layer: u16, callee: StratumId, callee_layer: u16) -> Result<(), RegistryError> {
-    if callee_layer >= caller_layer {
-        Err(RegistryError::NonAcyclicLayer { caller_layer, callee, callee_layer })
-    } else {
-        Ok(())
-    }
-}
-
-#[derive(Clone)]
-struct RetTys {
-    tys: [ValType; 8],
-    len: usize,
-    spill: Vec<ValType>,
-}
-
-impl Default for RetTys {
-    fn default() -> Self {
-        Self { tys: [ValType::I32; 8], len: 0, spill: Vec::new() }
-    }
-}
-
-impl PartialEq for RetTys {
-    fn eq(&self, other: &Self) -> bool {
-        self.eq_slice(other.as_slice())
-    }
-}
-impl Eq for RetTys {}
-
-impl RetTys {
-    fn push(&mut self, ty: ValType) {
-        if (self.len >> 3) == 0 {
-            self.tys[self.len & 7] = ty;
-            self.len += 1;
-        } else {
-            if self.len == 8 {
-                self.spill.extend_from_slice(&self.tys);
-            }
-            self.spill.push(ty);
-            self.len += 1;
-        }
-    }
-    fn as_slice(&self) -> &[ValType] {
-        if (self.len >> 3) == 0 || self.len == 8 {
-            &self.tys[..self.len.min(8)]
-        } else {
-            self.spill.as_slice()
-        }
-    }
-    fn from_slice(s: &[ValType]) -> Self {
-        let mut r = Self::default();
-        match s {
-            [] => {}
-            [a] => r.push(*a),
-            [a, b] => { r.push(*a); r.push(*b); }
-            _ => {
-                let mut i = 0;
-                while i < s.len() { r.push(s[i]); i += 1; }
-            }
-        }
-        r
-    }
-    fn from_pairs(s: &[(ValId, ValType)]) -> Self {
-        let mut r = Self::default();
-        match s {
-            [] => {}
-            [(_, a)] => r.push(*a),
-            [(_, a), (_, b)] => { r.push(*a); r.push(*b); }
-            _ => {
-                let mut i = 0;
-                while i < s.len() { r.push(s[i].1); i += 1; }
-            }
-        }
-        r
-    }
-    fn eq_slice(&self, s: &[ValType]) -> bool {
-        let a = self.as_slice();
-        if a.len() != s.len() {
-            return false;
-        }
-        match (a, s) {
-            ([], []) => true,
-            ([x], [y]) => x == y,
-            ([x0, x1], [y0, y1]) => x0 == y0 && x1 == y1,
-            _ => {
-                let mut i = 0;
-                while i < a.len() {
-                    if a[i] != s[i] { return false; }
-                    i += 1;
-                }
-                true
-            }
-        }
-    }
-    fn eq_pairs(&self, s: &[(ValId, ValType)]) -> bool {
-        let a = self.as_slice();
-        if a.len() != s.len() {
-            return false;
-        }
-        match (a, s) {
-            ([], []) => true,
-            ([x], [(_, y)]) => x == y,
-            ([x0, x1], [(_, y0), (_, y1)]) => x0 == y0 && x1 == y1,
-            _ => {
-                let mut i = 0;
-                while i < a.len() {
-                    if a[i] != s[i].1 { return false; }
-                    i += 1;
-                }
-                true
-            }
-        }
-    }
-}
-
 struct TypeEnv {
-    entries: [(ValId, ValType); 16],
+    inline: [(ValId, ValType); 16],
     len: usize,
     spill: Vec<(ValId, ValType)>,
 }
 
-impl Default for TypeEnv {
-    fn default() -> Self {
-        Self { entries: [(ValId(0), ValType::I32); 16], len: 0, spill: Vec::new() }
-    }
-}
-
 impl TypeEnv {
-    fn from_slice(params: &[(ValId, ValType)]) -> Self {
-        let mut e = Self::default();
-        e.extend_slice(params);
-        e
+    fn new(params: &[(ValId, ValType)]) -> Self {
+        let mut env = Self {
+            inline: [(ValId(0), ValType::I32); 16],
+            len: 0,
+            spill: Vec::new(),
+        };
+        let mut i = 0;
+        while i < params.len() {
+            env.push(params[i].0, params[i].1);
+            i += 1;
+        }
+        env
     }
+
     fn len(&self) -> usize {
         self.len
     }
+
     fn truncate(&mut self, saved: usize) {
-        if saved < self.len {
-            if (self.len >> 4) != 0 && self.len > 16 {
-                self.spill.truncate(saved.saturating_sub(16));
-            }
-            self.len = saved;
-        }
+        self.len = saved;
+        self.spill.truncate(saved.saturating_sub(16));
     }
+
     fn push(&mut self, id: ValId, ty: ValType) {
-        if (self.len >> 4) == 0 {
-            self.entries[self.len & 15] = (id, ty);
-            self.len += 1;
+        if self.len < 16 {
+            self.inline[self.len] = (id, ty);
         } else {
             self.spill.push((id, ty));
-            self.len += 1;
         }
+        self.len += 1;
     }
-    fn extend_slice(&mut self, pairs: &[(ValId, ValType)]) {
-        match pairs {
-            [] => {}
-            [p0] => self.push(p0.0, p0.1),
-            [p0, p1] => { self.push(p0.0, p0.1); self.push(p1.0, p1.1); }
-            _ => {
-                let mut i = 0;
-                while i < pairs.len() {
-                    self.push(pairs[i].0, pairs[i].1);
-                    i += 1;
-                }
-            }
+
+    fn extend_vars(&mut self, reg: &Region, span: Span) -> Result<(), RegistryError> {
+        let mut i = 0;
+        while i < span.len {
+            let (id, ty) = reg.try_var(span, i).ok_or(RegistryError::TypeMismatch)?;
+            self.push(id, ty);
+            i += 1;
         }
+        Ok(())
     }
+
     fn lookup(&self, id: ValId) -> Result<ValType, RegistryError> {
-        if self.len == 0 {
-            return Err(RegistryError::UndefinedVal(id));
-        }
-        if self.len == 1 {
-            return if self.entries[0].0 == id { Ok(self.entries[0].1) } else { Err(RegistryError::UndefinedVal(id)) };
-        }
-        if self.len == 2 {
-            if self.entries[1].0 == id { return Ok(self.entries[1].1); }
-            if self.entries[0].0 == id { return Ok(self.entries[0].1); }
-            return Err(RegistryError::UndefinedVal(id));
-        }
-        if (self.len >> 4) != 0 && self.len > 16 {
-            let mut j = self.spill.len();
-            while j > 0 {
-                j -= 1;
-                if self.spill[j].0 == id {
-                    return Ok(self.spill[j].1);
-                }
+        let mut s = self.spill.len();
+        while s > 0 {
+            s -= 1;
+            if self.spill[s].0 == id {
+                return Ok(self.spill[s].1);
             }
         }
         let mut i = self.len.min(16);
         while i > 0 {
             i -= 1;
-            if self.entries[i & 15].0 == id {
-                return Ok(self.entries[i & 15].1);
+            if self.inline[i].0 == id {
+                return Ok(self.inline[i].1);
             }
         }
         Err(RegistryError::UndefinedVal(id))
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SmallTys {
+    Inline([ValType; 4], u8),
+    Pool(u32),
+}
+
+impl SmallTys {
+    const EMPTY: Self = Self::Inline([ValType::I32; 4], 0);
+}
+
+#[derive(Default)]
+struct TyPool(Vec<Vec<ValType>>);
+
+impl TyPool {
+    fn intern_with<F>(&mut self, len: u32, mut get: F) -> Result<SmallTys, RegistryError>
+    where
+        F: FnMut(u32) -> Result<ValType, RegistryError>,
+    {
+        if len <= 4 {
+            let mut a = [ValType::I32; 4];
+            let mut i = 0;
+            while i < len {
+                a[i as usize] = get(i)?;
+                i += 1;
+            }
+            Ok(SmallTys::Inline(a, len as u8))
+        } else {
+            let mut v = Vec::with_capacity(len as usize);
+            let mut i = 0;
+            while i < len {
+                v.push(get(i)?);
+                i += 1;
+            }
+            let id = self.0.len() as u32;
+            self.0.push(v);
+            Ok(SmallTys::Pool(id))
+        }
+    }
+
+    fn intern_vals(&mut self, reg: &Region, vs: Span, env: &TypeEnv) -> Result<SmallTys, RegistryError> {
+        self.intern_with(vs.len, |i| {
+            env.lookup(reg.try_val(vs, i).ok_or(RegistryError::TypeMismatch)?)
+        })
+    }
+
+    fn intern_tys_span(&mut self, reg: &Region, span: Span) -> Result<SmallTys, RegistryError> {
+        self.intern_with(span.len, |i| reg.try_ty(span, i).ok_or(RegistryError::TypeMismatch))
+    }
+
+    fn intern_vars_span(&mut self, reg: &Region, span: Span) -> Result<SmallTys, RegistryError> {
+        self.intern_with(span.len, |i| {
+            Ok(reg.try_var(span, i).ok_or(RegistryError::TypeMismatch)?.1)
+        })
+    }
+
+    fn len(&self, st: SmallTys) -> usize {
+        match st {
+            SmallTys::Inline(_, n) => n as usize,
+            SmallTys::Pool(id) => self.0[id as usize].len(),
+        }
+    }
+
+    fn get(&self, st: SmallTys, idx: usize) -> ValType {
+        match st {
+            SmallTys::Inline(a, _) => a[idx],
+            SmallTys::Pool(id) => self.0[id as usize][idx],
+        }
+    }
+
+    fn eq_tys(&self, a: SmallTys, b: SmallTys) -> bool {
+        if self.len(a) != self.len(b) {
+            return false;
+        }
+        let mut i = 0;
+        while i < self.len(a) {
+            if self.get(a, i) != self.get(b, i) {
+                return false;
+            }
+            i += 1;
+        }
+        true
+    }
+
+    fn eq_slice(&self, st: SmallTys, expected: &[ValType]) -> bool {
+        if self.len(st) != expected.len() {
+            return false;
+        }
+        let mut i = 0;
+        while i < expected.len() {
+            if self.get(st, i) != expected[i] {
+                return false;
+            }
+            i += 1;
+        }
+        true
+    }
+
+    fn eq_tys_span(&self, st: SmallTys, reg: &Region, span: Span) -> bool {
+        if self.len(st) != span.len_usize() {
+            return false;
+        }
+        let mut i = 0;
+        while i < span.len {
+            if reg.try_ty(span, i) != Some(self.get(st, i as usize)) {
+                return false;
+            }
+            i += 1;
+        }
+        true
+    }
+
+    fn eq_vars_span(&self, st: SmallTys, reg: &Region, span: Span) -> bool {
+        if self.len(st) != span.len_usize() {
+            return false;
+        }
+        let mut i = 0;
+        while i < span.len {
+            if reg.try_var(span, i).map(|p| p.1) != Some(self.get(st, i as usize)) {
+                return false;
+            }
+            i += 1;
+        }
+        true
+    }
+}
+
+/// Small-vector storage for promoted Strata: stores up to 2 Strata inline
+/// (zero heap allocation / contiguous `&[Stratum]`), spilling to `Vec<Stratum>`
+/// seamlessly on the 3rd+ promoted Stratum.
+/// Invariant: `occupied[1] => occupied[0]`; when `!spill.is_empty()`, `occupied == [false, false]`.
+#[derive(Clone, Debug)]
+struct StratumStore {
+    inline: [Stratum; 2],
+    occupied: [bool; 2],
+    spill: Vec<Stratum>,
+}
+
+impl StratumStore {
+    const fn new() -> Self {
+        Self {
+            inline: [Stratum::empty_placeholder(), Stratum::empty_placeholder()],
+            occupied: [false, false],
+            spill: Vec::new(),
+        }
+    }
+
+    fn as_slice(&self) -> &[Stratum] {
+        if self.spill.is_empty() {
+            let len = (self.occupied[0] as usize) + (self.occupied[1] as usize);
+            &self.inline[..len]
+        } else {
+            &self.spill
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn get_by_id_spill(&self, id: StratumId) -> Option<&Stratum> {
+        let mut i = 0;
+        while i < self.spill.len() {
+            if self.spill[i].op.id == id {
+                return Some(&self.spill[i]);
+            }
+            i += 1;
+        }
+        None
+    }
+
+    fn get_by_id(&self, id: StratumId) -> Option<&Stratum> {
+        if self.spill.is_empty() {
+            if self.occupied[0] && self.inline[0].op.id == id {
+                return Some(&self.inline[0]);
+            }
+            if self.occupied[1] && self.inline[1].op.id == id {
+                return Some(&self.inline[1]);
+            }
+            None
+        } else {
+            self.get_by_id_spill(id)
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn has_name_spill(&self, name: &str) -> bool {
+        let mut i = 0;
+        while i < self.spill.len() {
+            if self.spill[i].op.name == name {
+                return true;
+            }
+            i += 1;
+        }
+        false
+    }
+
+    fn has_name(&self, name: &str) -> bool {
+        if self.spill.is_empty() {
+            (self.occupied[0] && self.inline[0].op.name == name)
+                || (self.occupied[1] && self.inline[1].op.name == name)
+        } else {
+            self.has_name_spill(name)
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn push_spill(&mut self, stratum: Stratum) {
+        if self.spill.is_empty() {
+            self.spill.reserve(3);
+            if self.occupied[0] {
+                let s0 = core::mem::replace(&mut self.inline[0], Stratum::empty_placeholder());
+                self.spill.push(s0);
+                self.occupied[0] = false;
+            }
+            if self.occupied[1] {
+                let s1 = core::mem::replace(&mut self.inline[1], Stratum::empty_placeholder());
+                self.spill.push(s1);
+                self.occupied[1] = false;
+            }
+        }
+        self.spill.push(stratum);
+    }
+
+    fn push(&mut self, stratum: Stratum) {
+        if !self.spill.is_empty() {
+            self.push_spill(stratum);
+        } else if !self.occupied[0] {
+            self.inline[0] = stratum;
+            self.occupied[0] = true;
+        } else if !self.occupied[1] {
+            self.inline[1] = stratum;
+            self.occupied[1] = true;
+        } else {
+            self.push_spill(stratum);
+        }
+    }
+}
+
+impl Default for StratumStore {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Small-vector storage for unpromoted candidate ops: stores up to 2 ops inline,
+/// spilling cleanly to `Vec<StratumOp>` on the 3rd+ simultaneous candidate.
+/// Invariant: `occupied[1] => occupied[0]`; when `!spill.is_empty()`, `occupied == [false, false]`.
+#[derive(Clone, Debug)]
+struct CandidateStore {
+    inline: [StratumOp; 2],
+    occupied: [bool; 2],
+    spill: Vec<StratumOp>,
+}
+
+impl CandidateStore {
+    const fn new() -> Self {
+        Self {
+            inline: [StratumOp::empty_placeholder(), StratumOp::empty_placeholder()],
+            occupied: [false, false],
+            spill: Vec::new(),
+        }
+    }
+
+    fn as_slice(&self) -> &[StratumOp] {
+        if self.spill.is_empty() {
+            let len = (self.occupied[0] as usize) + (self.occupied[1] as usize);
+            &self.inline[..len]
+        } else {
+            &self.spill
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn get_by_id_spill(&self, id: StratumId) -> Option<&StratumOp> {
+        let mut i = 0;
+        while i < self.spill.len() {
+            if self.spill[i].id == id {
+                return Some(&self.spill[i]);
+            }
+            i += 1;
+        }
+        None
+    }
+
+    fn get_by_id(&self, id: StratumId) -> Option<&StratumOp> {
+        if self.spill.is_empty() {
+            if self.occupied[0] && self.inline[0].id == id {
+                return Some(&self.inline[0]);
+            }
+            if self.occupied[1] && self.inline[1].id == id {
+                return Some(&self.inline[1]);
+            }
+            None
+        } else {
+            self.get_by_id_spill(id)
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn has_conflicting_name_spill(&self, name: &str, promoted_only: bool, op_id: StratumId) -> bool {
+        let mut i = 0;
+        while i < self.spill.len() {
+            if (!promoted_only || self.spill[i].id != op_id) && self.spill[i].name == name {
+                return true;
+            }
+            i += 1;
+        }
+        false
+    }
+
+    fn has_conflicting_name(&self, name: &str, promoted_only: bool, op_id: StratumId) -> bool {
+        if self.spill.is_empty() {
+            (self.occupied[0]
+                && (!promoted_only || self.inline[0].id != op_id)
+                && self.inline[0].name == name)
+                || (self.occupied[1]
+                    && (!promoted_only || self.inline[1].id != op_id)
+                    && self.inline[1].name == name)
+        } else {
+            self.has_conflicting_name_spill(name, promoted_only, op_id)
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn push_spill(&mut self, op: StratumOp) {
+        if self.spill.is_empty() {
+            self.spill.reserve(3);
+            if self.occupied[0] {
+                let s0 = core::mem::replace(&mut self.inline[0], StratumOp::empty_placeholder());
+                self.spill.push(s0);
+                self.occupied[0] = false;
+            }
+            if self.occupied[1] {
+                let s1 = core::mem::replace(&mut self.inline[1], StratumOp::empty_placeholder());
+                self.spill.push(s1);
+                self.occupied[1] = false;
+            }
+        }
+        self.spill.push(op);
+    }
+
+    fn push(&mut self, op: StratumOp) {
+        if !self.spill.is_empty() {
+            self.push_spill(op);
+        } else if !self.occupied[0] {
+            self.inline[0] = op;
+            self.occupied[0] = true;
+        } else if !self.occupied[1] {
+            self.inline[1] = op;
+            self.occupied[1] = true;
+        } else {
+            self.push_spill(op);
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn remove_spill(&mut self, id: StratumId) {
+        let mut i = 0;
+        while i < self.spill.len() {
+            if self.spill[i].id == id {
+                self.spill.remove(i);
+                break;
+            }
+            i += 1;
+        }
+    }
+
+    fn remove_by_id(&mut self, id: StratumId) {
+        if !self.spill.is_empty() {
+            self.remove_spill(id);
+            return;
+        }
+        if self.occupied[0] && self.inline[0].id == id {
+            if self.occupied[1] {
+                self.inline[0] =
+                    core::mem::replace(&mut self.inline[1], StratumOp::empty_placeholder());
+                self.occupied[1] = false;
+            } else {
+                self.inline[0] = StratumOp::empty_placeholder();
+                self.occupied[0] = false;
+            }
+        } else if self.occupied[1] && self.inline[1].id == id {
+            self.inline[1] = StratumOp::empty_placeholder();
+            self.occupied[1] = false;
+        }
+    }
+}
+
+impl Default for CandidateStore {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Small-vector storage for read-only `StratumId`s: stores up to 4 IDs inline,
+/// spilling cleanly to `Vec<StratumId>` on the 5th+ entry.
+/// Invariant: `occupied[k + 1] => occupied[k]`; when `!spill.is_empty()`, `occupied == [false; 4]`.
+#[derive(Clone, Debug)]
+struct ReadOnlyIdStore {
+    inline: [StratumId; 4],
+    occupied: [bool; 4],
+    spill: Vec<StratumId>,
+}
+
+impl ReadOnlyIdStore {
+    const fn new() -> Self {
+        Self { inline: [StratumId(0); 4], occupied: [false; 4], spill: Vec::new() }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn contains_spill(&self, id: StratumId) -> bool {
+        let mut i = 0;
+        while i < self.spill.len() {
+            if self.spill[i] == id {
+                return true;
+            }
+            i += 1;
+        }
+        false
+    }
+
+    fn contains(&self, id: StratumId) -> bool {
+        if self.spill.is_empty() {
+            (self.occupied[0] && self.inline[0] == id)
+                || (self.occupied[1] && self.inline[1] == id)
+                || (self.occupied[2] && self.inline[2] == id)
+                || (self.occupied[3] && self.inline[3] == id)
+        } else {
+            self.contains_spill(id)
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn push_spill(&mut self, id: StratumId) {
+        if self.spill.is_empty() {
+            self.spill.reserve(5);
+            let mut i = 0;
+            while i < 4 {
+                if self.occupied[i] {
+                    self.spill.push(self.inline[i]);
+                    self.inline[i] = StratumId(0);
+                    self.occupied[i] = false;
+                }
+                i += 1;
+            }
+        }
+        self.spill.push(id);
+    }
+
+    fn push(&mut self, id: StratumId) {
+        if !self.spill.is_empty() {
+            self.push_spill(id);
+        } else if !self.occupied[0] {
+            self.inline[0] = id;
+            self.occupied[0] = true;
+        } else if !self.occupied[1] {
+            self.inline[1] = id;
+            self.occupied[1] = true;
+        } else if !self.occupied[2] {
+            self.inline[2] = id;
+            self.occupied[2] = true;
+        } else if !self.occupied[3] {
+            self.inline[3] = id;
+            self.occupied[3] = true;
+        } else {
+            self.push_spill(id);
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn remove_spill(&mut self, id: StratumId) {
+        let mut i = 0;
+        while i < self.spill.len() {
+            if self.spill[i] == id {
+                self.spill.remove(i);
+                break;
+            }
+            i += 1;
+        }
+    }
+
+    fn remove_by_id(&mut self, id: StratumId) {
+        if !self.spill.is_empty() {
+            self.remove_spill(id);
+            return;
+        }
+        if self.occupied[0] && self.inline[0] == id {
+            if self.occupied[1] {
+                self.inline[0] = self.inline[1];
+                if self.occupied[2] {
+                    self.inline[1] = self.inline[2];
+                    if self.occupied[3] {
+                        self.inline[2] = self.inline[3];
+                        self.inline[3] = StratumId(0);
+                        self.occupied[3] = false;
+                    } else {
+                        self.inline[2] = StratumId(0);
+                        self.occupied[2] = false;
+                    }
+                } else {
+                    self.inline[1] = StratumId(0);
+                    self.occupied[1] = false;
+                }
+            } else {
+                self.inline[0] = StratumId(0);
+                self.occupied[0] = false;
+            }
+        } else if self.occupied[1] && self.inline[1] == id {
+            if self.occupied[2] {
+                self.inline[1] = self.inline[2];
+                if self.occupied[3] {
+                    self.inline[2] = self.inline[3];
+                    self.inline[3] = StratumId(0);
+                    self.occupied[3] = false;
+                } else {
+                    self.inline[2] = StratumId(0);
+                    self.occupied[2] = false;
+                }
+            } else {
+                self.inline[1] = StratumId(0);
+                self.occupied[1] = false;
+            }
+        } else if self.occupied[2] && self.inline[2] == id {
+            if self.occupied[3] {
+                self.inline[2] = self.inline[3];
+                self.inline[3] = StratumId(0);
+                self.occupied[3] = false;
+            } else {
+                self.inline[2] = StratumId(0);
+                self.occupied[2] = false;
+            }
+        } else if self.occupied[3] && self.inline[3] == id {
+            self.inline[3] = StratumId(0);
+            self.occupied[3] = false;
+        }
+    }
+}
+
+impl Default for ReadOnlyIdStore {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// TCB registry gating all candidate and promoted Strata.
 #[derive(Clone, Debug, Default)]
 pub struct StratumRegistry {
-    candidates: Vec<StratumOp>,
-    promoted: Vec<Stratum>,
-    read_only_ids: Vec<StratumId>,
+    candidates: CandidateStore,
+    promoted: StratumStore,
+    read_only_ids: ReadOnlyIdStore,
 }
 
-impl Drop for StratumRegistry {
-    fn drop(&mut self) {
-        if !self.promoted.is_empty() && self.promoted.len() <= 2 {
-            let _ = self.promoted.pop();
-            let _ = self.promoted.pop();
-        }
-        if !self.candidates.is_empty() && self.candidates.len() <= 2 {
-            let _ = self.candidates.pop();
-            let _ = self.candidates.pop();
+#[derive(Clone, Copy)]
+enum CheckTask {
+    Eval {
+        node: RegionNode,
+        limit: usize,
+        depth: usize,
+    },
+    StepBlock {
+        span: Span,
+        idx: u32,
+        limit: usize,
+        saved_env: usize,
+        yielded: Option<SmallTys>,
+        depth: usize,
+    },
+    AfterSubStmt {
+        results: Span,
+    },
+    AfterIfElse {
+        results: Span,
+    },
+    AfterBoundedLoop {
+        saved_env: usize,
+    },
+    AfterInvariantLoop {
+        state_vars: Span,
+        saved_env: usize,
+    },
+}
+
+const MAX_INLINE_CHECK_STACK: usize = 8;
+const MAX_CHECK_STACK: usize = MAX_CHECK_DEPTH * 5;
+
+struct CheckStacks {
+    inline_tasks: [CheckTask; MAX_INLINE_CHECK_STACK],
+    inline_task_len: usize,
+    spill_tasks: Vec<CheckTask>,
+    inline_tys: [SmallTys; MAX_INLINE_CHECK_STACK],
+    inline_ty_len: usize,
+    spill_tys: Vec<SmallTys>,
+}
+
+fn push_inline_or_spill<T: Copy>(
+    inline: &mut [T; MAX_INLINE_CHECK_STACK],
+    inline_len: &mut usize,
+    spill: &mut Vec<T>,
+    item: T,
+) -> Result<(), RegistryError> {
+    if *inline_len + spill.len() >= MAX_CHECK_STACK {
+        return Err(RegistryError::TypeMismatch);
+    }
+    if *inline_len < MAX_INLINE_CHECK_STACK {
+        inline[*inline_len] = item;
+        *inline_len += 1;
+    } else {
+        spill.push(item);
+    }
+    Ok(())
+}
+
+impl CheckStacks {
+    fn new() -> Self {
+        let dummy_task = CheckTask::AfterIfElse { results: Span::EMPTY };
+        Self {
+            inline_tasks: [dummy_task; MAX_INLINE_CHECK_STACK],
+            inline_task_len: 0,
+            spill_tasks: Vec::new(),
+            inline_tys: [SmallTys::EMPTY; MAX_INLINE_CHECK_STACK],
+            inline_ty_len: 0,
+            spill_tys: Vec::new(),
         }
     }
+
+    fn has_tasks(&self) -> bool {
+        self.inline_task_len > 0 || !self.spill_tasks.is_empty()
+    }
+
+    fn push_task(&mut self, task: CheckTask) -> Result<(), RegistryError> {
+        push_inline_or_spill(
+            &mut self.inline_tasks,
+            &mut self.inline_task_len,
+            &mut self.spill_tasks,
+            task,
+        )
+    }
+
+    fn pop_task(&mut self) -> CheckTask {
+        if !self.spill_tasks.is_empty() {
+            self.spill_tasks
+                .pop()
+                .unwrap_or(CheckTask::AfterIfElse { results: Span::EMPTY })
+        } else {
+            self.inline_task_len -= 1;
+            self.inline_tasks[self.inline_task_len]
+        }
+    }
+
+    fn push_ty(&mut self, ty: SmallTys) -> Result<(), RegistryError> {
+        push_inline_or_spill(
+            &mut self.inline_tys,
+            &mut self.inline_ty_len,
+            &mut self.spill_tys,
+            ty,
+        )
+    }
+
+    fn pop_ty(&mut self) -> Result<SmallTys, RegistryError> {
+        if !self.spill_tys.is_empty() {
+            self.spill_tys.pop().ok_or(RegistryError::TypeMismatch)
+        } else if self.inline_ty_len > 0 {
+            self.inline_ty_len -= 1;
+            Ok(self.inline_tys[self.inline_ty_len])
+        } else {
+            Err(RegistryError::TypeMismatch)
+        }
+    }
+}
+
+struct CheckCtx<'a> {
+    region: &'a Region,
+    caller_layer: u16,
+    promoted_only: bool,
+    self_op: Option<&'a StratumOp>,
 }
 
 impl StratumRegistry {
-    pub fn new() -> Self { Self::default() }
-    pub fn promoted(&self) -> &[Stratum] { &self.promoted }
-    pub fn candidates(&self) -> &[StratumOp] { &self.candidates }
+    pub const fn new() -> Self {
+        Self {
+            candidates: CandidateStore::new(),
+            promoted: StratumStore::new(),
+            read_only_ids: ReadOnlyIdStore::new(),
+        }
+    }
+
+    pub fn promoted(&self) -> &[Stratum] {
+        self.promoted.as_slice()
+    }
+
+    pub fn candidates(&self) -> &[StratumOp] {
+        self.candidates.as_slice()
+    }
+
     pub fn get_stratum(&self, id: StratumId) -> Option<&Stratum> {
-        match self.promoted.as_slice() {
-            [] => None,
-            [s0] => (s0.op.id == id).then_some(s0),
-            [s0, s1] => if s0.op.id == id { Some(s0) } else if s1.op.id == id { Some(s1) } else { None },
-            _ => self.promoted.iter().find(|s| s.op.id == id),
-        }
+        self.promoted.get_by_id(id)
     }
+
     pub fn get_op(&self, id: StratumId) -> Option<&StratumOp> {
-        if let Some(s) = self.get_stratum(id) { return Some(&s.op); }
-        match self.candidates.as_slice() {
-            [] => None,
-            [c0] => (c0.id == id).then_some(c0),
-            _ => self.candidates.iter().find(|o| o.id == id),
+        if let Some(s) = self.promoted.get_by_id(id) {
+            return Some(&s.op);
         }
+        self.candidates.get_by_id(id)
     }
+
     pub fn is_stratum_read_only(&self, id: StratumId) -> bool {
-        match self.read_only_ids.as_slice() {
-            [] => false,
-            [r0] => *r0 == id,
-            [r0, r1] => *r0 == id || *r1 == id,
-            _ => self.read_only_ids.contains(&id),
-        }
+        self.read_only_ids.contains(id)
     }
 
     /// Registers an unpromoted candidate op after validating layer `>= 1`, acyclicity, and SSA types.
     pub fn register_candidate_op(&mut self, op: StratumOp) -> Result<StratumId, RegistryError> {
+        if op.layer == 0 {
+            return Err(RegistryError::InvalidLayerZero);
+        }
         self.validate_op(&op, false)?;
         let id = op.id;
         if validate_read_only_with_registry(&op.body, self) && !self.is_stratum_read_only(id) {
@@ -311,56 +996,55 @@ impl StratumRegistry {
         Ok(id)
     }
 
-    fn check_one_law(&self, law: &Law, stratum_op: &StratumOp) -> Result<(), RegistryError> {
+    fn validate_law(
+        &self,
+        op: &StratumOp,
+        law: &Law,
+        tp: &mut TyPool,
+    ) -> Result<(), RegistryError> {
         check_law_digest(&law.proof_digest)?;
-        if let Some(pre) = &law.precondition {
-            if !validate_read_only_with_registry(pre, self) {
+        if law.precondition.pool.is_empty() {
+            if !law.precondition.is_empty_block() {
                 return Err(RegistryError::TypeMismatch);
             }
-            let mut env = TypeEnv::from_slice(&law.params);
-            if !self.check_region_entry(pre, &mut env, u16::MAX, true, Some(stratum_op))?.eq_slice(&[ValType::I32]) {
+        } else {
+            if !validate_read_only_with_registry(&law.precondition, self) {
+                return Err(RegistryError::TypeMismatch);
+            }
+            let pre_tys =
+                self.check_region(&law.precondition, &law.params, u16::MAX, true, Some(op), tp)?;
+            if !tp.eq_slice(pre_tys, &[ValType::I32]) {
                 return Err(RegistryError::TypeMismatch);
             }
         }
-        let mut lhs_env = TypeEnv::from_slice(&law.params);
-        let lhs_tys = self.check_region_entry(&law.lhs, &mut lhs_env, u16::MAX, true, Some(stratum_op))?;
-        let mut rhs_env = TypeEnv::from_slice(&law.params);
-        let rhs_tys = self.check_region_entry(&law.rhs, &mut rhs_env, u16::MAX, true, Some(stratum_op))?;
-        if lhs_tys != rhs_tys { return Err(RegistryError::TypeMismatch); }
+        let lhs_tys = self.check_region(&law.lhs, &law.params, u16::MAX, true, Some(op), tp)?;
+        let rhs_tys = self.check_region(&law.rhs, &law.params, u16::MAX, true, Some(op), tp)?;
+        if !tp.eq_tys(lhs_tys, rhs_tys) {
+            return Err(RegistryError::TypeMismatch);
+        }
         Ok(())
     }
 
     /// Admits a verified `Stratum` (acyclic op over already-promoted callees + >= 1 non-empty proved law).
     pub fn promote_stratum(&mut self, stratum: Stratum) -> Result<StratumId, RegistryError> {
-        match stratum.laws.as_slice() {
-            [] => return Err(RegistryError::MissingProvedLaw),
-            [law] => {
-                self.validate_op(&stratum.op, true)?;
-                self.check_one_law(law, &stratum.op)?;
-            }
-            laws => {
-                self.validate_op(&stratum.op, true)?;
-                for law in laws { self.check_one_law(law, &stratum.op)?; }
-            }
+        if !stratum.laws.has_first {
+            return Err(RegistryError::MissingProvedLaw);
         }
+        if stratum.op.layer == 0 {
+            return Err(RegistryError::InvalidLayerZero);
+        }
+        self.validate_op(&stratum.op, true)?;
+        let mut tp = TyPool::default();
+        self.validate_law(&stratum.op, &stratum.laws.first, &mut tp)?;
+        let mut l_idx = 0;
+        while l_idx < stratum.laws.rest.len() {
+            self.validate_law(&stratum.op, &stratum.laws.rest[l_idx], &mut tp)?;
+            l_idx += 1;
+        }
+
         let id = stratum.op.id;
-        let cand_pos = match self.candidates.as_slice() {
-            [] => None,
-            [c0] => (c0.id == id).then_some(0),
-            _ => self.candidates.iter().position(|c| c.id == id),
-        };
-        if let Some(pos) = cand_pos {
-            self.candidates.remove(pos);
-        }
-        let ro_pos = match self.read_only_ids.as_slice() {
-            [] => None,
-            [r0] => (*r0 == id).then_some(0),
-            [r0, r1] => if *r0 == id { Some(0) } else if *r1 == id { Some(1) } else { None },
-            _ => self.read_only_ids.iter().position(|&rid| rid == id),
-        };
-        if let Some(pos) = ro_pos {
-            self.read_only_ids.remove(pos);
-        }
+        self.candidates.remove_by_id(id);
+        self.read_only_ids.remove_by_id(id);
         if validate_read_only_with_registry(&stratum.op.body, self) {
             self.read_only_ids.push(id);
         }
@@ -369,23 +1053,17 @@ impl StratumRegistry {
     }
 
     fn validate_op(&self, op: &StratumOp, promoted_only: bool) -> Result<(), RegistryError> {
-        check_layer_non_zero(op.layer)?;
-        let dup_id = self.get_stratum(op.id).is_some()
-            || (!promoted_only && self.get_op(op.id).is_some());
-        if dup_id { return Err(RegistryError::DuplicateId); }
-        let dup_prom_name = match self.promoted.as_slice() {
-            [] => false,
-            [s0] => s0.op.name == op.name,
-            _ => self.promoted.iter().any(|s| s.op.name == op.name),
-        };
-        let dup_cand_name = match self.candidates.as_slice() {
-            [] => false,
-            [c0] => (!promoted_only || c0.id != op.id) && c0.name == op.name,
-            _ => self.candidates.iter().any(|c| (!promoted_only || c.id != op.id) && c.name == op.name),
-        };
-        if dup_prom_name || dup_cand_name { return Err(RegistryError::DuplicateName); }
-        let mut env = TypeEnv::from_slice(&op.params);
-        if !self.check_region_entry(&op.body, &mut env, op.layer, promoted_only, None)?.eq_slice(&op.results) {
+        if self.get_stratum(op.id).is_some() || (!promoted_only && self.get_op(op.id).is_some()) {
+            return Err(RegistryError::DuplicateId);
+        }
+        if self.promoted.has_name(&op.name)
+            || self.candidates.has_conflicting_name(&op.name, promoted_only, op.id)
+        {
+            return Err(RegistryError::DuplicateName);
+        }
+        let mut tp = TyPool::default();
+        let body_tys = self.check_region(&op.body, &op.params, op.layer, promoted_only, None, &mut tp)?;
+        if !tp.eq_slice(body_tys, &op.results) {
             return Err(RegistryError::TypeMismatch);
         }
         Ok(())
@@ -409,29 +1087,31 @@ impl StratumRegistry {
         }
     }
 
-    fn lookup_ty(id: ValId, env: &TypeEnv) -> Result<ValType, RegistryError> {
-        env.lookup(id)
-    }
-
     fn expect_ty(id: ValId, ty: ValType, env: &TypeEnv) -> Result<(), RegistryError> {
-        if Self::lookup_ty(id, env)? == ty { Ok(()) } else { Err(RegistryError::TypeMismatch) }
+        if env.lookup(id)? == ty { Ok(()) } else { Err(RegistryError::TypeMismatch) }
     }
 
-    #[inline(never)]
     fn check_op(op: &Op, declared_ty: ValType, env: &TypeEnv) -> Result<ValType, RegistryError> {
         match op {
             Op::ConstI32(_) | Op::MemorySize(_) => Ok(ValType::I32),
             Op::ConstI64(_) => Ok(ValType::I64),
-            Op::Copy(v) => Self::lookup_ty(*v, env),
+            Op::Copy(v) => env.lookup(*v),
             Op::Select { cond, true_val, false_val } => {
                 Self::expect_ty(*cond, ValType::I32, env)?;
-                let t = Self::lookup_ty(*true_val, env)?;
+                let t = env.lookup(*true_val)?;
                 Self::expect_ty(*false_val, t, env)?;
                 Ok(t)
             }
             Op::GlobalGet(_) => Ok(declared_ty),
-            Op::Un(u, v) => { Self::expect_ty(*v, u.input_ty(), env)?; Ok(u.output_ty()) }
-            Op::Bin(b, l, r) => { Self::expect_ty(*l, b.operand_ty(), env)?; Self::expect_ty(*r, b.operand_ty(), env)?; Ok(b.output_ty()) }
+            Op::Un(u, v) => {
+                Self::expect_ty(*v, u.input_ty(), env)?;
+                Ok(u.output_ty())
+            }
+            Op::Bin(b, l, r) => {
+                Self::expect_ty(*l, b.operand_ty(), env)?;
+                Self::expect_ty(*r, b.operand_ty(), env)?;
+                Ok(b.output_ty())
+            }
             Op::Load { addr, width, result_ty, .. } => {
                 Self::expect_ty(*addr, ValType::I32, env)?;
                 if *width == MemWidth::B8 && *result_ty != ValType::I64 {
@@ -439,444 +1119,669 @@ impl StratumRegistry {
                 }
                 Ok(*result_ty)
             }
-            Op::MemoryGrow { delta, .. } => { Self::expect_ty(*delta, ValType::I32, env)?; Ok(ValType::I32) }
+            Op::MemoryGrow { delta, .. } => {
+                Self::expect_ty(*delta, ValType::I32, env)?;
+                Ok(ValType::I32)
+            }
         }
     }
 
-    #[inline(never)]
     fn check_effect(eff: &EffectOp, env: &TypeEnv) -> Result<(), RegistryError> {
         match eff {
             EffectOp::Store { addr, val, width, .. } => {
                 Self::expect_ty(*addr, ValType::I32, env)?;
-                let vty = Self::lookup_ty(*val, env)?;
-                if *width == MemWidth::B8 && vty != ValType::I64 { return Err(RegistryError::TypeMismatch); }
+                let vty = env.lookup(*val)?;
+                if *width == MemWidth::B8 && vty != ValType::I64 {
+                    return Err(RegistryError::TypeMismatch);
+                }
             }
-            EffectOp::MemoryCopy { dst, src, len, .. } | EffectOp::MemoryFill { dst, val: src, len, .. } => {
+            EffectOp::MemoryCopy { dst, src, len, .. }
+            | EffectOp::MemoryFill { dst, val: src, len, .. } => {
                 Self::expect_ty(*dst, ValType::I32, env)?;
                 Self::expect_ty(*src, ValType::I32, env)?;
                 Self::expect_ty(*len, ValType::I32, env)?;
             }
-            EffectOp::GlobalSet { val, .. } => { Self::lookup_ty(*val, env)?; }
+            EffectOp::GlobalSet { val, .. } => {
+                env.lookup(*val)?;
+            }
             EffectOp::Trap(_) | EffectOp::Nop => {}
         }
         Ok(())
     }
 
+    fn check_vals_defined(reg: &Region, vs: Span, env: &TypeEnv) -> Result<(), RegistryError> {
+        let mut i = 0;
+        while i < vs.len {
+            let v = reg.try_val(vs, i).ok_or(RegistryError::TypeMismatch)?;
+            env.lookup(v)?;
+            i += 1;
+        }
+        Ok(())
+    }
+
     fn record_exit_tys(
-        yielded: &mut Option<RetTys>,
-        vs: &[ValId],
+        tp: &mut TyPool,
+        reg: &Region,
+        yielded: &mut Option<SmallTys>,
+        vs: Span,
         env: &TypeEnv,
     ) -> Result<(), RegistryError> {
-        let mut cur = RetTys::default();
-        match vs {
-            [] => {}
-            [v0] => cur.push(Self::lookup_ty(*v0, env)?),
-            [v0, v1] => { cur.push(Self::lookup_ty(*v0, env)?); cur.push(Self::lookup_ty(*v1, env)?); }
-            _ => {
-                let mut i = 0;
-                while i < vs.len() {
-                    cur.push(Self::lookup_ty(vs[i], env)?);
-                    i += 1;
-                }
-            }
-        }
-        match yielded {
+        let cur = tp.intern_vals(reg, vs, env)?;
+        match *yielded {
             None => *yielded = Some(cur),
-            Some(prev) if *prev == cur => {}
+            Some(prev) if tp.eq_tys(prev, cur) => {}
             Some(_) => return Err(RegistryError::TypeMismatch),
         }
         Ok(())
     }
 
-    fn check_vals_defined(vs: &[ValId], env: &TypeEnv) -> Result<(), RegistryError> {
-        match vs {
-            [] => Ok(()),
-            [v0] => Self::lookup_ty(*v0, env).map(|_| ()),
-            [v0, v1] => { Self::lookup_ty(*v0, env)?; Self::lookup_ty(*v1, env).map(|_| ()) }
-            _ => {
-                let mut i = 0;
-                while i < vs.len() {
-                    Self::lookup_ty(vs[i], env)?;
-                    i += 1;
-                }
-                Ok(())
-            }
-        }
-    }
-
-    fn check_flat_stmt(
-        &self,
-        stmt: &Stmt,
-        env: &mut TypeEnv,
-        yielded: &mut Option<RetTys>,
-        caller_layer: u16,
-        promoted_only: bool,
-        self_op: Option<&StratumOp>,
+    fn check_loop_inits(
+        region: &Region,
+        init_vars: Span,
+        state_vars: Span,
+        env: &TypeEnv,
     ) -> Result<(), RegistryError> {
-        match stmt {
-            Stmt::Let { dst, ty, op } => {
-                if Self::check_op(op, *ty, env)? != *ty { return Err(RegistryError::TypeMismatch); }
-                env.push(*dst, *ty);
-            }
-            Stmt::Effect(eff) => Self::check_effect(eff, env)?,
-            Stmt::Call { results, target, args } => match target {
-                CallTarget::Stratum(sid) => {
-                    let callee = self.resolve_callee(*sid, promoted_only, self_op)?;
-                    check_callee_layer(caller_layer, *sid, callee.layer)?;
-                    if args.len() != callee.params.len() || results.len() != callee.results.len() {
-                        return Err(RegistryError::TypeMismatch);
-                    }
-                    match results.as_slice() {
-                        [] => {}
-                        [r0] => if r0.1 != callee.results[0] { return Err(RegistryError::TypeMismatch); },
-                        _ => {
-                            let mut i = 0;
-                            while i < results.len() {
-                                if results[i].1 != callee.results[i] { return Err(RegistryError::TypeMismatch); }
-                                i += 1;
-                            }
-                        }
-                    }
-                    env.extend_slice(results);
-                    match args.as_slice() {
-                        [] => {}
-                        [a0] => Self::expect_ty(*a0, callee.params[0].1, env)?,
-                        _ => {
-                            let mut j = 0;
-                            while j < args.len() {
-                                Self::expect_ty(args[j], callee.params[j].1, env)?;
-                                j += 1;
-                            }
-                        }
-                    }
-                }
-                _ => {
-                    Self::check_vals_defined(args, env)?;
-                    env.extend_slice(results);
-                }
-            },
-            Stmt::Yield(vs) | Stmt::Return(vs) => Self::record_exit_tys(yielded, vs, env)?,
-            Stmt::Break { depth, cond, values } => {
-                if let Some(c) = cond { Self::expect_ty(*c, ValType::I32, env)?; }
-                if *depth == 0 {
-                    Self::record_exit_tys(yielded, values, env)?;
-                } else {
-                    Self::check_vals_defined(values, env)?;
-                }
-            }
-            Stmt::Continue { cond, values, .. } => {
-                if let Some(c) = cond { Self::expect_ty(*c, ValType::I32, env)?; }
-                Self::check_vals_defined(values, env)?;
-            }
-            Stmt::Region { .. } => unreachable!(),
+        if init_vars.len != state_vars.len {
+            return Err(RegistryError::TypeMismatch);
+        }
+        let mut i = 0;
+        while i < init_vars.len {
+            let iv = region.try_val(init_vars, i).ok_or(RegistryError::TypeMismatch)?;
+            let (_, sv_ty) = region.try_var(state_vars, i).ok_or(RegistryError::TypeMismatch)?;
+            Self::expect_ty(iv, sv_ty, env)?;
+            i += 1;
         }
         Ok(())
     }
 
-    fn check_region_entry(
+    fn check_simple_slot(
         &self,
-        region: &Region,
+        ctx: &CheckCtx<'_>,
+        slot: IrSlot,
         env: &mut TypeEnv,
-        caller_layer: u16,
-        promoted_only: bool,
-        self_op: Option<&StratumOp>,
-    ) -> Result<RetTys, RegistryError> {
-        if let Region::Block(stmts) = region {
-            match stmts.as_slice() {
-                [] => return Ok(RetTys::default()),
-                [s0] if !matches!(s0, Stmt::Region { .. }) => {
-                    let saved = env.len();
-                    let mut yielded = None;
-                    let res = self.check_flat_stmt(s0, env, &mut yielded, caller_layer, promoted_only, self_op);
-                    env.truncate(saved);
-                    res?;
-                    return Ok(yielded.unwrap_or_default());
+        tp: &mut TyPool,
+        yielded: &mut Option<SmallTys>,
+    ) -> Result<(), RegistryError> {
+        match slot.tag {
+            TAG_STMT_LET => {
+                let (dst, ty, op) = slot.to_let_op().ok_or(RegistryError::TypeMismatch)?;
+                if Self::check_op(&op, ty, env)? != ty {
+                    return Err(RegistryError::TypeMismatch);
                 }
-                _ => {}
+                env.push(dst, ty);
+            }
+            TAG_STMT_EFFECT => {
+                let eff = slot.to_effect().ok_or(RegistryError::TypeMismatch)?;
+                Self::check_effect(&eff, env)?;
+            }
+            TAG_STMT_CALL => {
+                let results = Span { start: slot.w0, len: slot.w1 };
+                let args = Span { start: slot.w3, len: slot.w4 };
+                if slot.sub == CALL_STRATUM {
+                    let sid = StratumId(slot.w2);
+                    let callee = self.resolve_callee(sid, ctx.promoted_only, ctx.self_op)?;
+                    if callee.layer >= ctx.caller_layer {
+                        return Err(RegistryError::NonAcyclicLayer {
+                            caller_layer: ctx.caller_layer,
+                            callee: sid,
+                            callee_layer: callee.layer,
+                        });
+                    }
+                    if args.len_usize() != callee.params.len()
+                        || results.len_usize() != callee.results.len()
+                    {
+                        return Err(RegistryError::TypeMismatch);
+                    }
+                    let mut j = 0;
+                    while j < args.len {
+                        let aid = ctx.region.try_val(args, j).ok_or(RegistryError::TypeMismatch)?;
+                        Self::expect_ty(aid, callee.params[j as usize].1, env)?;
+                        j += 1;
+                    }
+                    let mut k = 0;
+                    while k < results.len {
+                        let (rid, rty) =
+                            ctx.region.try_var(results, k).ok_or(RegistryError::TypeMismatch)?;
+                        if rty != callee.results[k as usize] {
+                            return Err(RegistryError::TypeMismatch);
+                        }
+                        env.push(rid, rty);
+                        k += 1;
+                    }
+                } else if slot.sub == CALL_FUNC || slot.sub == CALL_HOST {
+                    Self::check_vals_defined(ctx.region, args, env)?;
+                    env.extend_vars(ctx.region, results)?;
+                } else {
+                    return Err(RegistryError::TypeMismatch);
+                }
+            }
+            TAG_STMT_YIELD | TAG_STMT_RETURN => {
+                let vs = Span { start: slot.w0, len: slot.w1 };
+                Self::record_exit_tys(tp, ctx.region, yielded, vs, env)?;
+            }
+            TAG_STMT_BREAK | TAG_STMT_CONTINUE => {
+                if slot.sub != 0 {
+                    Self::expect_ty(ValId(slot.w1), ValType::I32, env)?;
+                }
+                let values = Span { start: slot.w2, len: slot.w3 };
+                if slot.tag == TAG_STMT_BREAK && slot.w0 == 0 {
+                    Self::record_exit_tys(tp, ctx.region, yielded, values, env)?;
+                } else {
+                    Self::check_vals_defined(ctx.region, values, env)?;
+                }
+            }
+            _ => return Err(RegistryError::TypeMismatch),
+        }
+        Ok(())
+    }
+
+    #[inline(never)]
+    fn check_region_nested(
+        &self,
+        ctx: &CheckCtx<'_>,
+        env: &mut TypeEnv,
+        first_task: CheckTask,
+        tp: &mut TyPool,
+    ) -> Result<SmallTys, RegistryError> {
+        let region = ctx.region;
+        let mut st = CheckStacks::new();
+        st.push_task(first_task)?;
+
+        while st.has_tasks() {
+            match st.pop_task() {
+                CheckTask::Eval { node, limit, depth } => {
+                    if depth >= MAX_CHECK_DEPTH {
+                        return Err(RegistryError::TypeMismatch);
+                    }
+                    match node {
+                        RegionNode::Block(span) if span.is_empty() => {
+                            st.push_ty(SmallTys::EMPTY)?;
+                        }
+                        RegionNode::Block(span) => {
+                            st.push_task(CheckTask::StepBlock {
+                                span,
+                                idx: 0,
+                                limit,
+                                saved_env: env.len(),
+                                yielded: None,
+                                depth,
+                            })?;
+                        }
+                        RegionNode::IfElse { cond, then_region, else_region, results } => {
+                            Self::expect_ty(cond, ValType::I32, env)?;
+                            let then_n = region
+                                .try_node_below(then_region, limit)
+                                .ok_or(RegistryError::TypeMismatch)?;
+                            let else_n = region
+                                .try_node_below(else_region, limit)
+                                .ok_or(RegistryError::TypeMismatch)?;
+                            st.push_task(CheckTask::AfterIfElse { results })?;
+                            st.push_task(CheckTask::Eval {
+                                node: else_n,
+                                limit: else_region.0 as usize,
+                                depth: depth + 1,
+                            })?;
+                            st.push_task(CheckTask::Eval {
+                                node: then_n,
+                                limit: then_region.0 as usize,
+                                depth: depth + 1,
+                            })?;
+                        }
+                        RegionNode::BoundedLoop { init_vars, state_vars, body, .. } => {
+                            Self::check_loop_inits(region, init_vars, state_vars, env)?;
+                            let saved_env = env.len();
+                            env.extend_vars(region, state_vars)?;
+                            let body_n = region
+                                .try_node_below(body, limit)
+                                .ok_or(RegistryError::TypeMismatch)?;
+                            st.push_task(CheckTask::AfterBoundedLoop { saved_env })?;
+                            st.push_task(CheckTask::Eval {
+                                node: body_n,
+                                limit: body.0 as usize,
+                                depth: depth + 1,
+                            })?;
+                        }
+                        RegionNode::InvariantLoop {
+                            init_vars,
+                            state_vars,
+                            cond,
+                            invariant_pred,
+                            fuel_measure,
+                            body,
+                        } => {
+                            Self::check_loop_inits(region, init_vars, state_vars, env)?;
+                            let saved_env = env.len();
+                            env.extend_vars(region, state_vars)?;
+                            let (Some(c), Some(inv), Some(f), Some(b)) = (
+                                region.try_node_below(cond, limit),
+                                region.try_node_below(invariant_pred, limit),
+                                region.try_node_below(fuel_measure, limit),
+                                region.try_node_below(body, limit),
+                            ) else {
+                                return Err(RegistryError::TypeMismatch);
+                            };
+                            st.push_task(CheckTask::AfterInvariantLoop { state_vars, saved_env })?;
+                            st.push_task(CheckTask::Eval {
+                                node: b,
+                                limit: body.0 as usize,
+                                depth: depth + 1,
+                            })?;
+                            st.push_task(CheckTask::Eval {
+                                node: f,
+                                limit: fuel_measure.0 as usize,
+                                depth: depth + 1,
+                            })?;
+                            st.push_task(CheckTask::Eval {
+                                node: inv,
+                                limit: invariant_pred.0 as usize,
+                                depth: depth + 1,
+                            })?;
+                            st.push_task(CheckTask::Eval {
+                                node: c,
+                                limit: cond.0 as usize,
+                                depth: depth + 1,
+                            })?;
+                        }
+                    }
+                }
+                CheckTask::StepBlock { span, idx, limit, saved_env, mut yielded, depth } => {
+                    if idx >= span.len {
+                        env.truncate(saved_env);
+                        st.push_ty(yielded.unwrap_or(SmallTys::EMPTY))?;
+                        continue;
+                    }
+                    let Some(pos) = span.start.checked_add(idx) else {
+                        return Err(RegistryError::TypeMismatch);
+                    };
+                    let pos = pos as usize;
+                    if pos >= region.pool.len() {
+                        return Err(RegistryError::TypeMismatch);
+                    }
+                    let slot = region.pool[pos];
+                    if !slot.is_stmt() {
+                        return Err(RegistryError::TypeMismatch);
+                    }
+                    if slot.tag == TAG_STMT_REGION {
+                        let results = Span { start: slot.w0, len: slot.w1 };
+                        let sub_id = RegionNodeId(slot.w2);
+                        let sub_n = region
+                            .try_node_below(sub_id, limit)
+                            .ok_or(RegistryError::TypeMismatch)?;
+                        st.push_task(CheckTask::StepBlock {
+                            span,
+                            idx: idx + 1,
+                            limit,
+                            saved_env,
+                            yielded,
+                            depth,
+                        })?;
+                        st.push_task(CheckTask::AfterSubStmt { results })?;
+                        st.push_task(CheckTask::Eval {
+                            node: sub_n,
+                            limit: sub_id.0 as usize,
+                            depth: depth + 1,
+                        })?;
+                        continue;
+                    }
+                    self.check_simple_slot(ctx, slot, env, tp, &mut yielded)?;
+                    if idx + 1 < span.len {
+                        st.push_task(CheckTask::StepBlock {
+                            span,
+                            idx: idx + 1,
+                            limit,
+                            saved_env,
+                            yielded,
+                            depth,
+                        })?;
+                    } else {
+                        env.truncate(saved_env);
+                        st.push_ty(yielded.unwrap_or(SmallTys::EMPTY))?;
+                    }
+                }
+                CheckTask::AfterSubStmt { results } => {
+                    let sub_tys = st.pop_ty()?;
+                    if !tp.eq_vars_span(sub_tys, region, results) {
+                        return Err(RegistryError::TypeMismatch);
+                    }
+                    env.extend_vars(region, results)?;
+                }
+                CheckTask::AfterIfElse { results } => {
+                    let else_tys = st.pop_ty()?;
+                    let then_tys = st.pop_ty()?;
+                    if !tp.eq_tys_span(then_tys, region, results)
+                        || !tp.eq_tys_span(else_tys, region, results)
+                    {
+                        return Err(RegistryError::TypeMismatch);
+                    }
+                    st.push_ty(tp.intern_tys_span(region, results)?)?;
+                }
+                CheckTask::AfterBoundedLoop { saved_env } => {
+                    env.truncate(saved_env);
+                }
+                CheckTask::AfterInvariantLoop { state_vars, saved_env } => {
+                    let _body_tys = st.pop_ty()?;
+                    let fuel_tys = st.pop_ty()?;
+                    let inv_tys = st.pop_ty()?;
+                    let cond_tys = st.pop_ty()?;
+                    env.truncate(saved_env);
+                    if !tp.eq_slice(cond_tys, &[ValType::I32])
+                        || !tp.eq_slice(inv_tys, &[ValType::I32])
+                        || !tp.eq_slice(fuel_tys, &[ValType::I64])
+                    {
+                        return Err(RegistryError::TypeMismatch);
+                    }
+                    st.push_ty(tp.intern_vars_span(region, state_vars)?)?;
+                }
             }
         }
-        self.check_region(region, env, caller_layer, promoted_only, self_op)
+        st.pop_ty()
     }
 
     fn check_region(
         &self,
-        root: &Region,
-        env: &mut TypeEnv,
-        root_caller_layer: u16,
+        region: &Region,
+        params: &[(ValId, ValType)],
+        caller_layer: u16,
         promoted_only: bool,
         self_op: Option<&StratumOp>,
-    ) -> Result<RetTys, RegistryError> {
-        enum CheckTask<'a> {
-            Enter { region: &'a Region, caller_layer: u16 },
-            StepBlock {
-                stmts: &'a [Stmt],
-                idx: usize,
-                saved: usize,
-                yielded: Option<RetTys>,
-                caller_layer: u16,
-            },
-            FinishSubRegion {
-                results: &'a [(ValId, ValType)],
-                stmts: &'a [Stmt],
-                next_idx: usize,
-                saved: usize,
-                yielded: Option<RetTys>,
-                caller_layer: u16,
-            },
-            FinishIf { results: &'a [ValType] },
-            RestoreEnv { saved: usize },
-            FinishInv { state_vars: &'a [(ValId, ValType)], saved: usize },
+        tp: &mut TyPool,
+    ) -> Result<SmallTys, RegistryError> {
+        if region.pool.is_empty() {
+            return if region.is_empty_block() {
+                Ok(SmallTys::EMPTY)
+            } else {
+                Err(RegistryError::TypeMismatch)
+            };
         }
-
-        let mut tasks = Stack2::with_first(CheckTask::Enter { region: root, caller_layer: root_caller_layer });
-        let mut vals = Stack2::<RetTys>::new();
-        'outer: while let Some(task) = tasks.pop() {
-            match task {
-                CheckTask::Enter { region, caller_layer } => match region {
-                    Region::Block(stmts) => tasks.push(CheckTask::StepBlock {
-                        stmts,
-                        idx: 0,
-                        saved: env.len(),
-                        yielded: None,
-                        caller_layer,
-                    }),
-                    Region::IfElse { cond, then_region, else_region, results } => {
-                        Self::expect_ty(*cond, ValType::I32, env)?;
-                        tasks.push(CheckTask::FinishIf { results });
-                        tasks.push(CheckTask::Enter { region: else_region, caller_layer });
-                        tasks.push(CheckTask::Enter { region: then_region, caller_layer });
-                    }
-                    Region::BoundedLoop { init_vars, state_vars, body, .. } => {
-                        if init_vars.len() != state_vars.len() {
-                            return Err(RegistryError::TypeMismatch);
-                        }
-                        let mut i = 0;
-                        while i < init_vars.len() {
-                            Self::expect_ty(init_vars[i], state_vars[i].1, env)?;
-                            i += 1;
-                        }
-                        let saved = env.len();
-                        env.extend_slice(state_vars);
-                        tasks.push(CheckTask::RestoreEnv { saved });
-                        tasks.push(CheckTask::Enter { region: body, caller_layer });
-                    }
-                    Region::InvariantLoop { init_vars, state_vars, cond, invariant_pred, fuel_measure, body } => {
-                        if init_vars.len() != state_vars.len() {
-                            return Err(RegistryError::TypeMismatch);
-                        }
-                        let mut i = 0;
-                        while i < init_vars.len() {
-                            Self::expect_ty(init_vars[i], state_vars[i].1, env)?;
-                            i += 1;
-                        }
-                        let saved = env.len();
-                        env.extend_slice(state_vars);
-                        tasks.push(CheckTask::FinishInv { state_vars, saved });
-                        tasks.push(CheckTask::Enter { region: body, caller_layer });
-                        tasks.push(CheckTask::Enter { region: fuel_measure, caller_layer });
-                        tasks.push(CheckTask::Enter { region: invariant_pred, caller_layer });
-                        tasks.push(CheckTask::Enter { region: cond, caller_layer });
-                    }
-                },
-                CheckTask::StepBlock { stmts, mut idx, saved, mut yielded, caller_layer } => {
-                    while idx < stmts.len() {
-                        if let Stmt::Region { results, region: sub } = &stmts[idx] {
-                            tasks.push(CheckTask::FinishSubRegion {
-                                results,
-                                stmts,
-                                next_idx: idx + 1,
-                                saved,
-                                yielded,
-                                caller_layer,
-                            });
-                            tasks.push(CheckTask::Enter { region: sub, caller_layer });
-                            continue 'outer;
-                        }
-                        if let Err(e) = self.check_flat_stmt(
-                            &stmts[idx],
-                            env,
-                            &mut yielded,
-                            caller_layer,
-                            promoted_only,
-                            self_op,
-                        ) {
-                            env.truncate(saved);
-                            return Err(e);
-                        }
-                        idx += 1;
-                    }
-                    env.truncate(saved);
-                    vals.push(yielded.unwrap_or_default());
+        if region.is_empty_block() {
+            return Ok(SmallTys::EMPTY);
+        }
+        let ctx = CheckCtx { region, caller_layer, promoted_only, self_op };
+        let mut env = TypeEnv::new(params);
+        if let RegionNode::Block(span) = region.root {
+            let saved_env = env.len();
+            let mut yielded = None;
+            let mut idx = 0;
+            while idx < span.len {
+                let Some(pos) = span.start.checked_add(idx) else {
+                    return Err(RegistryError::TypeMismatch);
+                };
+                let pos = pos as usize;
+                if pos >= region.pool.len() {
+                    return Err(RegistryError::TypeMismatch);
                 }
-                CheckTask::FinishSubRegion { results, stmts, next_idx, saved, yielded, caller_layer } => {
-                    let tys = vals.pop().unwrap_or_default();
-                    if !tys.eq_pairs(results) {
-                        env.truncate(saved);
-                        return Err(RegistryError::TypeMismatch);
-                    }
-                    env.extend_slice(results);
-                    tasks.push(CheckTask::StepBlock { stmts, idx: next_idx, saved, yielded, caller_layer });
+                let slot = region.pool[pos];
+                if !slot.is_stmt() {
+                    return Err(RegistryError::TypeMismatch);
                 }
-                CheckTask::FinishIf { results } => {
-                    let else_tys = vals.pop().unwrap_or_default();
-                    let then_tys = vals.pop().unwrap_or_default();
-                    if !then_tys.eq_slice(results) || !else_tys.eq_slice(results) {
-                        return Err(RegistryError::TypeMismatch);
-                    }
-                    vals.push(RetTys::from_slice(results));
+                if slot.tag == TAG_STMT_REGION {
+                    return self.check_region_nested(
+                        &ctx,
+                        &mut env,
+                        CheckTask::StepBlock {
+                            span,
+                            idx,
+                            limit: region.pool.len(),
+                            saved_env,
+                            yielded,
+                            depth: 0,
+                        },
+                        tp,
+                    );
                 }
-                CheckTask::RestoreEnv { saved } => {
-                    env.truncate(saved);
-                }
-                CheckTask::FinishInv { state_vars, saved } => {
-                    let _body_tys = vals.pop().unwrap_or_default();
-                    let fuel_tys = vals.pop().unwrap_or_default();
-                    let inv_tys = vals.pop().unwrap_or_default();
-                    let cond_tys = vals.pop().unwrap_or_default();
-                    env.truncate(saved);
-                    if !cond_tys.eq_slice(&[ValType::I32])
-                        || !inv_tys.eq_slice(&[ValType::I32])
-                        || !fuel_tys.eq_slice(&[ValType::I64])
-                    {
-                        return Err(RegistryError::TypeMismatch);
-                    }
-                    vals.push(RetTys::from_pairs(state_vars));
-                }
+                self.check_simple_slot(&ctx, slot, &mut env, tp, &mut yielded)?;
+                idx += 1;
             }
+            return Ok(yielded.unwrap_or(SmallTys::EMPTY));
         }
-        Ok(vals.pop().unwrap_or_default())
+        self.check_region_nested(
+            &ctx,
+            &mut env,
+            CheckTask::Eval { node: region.root, limit: region.pool.len(), depth: 0 },
+            tp,
+        )
     }
 
-    /// Expands all `CallTarget::Stratum` calls into Layer-0 primitives.
-    pub fn lower_region_to_layer0(&self, region: &Region, next_val: &mut u32) -> Result<Region, RegistryError> {
+    /// Expands all `CallTarget::Stratum` calls into Layer-0 primitives across DAG layers.
+    pub fn lower_region_to_layer0(
+        &self,
+        region: &Region,
+        next_val: &mut u32,
+    ) -> Result<Region, RegistryError> {
         *next_val = (*next_val).max(max_val_id_in_region(region));
-        self.lower_inner(region, next_val)
+        let mut cur = region.clone();
+        let mut pass = 0usize;
+        loop {
+            if pass >= MAX_CHECK_DEPTH {
+                return Err(RegistryError::TypeMismatch);
+            }
+            let (next_reg, changed) = self.expand_stratum_calls_once(&cur, next_val)?;
+            if !changed {
+                return Ok(next_reg);
+            }
+            cur = next_reg;
+            pass += 1;
+        }
     }
 
-    fn lower_inner(&self, root: &Region, next_val: &mut u32) -> Result<Region, RegistryError> {
-        enum LowerTask<'a> {
-            Enter(&'a Region),
-            StepBlock { stmts: &'a [Stmt], idx: usize, out: Vec<Stmt> },
-            FinishSubRegion { results: &'a [(ValId, ValType)], stmts: &'a [Stmt], next_idx: usize, out: Vec<Stmt> },
-            FinishStratumCall {
-                results: &'a [(ValId, ValType)],
-                args: &'a [ValId],
-                params: &'a [(ValId, ValType)],
-                stmts: &'a [Stmt],
-                next_idx: usize,
-                out: Vec<Stmt>,
-            },
-            BuildIf { cond: ValId, results: &'a [ValType] },
-            BuildBounded { max_iters: u32, init_vars: &'a [ValId], state_vars: &'a [(ValId, ValType)] },
-            BuildInv { init_vars: &'a [ValId], state_vars: &'a [(ValId, ValType)] },
+    fn expand_stratum_calls_once(
+        &self,
+        src: &Region,
+        next_val: &mut u32,
+    ) -> Result<(Region, bool), RegistryError> {
+        if src.is_empty_block() {
+            return Ok((Region::empty(), false));
         }
+        let mut out = RegionBuilder::with_capacity(src.pool.len());
+        let mut changed = false;
+        let root_out =
+            self.lower_node(src, src.root, src.pool.len(), next_val, &mut out, &mut changed, 0)?;
+        Ok((out.finish_node(root_out), changed))
+    }
 
-        let mut tasks = Stack2::with_first(LowerTask::Enter(root));
-        let mut vals = Stack2::<Region>::new();
-        'outer_low: while let Some(task) = tasks.pop() {
-            match task {
-                LowerTask::Enter(region) => match region {
-                    Region::Block(stmts) => tasks.push(LowerTask::StepBlock {
-                        stmts,
-                        idx: 0,
-                        out: Vec::new(),
-                    }),
-                    Region::IfElse { cond, then_region, else_region, results } => {
-                        tasks.push(LowerTask::BuildIf { cond: *cond, results });
-                        tasks.push(LowerTask::Enter(else_region));
-                        tasks.push(LowerTask::Enter(then_region));
-                    }
-                    Region::BoundedLoop { max_iters, init_vars, state_vars, body } => {
-                        tasks.push(LowerTask::BuildBounded { max_iters: *max_iters, init_vars, state_vars });
-                        tasks.push(LowerTask::Enter(body));
-                    }
-                    Region::InvariantLoop { init_vars, state_vars, cond, invariant_pred, fuel_measure, body } => {
-                        tasks.push(LowerTask::BuildInv { init_vars, state_vars });
-                        tasks.push(LowerTask::Enter(body));
-                        tasks.push(LowerTask::Enter(fuel_measure));
-                        tasks.push(LowerTask::Enter(invariant_pred));
-                        tasks.push(LowerTask::Enter(cond));
-                    }
-                },
-                LowerTask::StepBlock { stmts, mut idx, mut out } => {
-                    while idx < stmts.len() {
-                        match &stmts[idx] {
-                            Stmt::Call { results, target: CallTarget::Stratum(sid), args } => {
-                                let op = self.get_op(*sid).ok_or(RegistryError::UnknownStratum(*sid))?;
-                                if args.len() != op.params.len() {
-                                    return Err(RegistryError::TypeMismatch);
-                                }
-                                tasks.push(LowerTask::FinishStratumCall {
-                                    results,
-                                    args,
-                                    params: &op.params,
-                                    stmts,
-                                    next_idx: idx + 1,
-                                    out,
-                                });
-                                tasks.push(LowerTask::Enter(&op.body));
-                                continue 'outer_low;
+    #[allow(clippy::too_many_arguments)]
+    fn lower_node(
+        &self,
+        src: &Region,
+        node: RegionNode,
+        limit: usize,
+        next_val: &mut u32,
+        out: &mut RegionBuilder,
+        changed: &mut bool,
+        depth: usize,
+    ) -> Result<RegionNode, RegistryError> {
+        if depth >= MAX_CHECK_DEPTH {
+            return Err(RegistryError::TypeMismatch);
+        }
+        let copy_vals = |span: Span, b: &mut RegionBuilder| -> Result<Span, RegistryError> {
+            if span.is_empty() {
+                return Ok(Span::EMPTY);
+            }
+            let start = b.pool.len() as u32;
+            for i in 0..span.len {
+                b.pool.push(IrSlot::val(src.try_val(span, i).ok_or(RegistryError::TypeMismatch)?));
+            }
+            Ok(Span { start, len: span.len })
+        };
+        let copy_vars = |span: Span, b: &mut RegionBuilder| -> Result<Span, RegistryError> {
+            if span.is_empty() {
+                return Ok(Span::EMPTY);
+            }
+            let start = b.pool.len() as u32;
+            for i in 0..span.len {
+                let (id, ty) = src.try_var(span, i).ok_or(RegistryError::TypeMismatch)?;
+                b.pool.push(IrSlot::var(id, ty));
+            }
+            Ok(Span { start, len: span.len })
+        };
+        let copy_tys = |span: Span, b: &mut RegionBuilder| -> Result<Span, RegistryError> {
+            if span.is_empty() {
+                return Ok(Span::EMPTY);
+            }
+            let start = b.pool.len() as u32;
+            for i in 0..span.len {
+                b.pool.push(IrSlot::ty(src.try_ty(span, i).ok_or(RegistryError::TypeMismatch)?));
+            }
+            Ok(Span { start, len: span.len })
+        };
+
+        match node {
+            RegionNode::Block(span) if span.is_empty() => Ok(RegionNode::Block(Span::EMPTY)),
+            RegionNode::Block(span) => {
+                let mut stmts = Vec::with_capacity(span.len_usize());
+                for i in 0..span.len {
+                    let stmt = src.try_stmt(span, i).ok_or(RegistryError::TypeMismatch)?;
+                    match stmt {
+                        Stmt::Call { results, target: CallTarget::Stratum(sid), args } => {
+                            let op = self.get_op(sid).ok_or(RegistryError::UnknownStratum(sid))?;
+                            if args.len_usize() != op.params.len() {
+                                return Err(RegistryError::TypeMismatch);
                             }
-                            Stmt::Region { results, region: sub } => {
-                                tasks.push(LowerTask::FinishSubRegion { results, stmts, next_idx: idx + 1, out });
-                                tasks.push(LowerTask::Enter(sub));
-                                continue 'outer_low;
+                            let mut map = Vec::with_capacity(op.params.len());
+                            for j in 0..args.len {
+                                let aid =
+                                    src.try_val(args, j).ok_or(RegistryError::TypeMismatch)?;
+                                map.push((op.params[j as usize].0, aid));
                             }
-                            other => {
-                                out.push(other.clone());
-                                idx += 1;
-                            }
+                            let remapped = remap_region_vals(&op.body, &map, next_val);
+                            let new_res = copy_vars(results, out)?;
+                            let sub_id = out.embed_region_id(&remapped);
+                            stmts.push(Stmt::Region { results: new_res, region: sub_id });
+                            *changed = true;
                         }
+                        Stmt::Region { results, region: sub_id } => {
+                            let sub = src
+                                .try_node_below(sub_id, limit)
+                                .ok_or(RegistryError::TypeMismatch)?;
+                            let new_res = copy_vars(results, out)?;
+                            let sub_n = self.lower_node(
+                                src,
+                                sub,
+                                sub_id.0 as usize,
+                                next_val,
+                                out,
+                                changed,
+                                depth + 1,
+                            )?;
+                            let new_sub_id = out.alloc_node(sub_n);
+                            stmts.push(Stmt::Region { results: new_res, region: new_sub_id });
+                        }
+                        Stmt::Call { results, target, args } => {
+                            let r = copy_vars(results, out)?;
+                            let a = copy_vals(args, out)?;
+                            stmts.push(Stmt::Call { results: r, target, args: a });
+                        }
+                        Stmt::Yield(vs) => stmts.push(Stmt::Yield(copy_vals(vs, out)?)),
+                        Stmt::Return(vs) => stmts.push(Stmt::Return(copy_vals(vs, out)?)),
+                        Stmt::Break { depth: br_d, cond, values } => stmts.push(Stmt::Break {
+                            depth: br_d,
+                            cond,
+                            values: copy_vals(values, out)?,
+                        }),
+                        Stmt::Continue { depth: ct_d, cond, values } => {
+                            stmts.push(Stmt::Continue {
+                                depth: ct_d,
+                                cond,
+                                values: copy_vals(values, out)?,
+                            });
+                        }
+                        other => stmts.push(other),
                     }
-                    vals.push(Region::Block(out));
                 }
-                LowerTask::FinishSubRegion { results, stmts, next_idx, mut out } => {
-                    let sub = vals.pop().unwrap_or_else(|| Region::Block(Vec::new()));
-                    out.push(Stmt::Region { results: results.to_vec(), region: sub });
-                    tasks.push(LowerTask::StepBlock { stmts, idx: next_idx, out });
-                }
-                LowerTask::FinishStratumCall { results, args, params, stmts, next_idx, mut out } => {
-                    let lowered = vals.pop().unwrap_or_else(|| Region::Block(Vec::new()));
-                    let map: Vec<(ValId, ValId)> = params.iter().map(|&(p, _)| p).zip(args.iter().copied()).collect();
-                    let remapped = remap_region_vals(&lowered, &map, next_val);
-                    out.push(Stmt::Region { results: results.to_vec(), region: remapped });
-                    tasks.push(LowerTask::StepBlock { stmts, idx: next_idx, out });
-                }
-                LowerTask::BuildIf { cond, results } => {
-                    let else_r = vals.pop().unwrap_or_else(|| Region::Block(Vec::new()));
-                    let then_r = vals.pop().unwrap_or_else(|| Region::Block(Vec::new()));
-                    vals.push(Region::IfElse {
-                        cond,
-                        results: results.to_vec(),
-                        then_region: Box::new(then_r),
-                        else_region: Box::new(else_r),
-                    });
-                }
-                LowerTask::BuildBounded { max_iters, init_vars, state_vars } => {
-                    let body_r = vals.pop().unwrap_or_else(|| Region::Block(Vec::new()));
-                    vals.push(Region::BoundedLoop {
-                        max_iters,
-                        init_vars: init_vars.to_vec(),
-                        state_vars: state_vars.to_vec(),
-                        body: Box::new(body_r),
-                    });
-                }
-                LowerTask::BuildInv { init_vars, state_vars } => {
-                    let body_r = vals.pop().unwrap_or_else(|| Region::Block(Vec::new()));
-                    let fuel_r = vals.pop().unwrap_or_else(|| Region::Block(Vec::new()));
-                    let inv_r = vals.pop().unwrap_or_else(|| Region::Block(Vec::new()));
-                    let cond_r = vals.pop().unwrap_or_else(|| Region::Block(Vec::new()));
-                    vals.push(Region::InvariantLoop {
-                        init_vars: init_vars.to_vec(),
-                        state_vars: state_vars.to_vec(),
-                        cond: Box::new(cond_r),
-                        invariant_pred: Box::new(inv_r),
-                        fuel_measure: Box::new(fuel_r),
-                        body: Box::new(body_r),
-                    });
-                }
+                Ok(RegionNode::Block(out.alloc_stmts(&stmts)))
+            }
+            RegionNode::IfElse { cond, then_region, else_region, results } => {
+                let res = copy_tys(results, out)?;
+                let t = src
+                    .try_node_below(then_region, limit)
+                    .ok_or(RegistryError::TypeMismatch)?;
+                let e = src
+                    .try_node_below(else_region, limit)
+                    .ok_or(RegistryError::TypeMismatch)?;
+                let t_n = self.lower_node(
+                    src,
+                    t,
+                    then_region.0 as usize,
+                    next_val,
+                    out,
+                    changed,
+                    depth + 1,
+                )?;
+                let e_n = self.lower_node(
+                    src,
+                    e,
+                    else_region.0 as usize,
+                    next_val,
+                    out,
+                    changed,
+                    depth + 1,
+                )?;
+                let t_id = out.alloc_node(t_n);
+                let e_id = out.alloc_node(e_n);
+                Ok(RegionNode::IfElse { cond, then_region: t_id, else_region: e_id, results: res })
+            }
+            RegionNode::BoundedLoop { max_iters, init_vars, state_vars, body } => {
+                let iv = copy_vals(init_vars, out)?;
+                let sv = copy_vars(state_vars, out)?;
+                let b = src.try_node_below(body, limit).ok_or(RegistryError::TypeMismatch)?;
+                let b_n =
+                    self.lower_node(src, b, body.0 as usize, next_val, out, changed, depth + 1)?;
+                let b_id = out.alloc_node(b_n);
+                Ok(RegionNode::BoundedLoop { max_iters, init_vars: iv, state_vars: sv, body: b_id })
+            }
+            RegionNode::InvariantLoop {
+                init_vars,
+                state_vars,
+                cond,
+                invariant_pred,
+                fuel_measure,
+                body,
+            } => {
+                let iv = copy_vals(init_vars, out)?;
+                let sv = copy_vars(state_vars, out)?;
+                let (Some(c), Some(inv), Some(f), Some(b)) = (
+                    src.try_node_below(cond, limit),
+                    src.try_node_below(invariant_pred, limit),
+                    src.try_node_below(fuel_measure, limit),
+                    src.try_node_below(body, limit),
+                ) else {
+                    return Err(RegistryError::TypeMismatch);
+                };
+                let c_n =
+                    self.lower_node(src, c, cond.0 as usize, next_val, out, changed, depth + 1)?;
+                let inv_n = self.lower_node(
+                    src,
+                    inv,
+                    invariant_pred.0 as usize,
+                    next_val,
+                    out,
+                    changed,
+                    depth + 1,
+                )?;
+                let f_n = self.lower_node(
+                    src,
+                    f,
+                    fuel_measure.0 as usize,
+                    next_val,
+                    out,
+                    changed,
+                    depth + 1,
+                )?;
+                let b_n =
+                    self.lower_node(src, b, body.0 as usize, next_val, out, changed, depth + 1)?;
+                let c_id = out.alloc_node(c_n);
+                let inv_id = out.alloc_node(inv_n);
+                let f_id = out.alloc_node(f_n);
+                let b_id = out.alloc_node(b_n);
+                Ok(RegionNode::InvariantLoop {
+                    init_vars: iv,
+                    state_vars: sv,
+                    cond: c_id,
+                    invariant_pred: inv_id,
+                    fuel_measure: f_id,
+                    body: b_id,
+                })
             }
         }
-        Ok(vals.pop().unwrap_or_else(|| Region::Block(Vec::new())))
     }
 }

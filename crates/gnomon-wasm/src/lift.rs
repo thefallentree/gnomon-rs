@@ -4,7 +4,8 @@ use std::collections::{BTreeSet, HashMap};
 
 use gnomon_kernel::{
     BinOp, CallTarget, EffectOp, FuncDef, FuncId, GlobalDef, GlobalId, HostCallId, HostContract,
-    MemId, MemWidth, MemoryDef, Module, Op, Region, Stmt, TrapCode, UnOp, Val, ValId, ValType,
+    MemId, MemWidth, MemoryDef, Module, Op, Region, RegionBuilder, RegionNode, Stmt, TrapCode,
+    UnOp, Val, ValId, ValType,
 };
 use wasmparser::{
     BlockType, CompositeInnerType, ConstExpr, DataKind, ExternalKind, FuncType, FunctionBody,
@@ -315,14 +316,10 @@ pub fn lift_wasm(bytes: &[u8]) -> Result<Module, WasmError> {
             .map(|(k, &ty)| (ValId(base + k as u32), ty))
             .collect();
         let true_pred = || {
-            Region::Block(vec![
-                Stmt::Let {
-                    dst: ValId(0),
-                    ty: ValType::I32,
-                    op: Op::ConstI32(1),
-                },
-                Stmt::Yield(vec![ValId(0)]),
-            ])
+            Region::build(|b| {
+                b.push_let(ValId(0), ValType::I32, Op::ConstI32(1));
+                b.push_yield(&[ValId(0)]);
+            })
         };
         host_contracts.push(HostContract {
             id: HostCallId(i as u32),
@@ -689,6 +686,7 @@ fn lift_function(
 
     let mut_locals_table = prescan_mut_locals(body)?;
     let mut next_frame_id = 1usize;
+    let mut rb = RegionBuilder::new();
 
     let mut frames: Vec<ControlFrame> = vec![ControlFrame {
         kind: FrameKind::Func,
@@ -892,7 +890,8 @@ fn lift_function(
                         .collect();
                     yielded.extend(f.mut_local_vals(&f.local_env));
                     if !yielded.is_empty() {
-                        f.stmts.push(Stmt::Yield(yielded));
+                        let span = rb.alloc_vals(&yielded);
+                        f.stmts.push(Stmt::Yield(span));
                     }
                 }
                 f.then_stmts = std::mem::take(&mut f.stmts);
@@ -904,18 +903,19 @@ fn lift_function(
             Operator::End => {
                 if frames.len() == 1 {
                     let root = frames.pop().unwrap();
+                    let mut stmts = root.stmts;
                     if root.reachable {
                         let ret_len = root.results.len();
                         let split = root.stack.len().saturating_sub(ret_len);
                         let ret_vals: Vec<ValId> =
                             root.stack[split..].iter().map(|&(id, _)| id).collect();
-                        let mut stmts = root.stmts;
                         if !ret_vals.is_empty() {
-                            stmts.push(Stmt::Yield(ret_vals));
+                            let span = rb.alloc_vals(&ret_vals);
+                            stmts.push(Stmt::Yield(span));
                         }
-                        return Ok((func_params, Region::Block(stmts)));
                     }
-                    return Ok((func_params, Region::Block(root.stmts)));
+                    let root_span = rb.alloc_stmts(&stmts);
+                    return Ok((func_params, rb.finish_node(RegionNode::Block(root_span))));
                 }
 
                 let mut f = frames.pop().unwrap();
@@ -927,7 +927,8 @@ fn lift_function(
                         .collect();
                     yielded.extend(f.mut_local_vals(&f.local_env));
                     if !yielded.is_empty() {
-                        f.stmts.push(Stmt::Yield(yielded));
+                        let span = rb.alloc_vals(&yielded);
+                        f.stmts.push(Stmt::Yield(span));
                     }
                 }
 
@@ -944,14 +945,19 @@ fn lift_function(
                     region_results.push((alloc.fresh(), local_types[loc as usize]));
                 }
 
-                let region = match f.kind {
-                    FrameKind::Block => Region::Block(f.stmts),
-                    FrameKind::Loop => Region::BoundedLoop {
-                        max_iters: u32::MAX,
-                        init_vars: f.loop_init_vars,
-                        state_vars: f.loop_state_vars,
-                        body: Box::new(Region::Block(f.stmts)),
-                    },
+                let sub_id = match f.kind {
+                    FrameKind::Block => rb.alloc_block(&f.stmts),
+                    FrameKind::Loop => {
+                        let inits = rb.alloc_vals(&f.loop_init_vars);
+                        let states = rb.alloc_vars(&f.loop_state_vars);
+                        let body_id = rb.alloc_block(&f.stmts);
+                        rb.alloc_node(RegionNode::BoundedLoop {
+                            max_iters: u32::MAX,
+                            init_vars: inits,
+                            state_vars: states,
+                            body: body_id,
+                        })
+                    }
                     FrameKind::If => {
                         let cond = f.if_cond.expect("reachable if has cond");
                         let (then_stmts, else_stmts) = if f.seen_else {
@@ -963,18 +969,22 @@ fn lift_function(
                             let else_stmts = if implicit_else_vals.is_empty() {
                                 Vec::new()
                             } else {
-                                vec![Stmt::Yield(implicit_else_vals)]
+                                let span = rb.alloc_vals(&implicit_else_vals);
+                                vec![Stmt::Yield(span)]
                             };
                             (f.stmts, else_stmts)
                         };
                         let res_tys: Vec<ValType> =
                             region_results.iter().map(|&(_, ty)| ty).collect();
-                        Region::IfElse {
+                        let then_id = rb.alloc_block(&then_stmts);
+                        let else_id = rb.alloc_block(&else_stmts);
+                        let res_span = rb.alloc_tys(&res_tys);
+                        rb.alloc_node(RegionNode::IfElse {
                             cond,
-                            then_region: Box::new(Region::Block(then_stmts)),
-                            else_region: Box::new(Region::Block(else_stmts)),
-                            results: res_tys,
-                        }
+                            then_region: then_id,
+                            else_region: else_id,
+                            results: res_span,
+                        })
                     }
                     FrameKind::Func => unreachable!(),
                 };
@@ -990,9 +1000,10 @@ fn lift_function(
                 {
                     parent.local_env[loc as usize] = id;
                 }
+                let res_span = rb.alloc_vars(&region_results);
                 parent.stmts.push(Stmt::Region {
-                    results: region_results,
-                    region,
+                    results: res_span,
+                    region: sub_id,
                 });
             }
             Operator::Br { relative_depth } => {
@@ -1008,17 +1019,18 @@ fn lift_function(
                 for loc in mut_locs {
                     vals.push(cur.local_env[loc as usize]);
                 }
+                let vs = rb.alloc_vals(&vals);
                 cur.stmts.push(if is_loop {
                     Stmt::Continue {
                         depth: relative_depth,
                         cond: None,
-                        values: vals,
+                        values: vs,
                     }
                 } else {
                     Stmt::Break {
                         depth: relative_depth,
                         cond: None,
-                        values: vals,
+                        values: vs,
                     }
                 });
                 cur.reachable = false;
@@ -1037,17 +1049,18 @@ fn lift_function(
                 for loc in mut_locs {
                     vals.push(cur.local_env[loc as usize]);
                 }
+                let vs = rb.alloc_vals(&vals);
                 cur.stmts.push(if is_loop {
                     Stmt::Continue {
                         depth: relative_depth,
                         cond: Some(cond),
-                        values: vals,
+                        values: vs,
                     }
                 } else {
                     Stmt::Break {
                         depth: relative_depth,
                         cond: Some(cond),
-                        values: vals,
+                        values: vs,
                     }
                 });
             }
@@ -1075,6 +1088,7 @@ fn lift_function(
                     let tframe = &frames[tidx];
                     let mut vals = label_vals.clone();
                     vals.extend(tframe.mut_local_vals(&cur_locals));
+                    let vs = rb.alloc_vals(&vals);
                     let c_const = alloc.fresh();
                     let cond_id = alloc.fresh();
                     arm_stmts.push(Stmt::Let {
@@ -1091,30 +1105,31 @@ fn lift_function(
                         Stmt::Continue {
                             depth: d,
                             cond: Some(cond_id),
-                            values: vals,
+                            values: vs,
                         }
                     } else {
                         Stmt::Break {
                             depth: d,
                             cond: Some(cond_id),
-                            values: vals,
+                            values: vs,
                         }
                     });
                 }
                 let def_frame = &frames[default_idx];
                 let mut def_vals = label_vals;
                 def_vals.extend(def_frame.mut_local_vals(&cur_locals));
+                let def_vs = rb.alloc_vals(&def_vals);
                 arm_stmts.push(if def_frame.kind == FrameKind::Loop {
                     Stmt::Continue {
                         depth: default_depth,
                         cond: None,
-                        values: def_vals,
+                        values: def_vs,
                     }
                 } else {
                     Stmt::Break {
                         depth: default_depth,
                         cond: None,
-                        values: def_vals,
+                        values: def_vs,
                     }
                 });
 
@@ -1130,7 +1145,8 @@ fn lift_function(
                     .into_iter()
                     .map(|(id, _)| id)
                     .collect();
-                cur.stmts.push(Stmt::Return(ret_vals));
+                let vs = rb.alloc_vals(&ret_vals);
+                cur.stmts.push(Stmt::Return(vs));
                 cur.reachable = false;
                 cur.stack.clear();
             }
@@ -1246,10 +1262,12 @@ fn lift_function(
                 for &(id, ty) in &results {
                     cur.stack.push((id, ty));
                 }
+                let res_span = rb.alloc_vars(&results);
+                let arg_span = rb.alloc_vals(&args);
                 cur.stmts.push(Stmt::Call {
-                    results,
+                    results: res_span,
                     target,
-                    args,
+                    args: arg_span,
                 });
             }
             Operator::I32Const { value } => {

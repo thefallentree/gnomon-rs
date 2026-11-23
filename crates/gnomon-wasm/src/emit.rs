@@ -5,7 +5,7 @@ use std::collections::HashMap;
 
 use gnomon_kernel::{
     BinOp, CallTarget, EffectOp, FuncDef, FuncId, GlobalId, HostCallId, MemId, MemWidth, Module,
-    Op, Region, Stmt, UnOp, Val, ValId, ValType,
+    Op, RegionNode, RegionRef, Span, Stmt, UnOp, Val, ValId, ValType,
 };
 use wasm_encoder::{
     BlockType, CodeSection, ConstExpr, DataSection, EntityType, ExportKind, ExportSection,
@@ -370,11 +370,12 @@ fn emit_function(
 
     {
         let mut sink = InstructionSink::new(&mut inst_bytes);
-        match &f.body {
-            Region::Block(stmts) => {
-                emit_block_stmts(ctx, type_pool, &mut locals, &mut frames, &mut sink, stmts)?;
+        let root_ref = f.body.as_ref();
+        match root_ref.node {
+            RegionNode::Block(stmts) => {
+                emit_block_stmts(ctx, type_pool, &mut locals, &mut frames, &mut sink, root_ref, stmts)?;
             }
-            other => {
+            _ => {
                 let mut root_frames = Vec::new();
                 emit_region(
                     ctx,
@@ -382,7 +383,7 @@ fn emit_function(
                     &mut locals,
                     &mut root_frames,
                     &mut sink,
-                    other,
+                    root_ref,
                     &f.results,
                 )?;
             }
@@ -403,72 +404,78 @@ fn emit_region(
     locals: &mut LocalEnv,
     frames: &mut Vec<EmitFrame>,
     sink: &mut InstructionSink<'_>,
-    region: &Region,
+    region: RegionRef<'_>,
     expected_results: &[ValType],
 ) -> Result<bool, WasmError> {
-    match region {
-        Region::Block(stmts) => {
+    match region.node {
+        RegionNode::Block(stmts) => {
             let bt = type_pool.block_type(expected_results);
             sink.block(bt);
             frames.push(EmitFrame::Block {
                 ir_depth_cost: true,
             });
             let saved = locals.bindings.clone();
-            let res = emit_block_stmts(ctx, type_pool, locals, frames, sink, stmts);
+            let res = emit_block_stmts(ctx, type_pool, locals, frames, sink, region, stmts);
             locals.bindings = saved;
             let fell_through = res?;
             frames.pop();
             sink.end();
             Ok(fell_through)
         }
-        Region::IfElse {
+        RegionNode::IfElse {
             cond,
             then_region,
             else_region,
             results,
         } => {
-            let (cond_local, _) = locals.get(*cond)?;
+            let (cond_local, _) = locals.get(cond)?;
             sink.local_get(cond_local);
-            let bt = type_pool.block_type(results);
+            let res_tys = region.region.tys_vec(results);
+            let bt = type_pool.block_type(&res_tys);
             sink.if_(bt);
 
-            emit_if_branch(ctx, type_pool, locals, frames, sink, then_region, results)?;
-            let skip_else = results.is_empty()
-                && matches!(else_region.as_ref(), Region::Block(s) if s.is_empty());
+            let then_ref = region.child(then_region).ok_or_else(|| {
+                WasmError::ValidationError("invalid IfElse then_region node id".into())
+            })?;
+            let else_ref = region.child(else_region).ok_or_else(|| {
+                WasmError::ValidationError("invalid IfElse else_region node id".into())
+            })?;
+            emit_if_branch(ctx, type_pool, locals, frames, sink, then_ref, &res_tys)?;
+            let skip_else = res_tys.is_empty() && else_ref.is_empty_block();
             if !skip_else {
                 sink.else_();
-                emit_if_branch(ctx, type_pool, locals, frames, sink, else_region, results)?;
+                emit_if_branch(ctx, type_pool, locals, frames, sink, else_ref, &res_tys)?;
             }
             sink.end();
             Ok(true)
         }
-        Region::BoundedLoop {
+        RegionNode::BoundedLoop {
             max_iters,
             init_vars,
             state_vars,
             body,
         } => {
-            if init_vars.len() != state_vars.len() {
+            if init_vars.len != state_vars.len {
                 return Err(WasmError::ValidationError(
                     "BoundedLoop init_vars/state_vars length mismatch".into(),
                 ));
             }
-            for &iv in init_vars {
+            for iv in region.vals(init_vars) {
                 let (l, _) = locals.get(iv)?;
                 sink.local_get(l);
             }
             let saved_bindings = locals.bindings.clone();
-            let mut state_locals = Vec::with_capacity(state_vars.len());
-            for &(sv, ty) in state_vars {
+            let mut state_locals = Vec::with_capacity(state_vars.len_usize());
+            for (sv, ty) in region.vars(state_vars) {
                 state_locals.push(locals.bind(sv, ty));
             }
             for &sl in state_locals.iter().rev() {
                 sink.local_set(sl);
             }
 
-            let rem_local = if *max_iters < u32::MAX {
+            let rem_local = if max_iters < u32::MAX {
                 let rl = locals.alloc_temp(ValType::I32);
-                sink.i32_const(*max_iters as i32);
+                sink.i32_const(max_iters as i32);
                 sink.local_set(rl);
                 Some(rl)
             } else {
@@ -483,7 +490,6 @@ fn emit_region(
                 sink.local_get(rl);
                 sink.i32_eqz();
                 sink.if_(BlockType::Empty);
-                // Exhaust fuel cleanly so Wasmtime reports TrapCode::OutOfFuel, matching gnomon-kernel.
                 sink.loop_(BlockType::Empty);
                 sink.br(0);
                 sink.end();
@@ -498,17 +504,20 @@ fn emit_region(
             frames.push(EmitFrame::LoopExit);
             frames.push(EmitFrame::LoopCont { state_locals });
 
-            let body_res = match body.as_ref() {
-                Region::Block(stmts) => {
-                    emit_block_stmts(ctx, type_pool, locals, frames, sink, stmts)
+            let body_ref = region.child(body).ok_or_else(|| {
+                WasmError::ValidationError("invalid BoundedLoop body node id".into())
+            })?;
+            let body_res = match body_ref.node {
+                RegionNode::Block(stmts) => {
+                    emit_block_stmts(ctx, type_pool, locals, frames, sink, body_ref, stmts)
                 }
-                other => emit_region(
+                _ => emit_region(
                     ctx,
                     type_pool,
                     locals,
                     frames,
                     sink,
-                    other,
+                    body_ref,
                     expected_results,
                 ),
             };
@@ -521,57 +530,60 @@ fn emit_region(
             sink.end();
             Ok(true)
         }
-        Region::InvariantLoop {
+        RegionNode::InvariantLoop {
             init_vars,
             state_vars,
             cond,
             body,
             ..
         } => {
-            if init_vars.len() != state_vars.len() {
+            if init_vars.len != state_vars.len {
                 return Err(WasmError::ValidationError(
                     "InvariantLoop init_vars/state_vars length mismatch".into(),
                 ));
             }
-            for &iv in init_vars {
+            for iv in region.vals(init_vars) {
                 let (l, _) = locals.get(iv)?;
                 sink.local_get(l);
             }
             let saved_bindings = locals.bindings.clone();
-            let mut state_locals = Vec::with_capacity(state_vars.len());
-            for &(sv, ty) in state_vars {
+            let mut state_locals = Vec::with_capacity(state_vars.len_usize());
+            let mut state_tys = Vec::with_capacity(state_vars.len_usize());
+            for (sv, ty) in region.vars(state_vars) {
                 state_locals.push(locals.bind(sv, ty));
+                state_tys.push(ty);
             }
             for &sl in state_locals.iter().rev() {
                 sink.local_set(sl);
             }
 
-            let state_tys: Vec<ValType> = state_vars.iter().map(|&(_, t)| t).collect();
             let bt = type_pool.block_type(&state_tys);
             sink.block(bt);
             sink.loop_(bt);
 
-            // Evaluate loop condition region (returns single i32 on stack).
-            let cond_res: Result<bool, WasmError> = match cond.as_ref() {
-                Region::Block(stmts) => {
+            let cond_ref = region.child(cond).ok_or_else(|| {
+                WasmError::ValidationError("invalid InvariantLoop cond node id".into())
+            })?;
+            let cond_res: Result<bool, WasmError> = match cond_ref.node {
+                RegionNode::Block(stmts) => {
                     sink.block(BlockType::Result(WValType::I32));
                     frames.push(EmitFrame::Block {
                         ir_depth_cost: true,
                     });
                     let saved_cond = locals.bindings.clone();
-                    let r = emit_block_stmts(ctx, type_pool, locals, frames, sink, stmts);
+                    let r = emit_block_stmts(ctx, type_pool, locals, frames, sink, cond_ref, stmts);
                     locals.bindings = saved_cond;
                     frames.pop();
                     sink.end();
                     r
                 }
-                other => emit_region(
+                _ => emit_region(
                     ctx,
                     type_pool,
                     locals,
                     frames,
                     sink,
-                    other,
+                    cond_ref,
                     &[ValType::I32],
                 ),
             };
@@ -585,7 +597,7 @@ fn emit_region(
             for &sl in &state_locals {
                 sink.local_get(sl);
             }
-            sink.br(2); // 0 = this if, 1 = $cont, 2 = $exit
+            sink.br(2);
             sink.end();
 
             frames.push(EmitFrame::LoopExit);
@@ -593,14 +605,17 @@ fn emit_region(
                 state_locals: state_locals.clone(),
             });
 
-            let body_res = match body.as_ref() {
-                Region::Block(stmts) => {
+            let body_ref = region.child(body).ok_or_else(|| {
+                WasmError::ValidationError("invalid InvariantLoop body node id".into())
+            })?;
+            let body_res = match body_ref.node {
+                RegionNode::Block(stmts) => {
                     let saved_body = locals.bindings.clone();
-                    let r = emit_block_stmts(ctx, type_pool, locals, frames, sink, stmts);
+                    let r = emit_block_stmts(ctx, type_pool, locals, frames, sink, body_ref, stmts);
                     locals.bindings = saved_body;
                     r
                 }
-                other => emit_region(ctx, type_pool, locals, frames, sink, other, &state_tys),
+                _ => emit_region(ctx, type_pool, locals, frames, sink, body_ref, &state_tys),
             };
             locals.bindings = saved_bindings;
             let body_fell = body_res?;
@@ -626,20 +641,20 @@ fn emit_if_branch(
     locals: &mut LocalEnv,
     frames: &mut Vec<EmitFrame>,
     sink: &mut InstructionSink<'_>,
-    branch: &Region,
+    branch: RegionRef<'_>,
     expected_results: &[ValType],
 ) -> Result<(), WasmError> {
     let saved = locals.bindings.clone();
-    let res = match branch {
-        Region::Block(stmts) => {
+    let res = match branch.node {
+        RegionNode::Block(stmts) => {
             frames.push(EmitFrame::Block {
                 ir_depth_cost: true,
             });
-            let r = emit_block_stmts(ctx, type_pool, locals, frames, sink, stmts);
+            let r = emit_block_stmts(ctx, type_pool, locals, frames, sink, branch, stmts);
             frames.pop();
             r.map(|_| ())
         }
-        other => {
+        _ => {
             frames.push(EmitFrame::Block {
                 ir_depth_cost: false,
             });
@@ -649,7 +664,7 @@ fn emit_if_branch(
                 locals,
                 frames,
                 sink,
-                other,
+                branch,
                 expected_results,
             );
             frames.pop();
@@ -660,7 +675,7 @@ fn emit_if_branch(
     res
 }
 
-/// Emits statements in a `Region::Block`. Returns `true` if control could fall through
+/// Emits statements in a `RegionNode::Block`. Returns `true` if control could fall through
 /// normally without hitting an unconditional terminator (`Yield`/`Break`/`Continue`/`Return`/`Trap`).
 fn emit_block_stmts(
     ctx: &EmitCtx<'_>,
@@ -668,26 +683,30 @@ fn emit_block_stmts(
     locals: &mut LocalEnv,
     frames: &mut Vec<EmitFrame>,
     sink: &mut InstructionSink<'_>,
-    stmts: &[Stmt],
+    owner: RegionRef<'_>,
+    stmts: Span,
 ) -> Result<bool, WasmError> {
-    for stmt in stmts {
+    for stmt in owner.stmts(stmts) {
         match stmt {
             Stmt::Let { dst, ty, op } => {
-                emit_op(ctx, locals, sink, op)?;
-                let l = locals.bind(*dst, *ty);
+                emit_op(ctx, locals, sink, &op)?;
+                let l = locals.bind(dst, ty);
                 sink.local_set(l);
             }
             Stmt::Effect(eff) => {
-                let trapped = emit_effect(ctx, locals, sink, eff)?;
+                let trapped = emit_effect(ctx, locals, sink, &eff)?;
                 if trapped {
                     return Ok(false);
                 }
             }
             Stmt::Region { results, region } => {
-                let res_tys: Vec<ValType> = results.iter().map(|&(_, ty)| ty).collect();
-                emit_region(ctx, type_pool, locals, frames, sink, region, &res_tys)?;
-                let mut res_locals = Vec::with_capacity(results.len());
-                for &(id, ty) in results {
+                let res_tys: Vec<ValType> = owner.vars(results).map(|(_, ty)| ty).collect();
+                let sub_ref = owner.child(region).ok_or_else(|| {
+                    WasmError::ValidationError("invalid Stmt::Region node id".into())
+                })?;
+                emit_region(ctx, type_pool, locals, frames, sink, sub_ref, &res_tys)?;
+                let mut res_locals = Vec::with_capacity(results.len_usize());
+                for (id, ty) in owner.vars(results) {
                     res_locals.push(locals.bind(id, ty));
                 }
                 for &rl in res_locals.iter().rev() {
@@ -699,15 +718,15 @@ fn emit_block_stmts(
                 target,
                 args,
             } => {
-                for &a in args {
+                for a in owner.vals(args) {
                     let (l, _) = locals.get(a)?;
                     sink.local_get(l);
                 }
                 let func_idx = match target {
-                    CallTarget::Func(fid) => *ctx.func_map.get(fid).ok_or_else(|| {
+                    CallTarget::Func(fid) => *ctx.func_map.get(&fid).ok_or_else(|| {
                         WasmError::ValidationError(format!("unknown FuncId {fid:?}"))
                     })?,
-                    CallTarget::Host(hid) => *ctx.host_map.get(hid).ok_or_else(|| {
+                    CallTarget::Host(hid) => *ctx.host_map.get(&hid).ok_or_else(|| {
                         WasmError::ValidationError(format!("unknown HostCallId {hid:?}"))
                     })?,
                     CallTarget::Stratum(sid) => {
@@ -717,8 +736,8 @@ fn emit_block_stmts(
                     }
                 };
                 sink.call(func_idx);
-                let mut res_locals = Vec::with_capacity(results.len());
-                for &(id, ty) in results {
+                let mut res_locals = Vec::with_capacity(results.len_usize());
+                for (id, ty) in owner.vars(results) {
                     res_locals.push(locals.bind(id, ty));
                 }
                 for &rl in res_locals.iter().rev() {
@@ -726,14 +745,14 @@ fn emit_block_stmts(
                 }
             }
             Stmt::Yield(vals) => {
-                for &v in vals {
+                for v in owner.vals(vals) {
                     let (l, _) = locals.get(v)?;
                     sink.local_get(l);
                 }
                 return Ok(true);
             }
             Stmt::Return(vals) => {
-                for &v in vals {
+                for v in owner.vals(vals) {
                     let (l, _) = locals.get(v)?;
                     sink.local_get(l);
                 }
@@ -745,14 +764,14 @@ fn emit_block_stmts(
                 cond,
                 values,
             } => {
-                let target = resolve_target(frames, *depth, false)?;
+                let target = resolve_target(frames, depth, false)?;
                 let wasm_depth = match target {
                     Target::Block { wasm_depth } => wasm_depth,
                     Target::Loop { .. } => unreachable!(),
                 };
                 match cond {
                     None => {
-                        for &v in values {
+                        for v in owner.vals(values) {
                             let (l, _) = locals.get(v)?;
                             sink.local_get(l);
                         }
@@ -760,15 +779,14 @@ fn emit_block_stmts(
                         return Ok(false);
                     }
                     Some(c) => {
-                        let (cl, _) = locals.get(*c)?;
+                        let (cl, _) = locals.get(c)?;
                         if values.is_empty() {
                             sink.local_get(cl);
                             sink.br_if(wasm_depth);
                         } else {
-                            // Guarded branch carrying values: avoid leaving values on stack when false.
                             sink.local_get(cl);
                             sink.if_(BlockType::Empty);
-                            for &v in values {
+                            for v in owner.vals(values) {
                                 let (l, _) = locals.get(v)?;
                                 sink.local_get(l);
                             }
@@ -783,21 +801,21 @@ fn emit_block_stmts(
                 cond,
                 values,
             } => {
-                let (wasm_depth, state_locals) = match resolve_target(frames, *depth, true)? {
+                let (wasm_depth, state_locals) = match resolve_target(frames, depth, true)? {
                     Target::Loop {
                         wasm_depth,
                         state_locals,
                     } => (wasm_depth, state_locals),
                     Target::Block { .. } => unreachable!(),
                 };
-                if values.len() != state_locals.len() {
+                if values.len_usize() != state_locals.len() {
                     return Err(WasmError::ValidationError(
                         "Continue values arity does not match loop state_vars".into(),
                     ));
                 }
                 match cond {
                     None => {
-                        for &v in values {
+                        for v in owner.vals(values) {
                             let (l, _) = locals.get(v)?;
                             sink.local_get(l);
                         }
@@ -808,10 +826,10 @@ fn emit_block_stmts(
                         return Ok(false);
                     }
                     Some(c) => {
-                        let (cl, _) = locals.get(*c)?;
+                        let (cl, _) = locals.get(c)?;
                         sink.local_get(cl);
                         sink.if_(BlockType::Empty);
-                        for &v in values {
+                        for v in owner.vals(values) {
                             let (l, _) = locals.get(v)?;
                             sink.local_get(l);
                         }

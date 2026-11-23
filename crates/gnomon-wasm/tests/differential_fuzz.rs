@@ -4,7 +4,7 @@ use std::time::Instant;
 
 use gnomon_kernel::{
     BinOp, EffectOp, FuncDef, FuncId, GlobalDef, GlobalId, HeapState, MemId, MemoryDef, Module,
-    Op, Region, Stmt, StratumRegistry, TrapCode, UnOp, Val, ValId, ValType, eval_func,
+    Op, Region, StratumRegistry, TrapCode, UnOp, Val, ValId, ValType, eval_func,
 };
 use gnomon_wasm::{
     ExecOutcome, FuzzConfig, FuzzOutcome, WasmError, differential_check, emit_wasm,
@@ -461,29 +461,30 @@ fn test_imports_internal_calls_globals_and_polymorphic_return_if() {
             export_name: Some("sum_to".into()),
             params: vec![(ValId(0), ValType::I32)],
             results: vec![ValType::I32],
-            body: Region::Block(vec![
-                Stmt::Let { dst: ValId(1), ty: ValType::I32, op: Op::ConstI32(0) },
-                Stmt::Let { dst: ValId(2), ty: ValType::I32, op: Op::ConstI32(1) },
-                Stmt::Region {
-                    results: vec![(ValId(10), ValType::I32), (ValId(11), ValType::I32)],
-                    region: Region::BoundedLoop {
-                        max_iters: u32::MAX,
-                        init_vars: vec![ValId(1), ValId(0)],
-                        state_vars: vec![(ValId(3), ValType::I32), (ValId(4), ValType::I32)],
-                        body: Box::new(Region::Block(vec![
-                            Stmt::Let { dst: ValId(5), ty: ValType::I32, op: Op::Bin(BinOp::I32LeS, ValId(4), ValId(1)) },
-                            Stmt::Break { depth: 0, cond: Some(ValId(5)), values: vec![ValId(3), ValId(4)] },
-                            Stmt::Let { dst: ValId(6), ty: ValType::I32, op: Op::Bin(BinOp::I32Add, ValId(3), ValId(4)) },
-                            Stmt::Let { dst: ValId(7), ty: ValType::I32, op: Op::Bin(BinOp::I32Sub, ValId(4), ValId(2)) },
-                            Stmt::Continue { depth: 0, cond: None, values: vec![ValId(6), ValId(7)] },
-                        ])),
-                    },
-                },
-                Stmt::Effect(EffectOp::GlobalSet { id: GlobalId(0), val: ValId(10) }),
-                Stmt::Let { dst: ValId(12), ty: ValType::I32, op: Op::Un(UnOp::I32Clz, ValId(10)) },
-                Stmt::Let { dst: ValId(13), ty: ValType::I32, op: Op::Bin(BinOp::I32Add, ValId(10), ValId(12)) },
-                Stmt::Yield(vec![ValId(13)]),
-            ]),
+            body: {
+                let loop_body = Region::build(|b| {
+                    b.push_let(ValId(5), ValType::I32, Op::Bin(BinOp::I32LeS, ValId(4), ValId(1)));
+                    b.push_break(0, Some(ValId(5)), &[ValId(3), ValId(4)]);
+                    b.push_let(ValId(6), ValType::I32, Op::Bin(BinOp::I32Add, ValId(3), ValId(4)));
+                    b.push_let(ValId(7), ValType::I32, Op::Bin(BinOp::I32Sub, ValId(4), ValId(2)));
+                    b.push_continue(0, None, &[ValId(6), ValId(7)]);
+                });
+                let lp = Region::bounded_loop(
+                    u32::MAX,
+                    &[ValId(1), ValId(0)],
+                    &[(ValId(3), ValType::I32), (ValId(4), ValType::I32)],
+                    &loop_body,
+                );
+                Region::build(|b| {
+                    b.push_let(ValId(1), ValType::I32, Op::ConstI32(0));
+                    b.push_let(ValId(2), ValType::I32, Op::ConstI32(1));
+                    b.push_subregion(&[(ValId(10), ValType::I32), (ValId(11), ValType::I32)], &lp);
+                    b.push_effect(EffectOp::GlobalSet { id: GlobalId(0), val: ValId(10) });
+                    b.push_let(ValId(12), ValType::I32, Op::Un(UnOp::I32Clz, ValId(10)));
+                    b.push_let(ValId(13), ValType::I32, Op::Bin(BinOp::I32Add, ValId(10), ValId(12)));
+                    b.push_yield(&[ValId(13)]);
+                })
+            },
         }],
         memory_exports: vec![("mem".into(), MemId(0))],
         global_exports: vec![],
@@ -1018,33 +1019,39 @@ fn test_invariant_loop_emit_and_swapped_state_vars() {
             export_name: Some("fib_swap".into()),
             params: vec![(ValId(0), ValType::I32)],
             results: vec![ValType::I32],
-            body: Region::Block(vec![
-                Stmt::Let { dst: ValId(1), ty: ValType::I32, op: Op::ConstI32(0) },
-                Stmt::Let { dst: ValId(2), ty: ValType::I32, op: Op::ConstI32(1) },
-                Stmt::Region {
-                    results: vec![(ValId(20), ValType::I32), (ValId(21), ValType::I32), (ValId(22), ValType::I32)],
-                    region: Region::InvariantLoop {
-                        init_vars: vec![ValId(0), ValId(1), ValId(2)],
-                        state_vars: vec![(ValId(3), ValType::I32), (ValId(4), ValType::I32), (ValId(5), ValType::I32)],
-                        cond: Box::new(Region::Block(vec![
-                            Stmt::Let { dst: ValId(6), ty: ValType::I32, op: Op::Bin(BinOp::I32GtS, ValId(3), ValId(1)) },
-                            Stmt::Yield(vec![ValId(6)]),
-                        ])),
-                        invariant_pred: Box::new(Region::Block(vec![Stmt::Yield(vec![ValId(2)])])),
-                        fuel_measure: Box::new(Region::Block(vec![
-                            Stmt::Let { dst: ValId(7), ty: ValType::I64, op: Op::Un(UnOp::I64ExtendI32U, ValId(3)) },
-                            Stmt::Yield(vec![ValId(7)]),
-                        ])),
-                        body: Box::new(Region::Block(vec![
-                            Stmt::Let { dst: ValId(8), ty: ValType::I32, op: Op::Bin(BinOp::I32Sub, ValId(3), ValId(2)) },
-                            Stmt::Let { dst: ValId(9), ty: ValType::I32, op: Op::Bin(BinOp::I32Add, ValId(4), ValId(5)) },
-                            // Swap/shift state_vars: (n - 1, b, a + b)
-                            Stmt::Yield(vec![ValId(8), ValId(5), ValId(9)]),
-                        ])),
-                    },
-                },
-                Stmt::Yield(vec![ValId(21)]),
-            ]),
+            body: {
+                let cond = Region::build(|b| {
+                    b.push_let(ValId(6), ValType::I32, Op::Bin(BinOp::I32GtS, ValId(3), ValId(1)));
+                    b.push_yield(&[ValId(6)]);
+                });
+                let inv = Region::yield_vals(&[ValId(2)]);
+                let fuel = Region::build(|b| {
+                    b.push_let(ValId(7), ValType::I64, Op::Un(UnOp::I64ExtendI32U, ValId(3)));
+                    b.push_yield(&[ValId(7)]);
+                });
+                let body_lp = Region::build(|b| {
+                    b.push_let(ValId(8), ValType::I32, Op::Bin(BinOp::I32Sub, ValId(3), ValId(2)));
+                    b.push_let(ValId(9), ValType::I32, Op::Bin(BinOp::I32Add, ValId(4), ValId(5)));
+                    b.push_yield(&[ValId(8), ValId(5), ValId(9)]);
+                });
+                let lp = Region::invariant_loop(
+                    &[ValId(0), ValId(1), ValId(2)],
+                    &[(ValId(3), ValType::I32), (ValId(4), ValType::I32), (ValId(5), ValType::I32)],
+                    &cond,
+                    &inv,
+                    &fuel,
+                    &body_lp,
+                );
+                Region::build(|b| {
+                    b.push_let(ValId(1), ValType::I32, Op::ConstI32(0));
+                    b.push_let(ValId(2), ValType::I32, Op::ConstI32(1));
+                    b.push_subregion(
+                        &[(ValId(20), ValType::I32), (ValId(21), ValType::I32), (ValId(22), ValType::I32)],
+                        &lp,
+                    );
+                    b.push_yield(&[ValId(21)]);
+                })
+            },
         }],
         memory_exports: vec![],
         global_exports: vec![],
@@ -1065,14 +1072,14 @@ fn test_exported_mutable_global_falsification_and_bounded_loop_fuel_trap() {
     // 1. Exported mutable global divergence must be falsified even when return values match,
     // and mutable globals must reset cleanly between fuzz vectors.
     let mk_global_mod = |mutate_global: bool| {
-        let mut body = vec![
-            Stmt::Let { dst: ValId(1), ty: ValType::I32, op: Op::GlobalGet(GlobalId(0)) },
-            Stmt::Let { dst: ValId(2), ty: ValType::I32, op: Op::Bin(BinOp::I32Add, ValId(1), ValId(0)) },
-        ];
-        if mutate_global {
-            body.push(Stmt::Effect(EffectOp::GlobalSet { id: GlobalId(0), val: ValId(2) }));
-        }
-        body.push(Stmt::Yield(vec![ValId(0)]));
+        let body = Region::build(|b| {
+            b.push_let(ValId(1), ValType::I32, Op::GlobalGet(GlobalId(0)));
+            b.push_let(ValId(2), ValType::I32, Op::Bin(BinOp::I32Add, ValId(1), ValId(0)));
+            if mutate_global {
+                b.push_effect(EffectOp::GlobalSet { id: GlobalId(0), val: ValId(2) });
+            }
+            b.push_yield(&[ValId(0)]);
+        });
         let ir = Module {
             memories: vec![],
             globals: vec![GlobalDef {
@@ -1088,7 +1095,7 @@ fn test_exported_mutable_global_falsification_and_bounded_loop_fuel_trap() {
                 export_name: Some("step".into()),
                 params: vec![(ValId(0), ValType::I32)],
                 results: vec![ValType::I32],
-                body: Region::Block(body),
+                body,
             }],
             memory_exports: vec![],
             global_exports: vec![("g0".into(), GlobalId(0))],
@@ -1116,33 +1123,27 @@ fn test_exported_mutable_global_falsification_and_bounded_loop_fuel_trap() {
             export_name: Some("spin".into()),
             params: vec![(ValId(0), ValType::I32)],
             results: vec![ValType::I32],
-            body: Region::Block(vec![
-                Stmt::Region {
-                    results: vec![(ValId(5), ValType::I32)],
-                    region: Region::Block(vec![
-                        // Shadow ValId(0) inside child block!
-                        Stmt::Let { dst: ValId(0), ty: ValType::I32, op: Op::ConstI32(99) },
-                        Stmt::Yield(vec![ValId(0)]),
-                    ]),
-                },
-                Stmt::Region {
-                    results: vec![(ValId(6), ValType::I32)],
-                    region: Region::BoundedLoop {
-                        max_iters: 3,
-                        init_vars: vec![ValId(0)],
-                        state_vars: vec![(ValId(1), ValType::I32)],
-                        body: Box::new(Region::Block(vec![
-                            Stmt::Let { dst: ValId(2), ty: ValType::I32, op: Op::ConstI32(0) },
-                            Stmt::Let { dst: ValId(3), ty: ValType::I32, op: Op::Bin(BinOp::I32LeS, ValId(1), ValId(2)) },
-                            Stmt::Break { depth: 0, cond: Some(ValId(3)), values: vec![ValId(5)] },
-                            Stmt::Let { dst: ValId(4), ty: ValType::I32, op: Op::ConstI32(1) },
-                            Stmt::Let { dst: ValId(7), ty: ValType::I32, op: Op::Bin(BinOp::I32Sub, ValId(1), ValId(4)) },
-                            Stmt::Continue { depth: 0, cond: None, values: vec![ValId(7)] },
-                        ])),
-                    },
-                },
-                Stmt::Yield(vec![ValId(6)]),
-            ]),
+            body: {
+                let inner_shadow = Region::build(|b| {
+                    // Shadow ValId(0) inside child block!
+                    b.push_let(ValId(0), ValType::I32, Op::ConstI32(99));
+                    b.push_yield(&[ValId(0)]);
+                });
+                let lp_body = Region::build(|b| {
+                    b.push_let(ValId(2), ValType::I32, Op::ConstI32(0));
+                    b.push_let(ValId(3), ValType::I32, Op::Bin(BinOp::I32LeS, ValId(1), ValId(2)));
+                    b.push_break(0, Some(ValId(3)), &[ValId(5)]);
+                    b.push_let(ValId(4), ValType::I32, Op::ConstI32(1));
+                    b.push_let(ValId(7), ValType::I32, Op::Bin(BinOp::I32Sub, ValId(1), ValId(4)));
+                    b.push_continue(0, None, &[ValId(7)]);
+                });
+                let lp = Region::bounded_loop(3, &[ValId(0)], &[(ValId(1), ValType::I32)], &lp_body);
+                Region::build(|b| {
+                    b.push_subregion(&[(ValId(5), ValType::I32)], &inner_shadow);
+                    b.push_subregion(&[(ValId(6), ValType::I32)], &lp);
+                    b.push_yield(&[ValId(6)]);
+                })
+            },
         }],
         memory_exports: vec![],
         global_exports: vec![],

@@ -4,8 +4,9 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use gnomon_kernel::{
     BinOp, CallTarget, EffectOp, GlobalId, HostContract, MAX_CALL_DEPTH, MAX_WASM_PAGES, MemId,
-    MemWidth, Module, Op, Region, SliceBound, Stmt, StratumRegistry, TrapCode, UnOp, Val, ValId,
-    ValType, VcObligation, WASM_PAGE_SIZE, validate_read_only_with_registry,
+    MemWidth, Module, Op, Region, RegionNode, RegionRef, SliceBound, Span, Stmt, StratumRegistry,
+    TrapCode, UnOp, Val, ValId, ValType, VcObligation, WASM_PAGE_SIZE,
+    validate_read_only_with_registry,
 };
 
 use crate::{SieveError, SmtModel, SmtResult};
@@ -1354,7 +1355,7 @@ fn eval_body<B: SmtTarget>(
             .map(|&ty| SymVal { ty, term: b.bv_const(bits_of(ty), 0), konst: Some(0) })
             .collect());
     }
-    let flow = eval_region_flow(b, module, registry, state, body, depth)?;
+    let flow = eval_region_flow(b, module, registry, state, body.as_ref(), depth)?;
     state.env = saved_env;
 
     // Any escaping Break/Continue from a function/stratum traps Unreachable.
@@ -1421,7 +1422,8 @@ fn eval_host_call<B: SmtTarget>(
 
     // Check precondition on read-only snapshot.
     let mut pre_state = state.clone();
-    let pre_flow = eval_region_flow(b, module, registry, &mut pre_state, &hc.precondition, depth + 1)?;
+    let pre_flow =
+        eval_region_flow(b, module, registry, &mut pre_state, hc.precondition.as_ref(), depth + 1)?;
     let pre_violated = if pre_state.trapped.konst == Some(true)
         || matches!(pre_flow.normal.active.konst, Some(false))
     {
@@ -1482,7 +1484,7 @@ fn eval_host_call<B: SmtTarget>(
         let before_mems = state.mems.clone();
         let write_starts: BTreeMap<MemId, usize> =
             before_mems.iter().map(|(&mid, m)| (mid, m.write_addrs.len())).collect();
-        let flow = eval_region_flow(b, module, registry, state, sim_body, depth + 1)?;
+        let flow = eval_region_flow(b, module, registry, state, sim_body.as_ref(), depth + 1)?;
         for out in flow.breaks.values().chain(flow.continues.values()) {
             state.trap_if(b, &out.active, TrapCode::HostContractViolation);
         }
@@ -1565,7 +1567,14 @@ fn eval_host_call<B: SmtTarget>(
         state.env.insert(id, v.clone());
     }
     let mut post_state = state.clone();
-    let post_flow = eval_region_flow(b, module, registry, &mut post_state, &hc.postcondition, depth + 1)?;
+    let post_flow = eval_region_flow(
+        b,
+        module,
+        registry,
+        &mut post_state,
+        hc.postcondition.as_ref(),
+        depth + 1,
+    )?;
     let post_nz = match post_flow.normal.values.first() {
         Some(v) if v.ty == ValType::I32 => state.is_nonzero(b, v),
         _ => SymBool::from_const(b, false),
@@ -1593,31 +1602,38 @@ fn eval_block_stmts_raw<B: SmtTarget>(
     module: &Module,
     registry: &StratumRegistry,
     state: &mut ExecState<B::Term>,
-    stmts: &[Stmt],
+    r: RegionRef<'_>,
+    stmts: Span,
     depth: u32,
 ) -> Result<FlowTargets<B::Term>, SieveError> {
     let saved_env = state.env.clone();
     let mut flows = FlowTargets::empty(b);
 
-    for stmt in stmts {
+    for stmt in r.stmts(stmts) {
         if matches!(state.path_active.konst, Some(false)) {
             break;
         }
         match stmt {
             Stmt::Let { dst, ty, op } => {
-                let val = eval_op(b, state, op)?;
-                if val.ty != *ty {
+                let val = eval_op(b, state, &op)?;
+                if val.ty != ty {
                     let active = state.path_active.clone();
                     state.trap_if(b, &active, TrapCode::Unreachable);
                 } else {
-                    state.env.insert(*dst, val);
+                    state.env.insert(dst, val);
                 }
             }
             Stmt::Effect(eff) => {
-                eval_effect(b, module, registry, state, eff, depth)?;
+                eval_effect(b, module, registry, state, &eff, depth)?;
             }
             Stmt::Region { results, region } => {
-                let inner = eval_region_flow(b, module, registry, state, region, depth)?;
+                let Some(sub_r) = r.child(region) else {
+                    let active = state.path_active.clone();
+                    state.trap_if(b, &active, TrapCode::Unreachable);
+                    break;
+                };
+                let res_vars = r.region.vars_vec(results);
+                let inner = eval_region_flow(b, module, registry, state, sub_r, depth)?;
                 merge_outcome(b, &mut flows.returns, &inner.returns.active, &inner.returns.values)?;
                 for (d, out) in inner.breaks {
                     let entry = flows.breaks.entry(d).or_insert_with(|| FlowOutcome::empty(b));
@@ -1629,36 +1645,37 @@ fn eval_block_stmts_raw<B: SmtTarget>(
                 }
                 state.path_active = inner.normal.active.clone();
                 if !matches!(state.path_active.konst, Some(false)) {
-                    bind_params(b, state, results, &inner.normal.values)?;
+                    bind_params(b, state, &res_vars, &inner.normal.values)?;
                 } else {
-                    for &(id, ty) in results {
+                    for &(id, ty) in &res_vars {
                         state.env.insert(id, SymVal { ty, term: b.bv_const(bits_of(ty), 0), konst: Some(0) });
                     }
                 }
             }
             Stmt::Call { results, target, args } => {
-                let arg_vals: Vec<_> = args
-                    .iter()
-                    .map(|id| state.get_val(*id))
+                let arg_vals: Vec<_> = r
+                    .vals(args)
+                    .map(|id| state.get_val(id))
                     .collect::<Result<_, _>>()?;
+                let res_vars = r.region.vars_vec(results);
                 let active_before = state.path_active.clone();
                 let res_vals = match target {
                     CallTarget::Func(fid) => {
-                        let Some(f) = module.func(*fid) else {
+                        let Some(f) = module.func(fid) else {
                             state.trap_if(b, &active_before, TrapCode::Unreachable);
                             continue;
                         };
                         eval_body(b, module, registry, state, &f.params, &f.results, &f.body, &arg_vals, depth + 1)?
                     }
                     CallTarget::Stratum(sid) => {
-                        let Some(op) = registry.get_op(*sid) else {
+                        let Some(op) = registry.get_op(sid) else {
                             state.trap_if(b, &active_before, TrapCode::Unreachable);
                             continue;
                         };
                         eval_body(b, module, registry, state, &op.params, &op.results, &op.body, &arg_vals, depth + 1)?
                     }
                     CallTarget::Host(hid) => {
-                        let Some(hc) = module.host_contract(*hid) else {
+                        let Some(hc) = module.host_contract(hid) else {
                             state.trap_if(b, &active_before, TrapCode::HostContractViolation);
                             continue;
                         };
@@ -1666,11 +1683,11 @@ fn eval_block_stmts_raw<B: SmtTarget>(
                     }
                 };
                 if !matches!(state.path_active.konst, Some(false)) {
-                    bind_params(b, state, results, &res_vals)?;
+                    bind_params(b, state, &res_vars, &res_vals)?;
                 }
             }
             Stmt::Yield(ids) => {
-                let vals: Vec<_> = ids.iter().map(|id| state.get_val(*id)).collect::<Result<_, _>>()?;
+                let vals: Vec<_> = r.vals(ids).map(|id| state.get_val(id)).collect::<Result<_, _>>()?;
                 let take = state.path_active.clone();
                 merge_outcome(b, &mut flows.normal, &take, &vals)?;
                 state.path_active = SymBool::from_const(b, false);
@@ -1679,7 +1696,7 @@ fn eval_block_stmts_raw<B: SmtTarget>(
                 let (take, remaining) = match cond {
                     None => (state.path_active.clone(), SymBool::from_const(b, false)),
                     Some(cid) => {
-                        let cv = state.get_u32(*cid)?;
+                        let cv = state.get_u32(cid)?;
                         let cond_sym = state.is_nonzero(b, &cv);
                         let take = state.path_active.and(b, &cond_sym);
                         let not_cond = cond_sym.not(b);
@@ -1688,8 +1705,8 @@ fn eval_block_stmts_raw<B: SmtTarget>(
                     }
                 };
                 if !matches!(take.konst, Some(false)) {
-                    let vals: Vec<_> = values.iter().map(|id| state.get_val(*id)).collect::<Result<_, _>>()?;
-                    let entry = flows.breaks.entry(*br_d).or_insert_with(|| FlowOutcome::empty(b));
+                    let vals: Vec<_> = r.vals(values).map(|id| state.get_val(id)).collect::<Result<_, _>>()?;
+                    let entry = flows.breaks.entry(br_d).or_insert_with(|| FlowOutcome::empty(b));
                     merge_outcome(b, entry, &take, &vals)?;
                 }
                 state.path_active = remaining;
@@ -1698,7 +1715,7 @@ fn eval_block_stmts_raw<B: SmtTarget>(
                 let (take, remaining) = match cond {
                     None => (state.path_active.clone(), SymBool::from_const(b, false)),
                     Some(cid) => {
-                        let cv = state.get_u32(*cid)?;
+                        let cv = state.get_u32(cid)?;
                         let cond_sym = state.is_nonzero(b, &cv);
                         let take = state.path_active.and(b, &cond_sym);
                         let not_cond = cond_sym.not(b);
@@ -1707,14 +1724,14 @@ fn eval_block_stmts_raw<B: SmtTarget>(
                     }
                 };
                 if !matches!(take.konst, Some(false)) {
-                    let vals: Vec<_> = values.iter().map(|id| state.get_val(*id)).collect::<Result<_, _>>()?;
-                    let entry = flows.continues.entry(*ct_d).or_insert_with(|| FlowOutcome::empty(b));
+                    let vals: Vec<_> = r.vals(values).map(|id| state.get_val(id)).collect::<Result<_, _>>()?;
+                    let entry = flows.continues.entry(ct_d).or_insert_with(|| FlowOutcome::empty(b));
                     merge_outcome(b, entry, &take, &vals)?;
                 }
                 state.path_active = remaining;
             }
             Stmt::Return(ids) => {
-                let vals: Vec<_> = ids.iter().map(|id| state.get_val(*id)).collect::<Result<_, _>>()?;
+                let vals: Vec<_> = r.vals(ids).map(|id| state.get_val(id)).collect::<Result<_, _>>()?;
                 let take = state.path_active.clone();
                 merge_outcome(b, &mut flows.returns, &take, &vals)?;
                 state.path_active = SymBool::from_const(b, false);
@@ -1737,12 +1754,12 @@ fn eval_region_flow<B: SmtTarget>(
     module: &Module,
     registry: &StratumRegistry,
     state: &mut ExecState<B::Term>,
-    region: &Region,
+    region: RegionRef<'_>,
     depth: u32,
 ) -> Result<FlowTargets<B::Term>, SieveError> {
-    match region {
-        Region::Block(stmts) => {
-            let raw = eval_block_stmts_raw(b, module, registry, state, stmts, depth)?;
+    match region.node {
+        RegionNode::Block(stmts) => {
+            let raw = eval_block_stmts_raw(b, module, registry, state, region, stmts, depth)?;
             let mut out = FlowTargets::empty(b);
             let br0_non_empty = raw.breaks.get(&0).is_some_and(|br| !br.values.is_empty());
             if br0_non_empty && raw.normal.values.is_empty() {
@@ -1767,8 +1784,14 @@ fn eval_region_flow<B: SmtTarget>(
             }
             Ok(out)
         }
-        Region::IfElse { cond, then_region, else_region, results } => {
-            let c_val = state.get_u32(*cond)?;
+        RegionNode::IfElse { cond, then_region, else_region, results } => {
+            let (Some(then_r), Some(else_r)) = (region.child(then_region), region.child(else_region)) else {
+                let active = state.path_active.clone();
+                state.trap_if(b, &active, TrapCode::Unreachable);
+                return Ok(FlowTargets::empty(b));
+            };
+            let res_tys = region.region.tys_vec(results);
+            let c_val = state.get_u32(cond)?;
             let c_nz = state.is_nonzero(b, &c_val);
             let entry_active = state.path_active.clone();
 
@@ -1777,9 +1800,9 @@ fn eval_region_flow<B: SmtTarget>(
             let then_flow = if matches!(then_state.path_active.konst, Some(false)) {
                 FlowTargets::empty(b)
             } else {
-                let mut tf = eval_region_flow(b, module, registry, &mut then_state, then_region, depth)?;
+                let mut tf = eval_region_flow(b, module, registry, &mut then_state, then_r, depth)?;
                 if !matches!(tf.normal.active.konst, Some(false))
-                    && !check_result_types(&tf.normal.values, results)
+                    && !check_result_types(&tf.normal.values, &res_tys)
                 {
                     then_state.trap_if(b, &tf.normal.active, TrapCode::Unreachable);
                     tf.normal = FlowOutcome::empty(b);
@@ -1793,9 +1816,9 @@ fn eval_region_flow<B: SmtTarget>(
             let else_flow = if matches!(else_state.path_active.konst, Some(false)) {
                 FlowTargets::empty(b)
             } else {
-                let mut ef = eval_region_flow(b, module, registry, &mut else_state, else_region, depth)?;
+                let mut ef = eval_region_flow(b, module, registry, &mut else_state, else_r, depth)?;
                 if !matches!(ef.normal.active.konst, Some(false))
-                    && !check_result_types(&ef.normal.values, results)
+                    && !check_result_types(&ef.normal.values, &res_tys)
                 {
                     else_state.trap_if(b, &ef.normal.active, TrapCode::Unreachable);
                     ef.normal = FlowOutcome::empty(b);
@@ -1834,13 +1857,19 @@ fn eval_region_flow<B: SmtTarget>(
             }
             Ok(merged)
         }
-        Region::BoundedLoop { max_iters, init_vars, state_vars, body } => {
-            let mut loop_state: Vec<SymVal<B::Term>> = init_vars
-                .iter()
-                .map(|id| state.get_val(*id))
+        RegionNode::BoundedLoop { max_iters, init_vars, state_vars, body } => {
+            let Some(body_r) = region.child(body) else {
+                let active = state.path_active.clone();
+                state.trap_if(b, &active, TrapCode::Unreachable);
+                return Ok(FlowTargets::empty(b));
+            };
+            let state_var_defs = region.region.vars_vec(state_vars);
+            let mut loop_state: Vec<SymVal<B::Term>> = region
+                .vals(init_vars)
+                .map(|id| state.get_val(id))
                 .collect::<Result<_, _>>()?;
-            if loop_state.len() != state_vars.len()
-                || loop_state.iter().zip(state_vars).any(|(v, &(_, t))| v.ty != t)
+            if loop_state.len() != state_var_defs.len()
+                || loop_state.iter().zip(&state_var_defs).any(|(v, &(_, t))| v.ty != t)
             {
                 let active = state.path_active.clone();
                 state.trap_if(b, &active, TrapCode::Unreachable);
@@ -1851,18 +1880,20 @@ fn eval_region_flow<B: SmtTarget>(
             let mut iter_active = state.path_active.clone();
             let mut loop_exits = FlowTargets::empty(b);
 
-            let unroll_limit = (*max_iters).min(MAX_SMT_LOOP_UNROLL);
+            let unroll_limit = max_iters.min(MAX_SMT_LOOP_UNROLL);
             for _ in 0..unroll_limit {
                 if matches!(iter_active.konst, Some(false)) {
                     break;
                 }
-                for (&(sid, _), val) in state_vars.iter().zip(&loop_state) {
+                for (&(sid, _), val) in state_var_defs.iter().zip(&loop_state) {
                     state.env.insert(sid, val.clone());
                 }
                 state.path_active = iter_active.clone();
-                let body_flow = match body.as_ref() {
-                    Region::Block(stmts) => eval_block_stmts_raw(b, module, registry, state, stmts, depth)?,
-                    other => eval_region_flow(b, module, registry, state, other, depth)?,
+                let body_flow = match body_r.node {
+                    RegionNode::Block(stmts) => {
+                        eval_block_stmts_raw(b, module, registry, state, body_r, stmts, depth)?
+                    }
+                    _ => eval_region_flow(b, module, registry, state, body_r, depth)?,
                 };
 
                 merge_outcome(b, &mut loop_exits.normal, &body_flow.normal.active, &body_flow.normal.values)?;
@@ -1880,8 +1911,8 @@ fn eval_region_flow<B: SmtTarget>(
                 let mut next_active = SymBool::from_const(b, false);
                 for (d, ct) in body_flow.continues {
                     if d == 0 {
-                        if ct.values.len() != state_vars.len()
-                            || ct.values.iter().zip(state_vars).any(|(v, &(_, t))| v.ty != t)
+                        if ct.values.len() != state_var_defs.len()
+                            || ct.values.iter().zip(&state_var_defs).any(|(v, &(_, t))| v.ty != t)
                         {
                             state.path_active = ct.active.clone();
                             state.trap_if(b, &ct.active, TrapCode::Unreachable);
@@ -1898,7 +1929,7 @@ fn eval_region_flow<B: SmtTarget>(
             }
 
             if !matches!(iter_active.konst, Some(false)) {
-                if *max_iters <= MAX_SMT_LOOP_UNROLL {
+                if max_iters <= MAX_SMT_LOOP_UNROLL {
                     state.path_active = iter_active.clone();
                     state.trap_if(b, &iter_active, TrapCode::OutOfFuel);
                 } else {
@@ -1909,7 +1940,7 @@ fn eval_region_flow<B: SmtTarget>(
             state.env = saved_env;
             Ok(loop_exits)
         }
-        Region::InvariantLoop { .. } => Err(SieveError::EncodingError(
+        RegionNode::InvariantLoop { .. } => Err(SieveError::EncodingError(
             "InvariantLoop must be split via split_invariant_loop before SMT encoding".into(),
         )),
     }
@@ -1924,7 +1955,7 @@ fn eval_top_region<B: SmtTarget>(
     state: &mut ExecState<B::Term>,
     region: &Region,
 ) -> Result<Vec<SymVal<B::Term>>, SieveError> {
-    let flow = eval_region_flow(b, module, registry, state, region, 0)?;
+    let flow = eval_region_flow(b, module, registry, state, region.as_ref(), 0)?;
     for out in flow.breaks.values().chain(flow.continues.values()) {
         state.trap_if(b, &out.active, TrapCode::Unreachable);
     }
@@ -1973,7 +2004,7 @@ impl<'a> FreeVarCollector<'a> {
 
     fn collect_region(
         &mut self,
-        region: &Region,
+        region: RegionRef<'_>,
         bound: &mut Vec<ValId>,
         is_root: bool,
     ) -> Result<Vec<Option<ValType>>, SieveError> {
@@ -1984,52 +2015,55 @@ impl<'a> FreeVarCollector<'a> {
             }
         }
         let mut out_tys = Vec::new();
-        match region {
-            Region::Block(stmts) => {
+        match region.node {
+            RegionNode::Block(stmts) => {
                 let saved_bound = bound.len();
-                for stmt in stmts {
+                for stmt in region.stmts(stmts) {
                     match stmt {
                         Stmt::Let { dst, ty, op } => {
                             match op {
                                 Op::ConstI32(_) | Op::ConstI64(_) | Op::GlobalGet(_) | Op::MemorySize(_) => {}
-                                Op::Copy(v) => self.record(*v, bound, Some(*ty))?,
+                                Op::Copy(v) => self.record(v, bound, Some(ty))?,
                                 Op::Select { cond, true_val, false_val } => {
-                                    self.record(*cond, bound, Some(ValType::I32))?;
-                                    self.record(*true_val, bound, Some(*ty))?;
-                                    self.record(*false_val, bound, Some(*ty))?;
+                                    self.record(cond, bound, Some(ValType::I32))?;
+                                    self.record(true_val, bound, Some(ty))?;
+                                    self.record(false_val, bound, Some(ty))?;
                                 }
-                                Op::Un(u, v) => self.record(*v, bound, Some(u.input_ty()))?,
+                                Op::Un(u, v) => self.record(v, bound, Some(u.input_ty()))?,
                                 Op::Bin(bin, l, r) => {
-                                    self.record(*l, bound, Some(bin.operand_ty()))?;
-                                    self.record(*r, bound, Some(bin.operand_ty()))?;
+                                    self.record(l, bound, Some(bin.operand_ty()))?;
+                                    self.record(r, bound, Some(bin.operand_ty()))?;
                                 }
-                                Op::Load { addr, .. } => self.record(*addr, bound, Some(ValType::I32))?,
-                                Op::MemoryGrow { delta, .. } => self.record(*delta, bound, Some(ValType::I32))?,
+                                Op::Load { addr, .. } => self.record(addr, bound, Some(ValType::I32))?,
+                                Op::MemoryGrow { delta, .. } => self.record(delta, bound, Some(ValType::I32))?,
                             }
-                            bound.push(*dst);
-                            local_tys.insert(*dst, *ty);
+                            bound.push(dst);
+                            local_tys.insert(dst, ty);
                         }
                         Stmt::Effect(eff) => match eff {
                             EffectOp::Store { addr, width, val, .. } => {
-                                self.record(*addr, bound, Some(ValType::I32))?;
-                                let expected = if *width == MemWidth::B8 { Some(ValType::I64) } else { None };
-                                self.record(*val, bound, expected)?;
+                                self.record(addr, bound, Some(ValType::I32))?;
+                                let expected = if width == MemWidth::B8 { Some(ValType::I64) } else { None };
+                                self.record(val, bound, expected)?;
                             }
                             EffectOp::MemoryCopy { dst, src, len, .. }
                             | EffectOp::MemoryFill { dst, val: src, len, .. } => {
                                 for v in [dst, src, len] {
-                                    self.record(*v, bound, Some(ValType::I32))?;
+                                    self.record(v, bound, Some(ValType::I32))?;
                                 }
                             }
                             EffectOp::GlobalSet { id, val } => {
-                                let g_ty = self.module.global(*id).map(|g| g.ty);
-                                self.record(*val, bound, g_ty)?;
+                                let g_ty = self.module.global(id).map(|g| g.ty);
+                                self.record(val, bound, g_ty)?;
                             }
                             EffectOp::Trap(_) | EffectOp::Nop => {}
                         },
-                        Stmt::Region { results, region } => {
-                            let inner_tys = self.collect_region(region, bound, false)?;
-                            for (i, &(id, ty)) in results.iter().enumerate() {
+                        Stmt::Region { results, region: sub_id } => {
+                            let Some(sub_r) = region.child(sub_id) else {
+                                return Err(SieveError::EncodingError("invalid child region id".into()));
+                            };
+                            let inner_tys = self.collect_region(sub_r, bound, false)?;
+                            for (i, (id, ty)) in region.vars(results).enumerate() {
                                 if let Some(Some(it)) = inner_tys.get(i).copied()
                                     && it != ty
                                 {
@@ -2043,31 +2077,31 @@ impl<'a> FreeVarCollector<'a> {
                             let param_tys: Vec<Option<ValType>> = match target {
                                 CallTarget::Func(fid) => self
                                     .module
-                                    .func(*fid)
+                                    .func(fid)
                                     .map(|f| f.params.iter().map(|&(_, t)| Some(t)).collect())
                                     .unwrap_or_default(),
                                 CallTarget::Stratum(sid) => self
                                     .registry
-                                    .get_op(*sid)
+                                    .get_op(sid)
                                     .map(|op| op.params.iter().map(|&(_, t)| Some(t)).collect())
                                     .unwrap_or_default(),
                                 CallTarget::Host(hid) => self
                                     .module
-                                    .host_contract(*hid)
+                                    .host_contract(hid)
                                     .map(|hc| hc.params.iter().map(|&(_, t)| Some(t)).collect())
                                     .unwrap_or_default(),
                             };
-                            for (i, &a) in args.iter().enumerate() {
+                            for (i, a) in region.vals(args).enumerate() {
                                 self.record(a, bound, param_tys.get(i).copied().flatten())?;
                             }
-                            for &(id, ty) in results {
+                            for (id, ty) in region.vars(results) {
                                 bound.push(id);
                                 local_tys.insert(id, ty);
                             }
                         }
                         Stmt::Yield(vs) => {
                             out_tys.clear();
-                            for &v in vs {
+                            for v in region.vals(vs) {
                                 self.record(v, bound, None)?;
                                 let t = if bound.contains(&v) {
                                     local_tys.get(&v).copied()
@@ -2081,7 +2115,7 @@ impl<'a> FreeVarCollector<'a> {
                             if is_root {
                                 out_tys.clear();
                             }
-                            for &v in vs {
+                            for v in region.vals(vs) {
                                 self.record(v, bound, None)?;
                                 if is_root {
                                     let t = if bound.contains(&v) {
@@ -2095,10 +2129,10 @@ impl<'a> FreeVarCollector<'a> {
                         }
                         Stmt::Break { depth, cond, values } => {
                             if let Some(c) = cond {
-                                self.record(*c, bound, Some(ValType::I32))?;
+                                self.record(c, bound, Some(ValType::I32))?;
                             }
-                            if *depth == 0 && out_tys.is_empty() {
-                                for &v in values {
+                            if depth == 0 && out_tys.is_empty() {
+                                for v in region.vals(values) {
                                     self.record(v, bound, None)?;
                                     let t = if bound.contains(&v) {
                                         local_tys.get(&v).copied()
@@ -2108,16 +2142,16 @@ impl<'a> FreeVarCollector<'a> {
                                     out_tys.push(t);
                                 }
                             } else {
-                                for &v in values {
+                                for v in region.vals(values) {
                                     self.record(v, bound, None)?;
                                 }
                             }
                         }
                         Stmt::Continue { cond, values, .. } => {
                             if let Some(c) = cond {
-                                self.record(*c, bound, Some(ValType::I32))?;
+                                self.record(c, bound, Some(ValType::I32))?;
                             }
-                            for &v in values {
+                            for v in region.vals(values) {
                                 self.record(v, bound, None)?;
                             }
                         }
@@ -2125,24 +2159,31 @@ impl<'a> FreeVarCollector<'a> {
                 }
                 bound.truncate(saved_bound);
             }
-            Region::IfElse { cond, then_region, else_region, results } => {
-                self.record(*cond, bound, Some(ValType::I32))?;
-                let _ = self.collect_region(then_region, bound, false)?;
-                let _ = self.collect_region(else_region, bound, false)?;
-                out_tys = results.iter().copied().map(Some).collect();
+            RegionNode::IfElse { cond, then_region, else_region, results } => {
+                let (Some(then_r), Some(else_r)) = (region.child(then_region), region.child(else_region)) else {
+                    return Err(SieveError::EncodingError("invalid IfElse child region".into()));
+                };
+                self.record(cond, bound, Some(ValType::I32))?;
+                let _ = self.collect_region(then_r, bound, false)?;
+                let _ = self.collect_region(else_r, bound, false)?;
+                out_tys = region.tys(results).map(Some).collect();
             }
-            Region::BoundedLoop { init_vars, state_vars, body, .. } => {
-                for (i, &iv) in init_vars.iter().enumerate() {
-                    self.record(iv, bound, state_vars.get(i).map(|&(_, t)| t))?;
+            RegionNode::BoundedLoop { init_vars, state_vars, body, .. } => {
+                let Some(body_r) = region.child(body) else {
+                    return Err(SieveError::EncodingError("invalid BoundedLoop body".into()));
+                };
+                let state_var_defs = region.region.vars_vec(state_vars);
+                for (i, iv) in region.vals(init_vars).enumerate() {
+                    self.record(iv, bound, state_var_defs.get(i).map(|&(_, t)| t))?;
                 }
                 let saved = bound.len();
-                for &(sv, _) in state_vars {
+                for &(sv, _) in &state_var_defs {
                     bound.push(sv);
                 }
-                out_tys = self.collect_region(body, bound, false)?;
+                out_tys = self.collect_region(body_r, bound, false)?;
                 bound.truncate(saved);
             }
-            Region::InvariantLoop { .. } => {
+            RegionNode::InvariantLoop { .. } => {
                 return Err(SieveError::EncodingError(
                     "InvariantLoop must be split via split_invariant_loop before SMT encoding".into(),
                 ));
@@ -2162,24 +2203,24 @@ fn infer_equiv_params(
     let mut collector = FreeVarCollector { module, registry, free_tys: BTreeMap::new() };
     let mut bound = Vec::new();
     if let Some(pre) = precondition {
-        let _ = collector.collect_region(pre, &mut bound, true)?;
+        let _ = collector.collect_region(pre.as_ref(), &mut bound, true)?;
     }
-    let lhs_out = collector.collect_region(lhs, &mut bound, true)?;
-    let rhs_out = collector.collect_region(rhs, &mut bound, true)?;
+    let lhs_out = collector.collect_region(lhs.as_ref(), &mut bound, true)?;
+    let rhs_out = collector.collect_region(rhs.as_ref(), &mut bound, true)?;
 
     // Unify direct free-var yield types between LHS and RHS when one side constrains the other.
-    fn last_yield(stmts: &[Stmt]) -> Option<&[ValId]> {
-        for s in stmts.iter().rev() {
+    fn last_yield(r: &Region, stmts: Span) -> Option<Vec<ValId>> {
+        for s in r.stmts(stmts).rev() {
             if let Stmt::Yield(vs) | Stmt::Return(vs) = s {
-                return Some(vs.as_slice());
+                return Some(r.vals_vec(vs));
             }
         }
         None
     }
-    if let (Region::Block(ls), Region::Block(rs)) = (lhs, rhs)
-        && let (Some(ly), Some(ry)) = (last_yield(ls), last_yield(rs))
+    if let (RegionNode::Block(ls), RegionNode::Block(rs)) = (lhs.root, rhs.root)
+        && let (Some(ly), Some(ry)) = (last_yield(lhs, ls), last_yield(rhs, rs))
     {
-        for ((&lv, &rv), (&lt, &rt)) in ly.iter().zip(ry).zip(lhs_out.iter().zip(&rhs_out)) {
+        for ((&lv, &rv), (&lt, &rt)) in ly.iter().zip(&ry).zip(lhs_out.iter().zip(&rhs_out)) {
             if collector.free_tys.contains_key(&lv)
                 && let Some(t) = rt
             {

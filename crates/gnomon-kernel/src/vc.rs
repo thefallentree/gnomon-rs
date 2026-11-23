@@ -1,12 +1,18 @@
-//! Deterministic loop Verification Condition (VC) splitter.
+//! Deterministic loop Verification Condition (VC) splitter and iterative region analyzers.
 
 use alloc::{boxed::Box, vec, vec::Vec};
 use crate::eval::{HeapState, eval_region_first};
 use crate::ir::*;
 use crate::registry::StratumRegistry;
 
+const MAX_VC_DEPTH: usize = 64;
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum VcKind { Init, Preservation, Exit }
+pub enum VcKind {
+    Init,
+    Preservation,
+    Exit,
+}
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum VcError {
@@ -17,23 +23,135 @@ pub enum VcError {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum VcEvalResult { Holds, Vacuous, Violated(Option<TrapCode>) }
+pub enum VcEvalResult {
+    Holds,
+    Vacuous,
+    Violated(Option<TrapCode>),
+}
+
+/// Small-vector storage for `VcObligation` assumption regions: stores up to 2
+/// regions inline (covering `Init`, `Preservation`, and `Exit` VCs with zero
+/// heap allocation), spilling seamlessly to `Vec<Region>` on the 3rd+ entry.
+#[derive(Debug)]
+pub struct RegionList {
+    inline: [Region; 2],
+    inline_len: usize,
+    spill: Vec<Region>,
+}
+
+impl RegionList {
+    pub const fn empty() -> Self {
+        Self { inline: [Region::empty(), Region::empty()], inline_len: 0, spill: Vec::new() }
+    }
+
+    pub const fn single(r: Region) -> Self {
+        Self { inline: [r, Region::empty()], inline_len: 1, spill: Vec::new() }
+    }
+
+    pub const fn pair(a: Region, b: Region) -> Self {
+        Self { inline: [a, b], inline_len: 2, spill: Vec::new() }
+    }
+
+    pub fn from_vec(mut v: Vec<Region>) -> Self {
+        match v.len() {
+            0 => Self::empty(),
+            1 => Self::single(v.pop().unwrap_or_else(Region::empty)),
+            2 => {
+                let b = v.pop().unwrap_or_else(Region::empty);
+                let a = v.pop().unwrap_or_else(Region::empty);
+                Self::pair(a, b)
+            }
+            _ => Self { inline: [Region::empty(), Region::empty()], inline_len: 0, spill: v },
+        }
+    }
+
+    #[inline]
+    pub fn len(&self) -> usize {
+        if self.spill.is_empty() { self.inline_len } else { self.spill.len() }
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.inline_len == 0 && self.spill.is_empty()
+    }
+
+    #[inline]
+    pub fn as_slice(&self) -> &[Region] {
+        if self.spill.is_empty() { &self.inline[..self.inline_len] } else { &self.spill }
+    }
+
+    #[inline]
+    pub fn iter(&self) -> core::slice::Iter<'_, Region> {
+        self.as_slice().iter()
+    }
+
+    #[inline]
+    pub fn get(&self, idx: usize) -> Option<&Region> {
+        if self.spill.is_empty() {
+            if idx < self.inline_len { Some(&self.inline[idx]) } else { None }
+        } else {
+            self.spill.get(idx)
+        }
+    }
+}
+
+impl Default for RegionList {
+    fn default() -> Self {
+        Self::empty()
+    }
+}
+
+impl Clone for RegionList {
+    fn clone(&self) -> Self {
+        if self.spill.is_empty() {
+            Self { inline: self.inline.clone(), inline_len: self.inline_len, spill: Vec::new() }
+        } else {
+            Self {
+                inline: [Region::empty(), Region::empty()],
+                inline_len: 0,
+                spill: self.spill.clone(),
+            }
+        }
+    }
+}
+
+impl PartialEq for RegionList {
+    fn eq(&self, other: &Self) -> bool {
+        self.as_slice() == other.as_slice()
+    }
+}
+
+impl Eq for RegionList {}
+
+impl From<Vec<Region>> for RegionList {
+    fn from(v: Vec<Region>) -> Self {
+        Self::from_vec(v)
+    }
+}
+
+impl core::ops::Deref for RegionList {
+    type Target = [Region];
+    #[inline]
+    fn deref(&self) -> &[Region] {
+        self.as_slice()
+    }
+}
+
+impl<'a> IntoIterator for &'a RegionList {
+    type Item = &'a Region;
+    type IntoIter = core::slice::Iter<'a, Region>;
+    #[inline]
+    fn into_iter(self) -> Self::IntoIter {
+        self.as_slice().iter()
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VcObligation {
     pub kind: VcKind,
     pub params: Vec<(ValId, ValType)>,
-    pub assumptions: Vec<Region>,
+    pub assumptions: RegionList,
     pub goal: Region,
-}
-
-impl Drop for VcObligation {
-    fn drop(&mut self) {
-        if !self.assumptions.is_empty() && self.assumptions.len() <= 2 {
-            let _ = self.assumptions.pop();
-            let _ = self.assumptions.pop();
-        }
-    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -45,771 +163,1097 @@ pub struct LoopVcs {
 
 /// Ensures a predicate/measure/spec region performs no heap, global, or unverified call mutations.
 pub fn validate_read_only(region: &Region) -> bool {
-    validate_ro_region(region, None)
+    validate_ro_upto(region, region.root, region.pool.len(), None)
 }
 
 /// Ensures `region` performs no heap or global mutations, verifying any `CallTarget::Stratum`
 /// callees via `registry`'s inductively verified read-only metadata.
 pub fn validate_read_only_with_registry(region: &Region, registry: &StratumRegistry) -> bool {
-    validate_ro_region(region, Some(registry))
+    validate_ro_upto(region, region.root, region.pool.len(), Some(registry))
 }
 
-fn classify_stmt_ro(s: &Stmt, registry: Option<&StratumRegistry>) -> Option<bool> {
-    match s {
-        Stmt::Let { op, .. } => Some(!matches!(op, Op::MemoryGrow { .. })),
-        Stmt::Effect(eff) => Some(matches!(eff, EffectOp::Trap(_) | EffectOp::Nop)),
-        Stmt::Region { .. } => None,
-        Stmt::Call { target: CallTarget::Stratum(sid), .. } => {
-            Some(registry.is_some_and(|reg| reg.is_stratum_read_only(*sid)))
-        }
-        Stmt::Call { .. } => Some(false),
-        Stmt::Yield(_) | Stmt::Break { .. } | Stmt::Continue { .. } | Stmt::Return(_) => Some(true),
-    }
+#[derive(Clone, Copy)]
+struct RoSlot {
+    ro: bool,
+    stmt_cnt: u32,
+    bad_cnt: u32,
 }
 
-fn validate_ro_region(region: &Region, registry: Option<&StratumRegistry>) -> bool {
-    if let Region::Block(stmts) = region {
-        match stmts.as_slice() {
-            [] => return true,
-            [s0] => {
-                if let Some(ok) = classify_stmt_ro(s0, registry) {
-                    return ok;
-                }
-            }
-            _ => {}
-        }
-    }
-    let mut stack = Stack2::<&Region>::with_first(region);
-    while let Some(r) = stack.pop() {
-        match r {
-            Region::Block(stmts) => match stmts.as_slice() {
-                [] => {}
-                [s0] => match classify_stmt_ro(s0, registry) {
-                    Some(true) => {}
-                    Some(false) => return false,
-                    None => {
-                        if let Stmt::Region { region: sub, .. } = s0 {
-                            stack.push(sub);
-                        }
-                    }
-                },
-                _ => {
-                    let mut i = 0;
-                    while i < stmts.len() {
-                        let s = &stmts[i];
-                        match classify_stmt_ro(s, registry) {
-                            Some(true) => {}
-                            Some(false) => return false,
-                            None => {
-                                if let Stmt::Region { region: sub, .. } = s {
-                                    stack.push(sub);
-                                }
-                            }
-                        }
-                        i += 1;
-                    }
-                }
-            },
-            Region::IfElse { then_region, else_region, .. } => {
-                stack.push(else_region);
-                stack.push(then_region);
-            }
-            Region::BoundedLoop { body, .. } => stack.push(body),
-            Region::InvariantLoop { cond, invariant_pred, fuel_measure, body, .. } => {
-                stack.push(body);
-                stack.push(fuel_measure);
-                stack.push(invariant_pred);
-                stack.push(cond);
-            }
-        }
-    }
-    true
+impl RoSlot {
+    const ZERO: Self = Self { ro: false, stmt_cnt: 0, bad_cnt: 0 };
 }
 
-struct RemapScope {
-    inline: [(ValId, ValId); 16],
-    len: usize,
-    spill: Vec<(ValId, ValId)>,
-}
-
-impl RemapScope {
-    fn from_slice(initial: &[(ValId, ValId)]) -> Self {
-        let mut s = Self { inline: [(ValId(0), ValId(0)); 16], len: 0, spill: Vec::new() };
-        match initial {
-            [] => {}
-            [(k0, v0)] => s.push(*k0, *v0),
-            [(k0, v0), (k1, v1)] => {
-                s.push(*k0, *v0);
-                s.push(*k1, *v1);
-            }
-            _ => {
-                let mut i = 0;
-                while i < initial.len() {
-                    let (k, v) = initial[i];
-                    s.push(k, v);
-                    i += 1;
-                }
-            }
+fn check_slot_ro(
+    slot: IrSlot,
+    idx: usize,
+    registry: Option<&StratumRegistry>,
+    slots: &[RoSlot],
+) -> bool {
+    match slot.tag {
+        TAG_STMT_LET => slot.sub != OP_MEM_GROW,
+        TAG_STMT_EFFECT => slot.sub == EFF_TRAP || slot.sub == EFF_NOP,
+        TAG_STMT_REGION => {
+            let s_idx = slot.w2 as usize;
+            s_idx < idx && slots[s_idx].ro
         }
-        s
-    }
-    fn len(&self) -> usize {
-        self.len
-    }
-    fn truncate(&mut self, saved: usize) {
-        if saved < self.len {
-            if (self.len >> 4) != 0 {
-                self.spill.truncate(saved.saturating_sub(16));
-            }
-            self.len = saved;
+        TAG_STMT_CALL => {
+            slot.sub == CALL_STRATUM
+                && registry.is_some_and(|reg| reg.is_stratum_read_only(StratumId(slot.w2)))
         }
-    }
-    fn push(&mut self, old: ValId, new: ValId) {
-        if (self.len >> 4) == 0 {
-            self.inline[self.len & 15] = (old, new);
-            self.len += 1;
-        } else {
-            self.len = self.len.saturating_add(1);
-            self.spill.push((old, new));
-        }
-    }
-    fn lookup(&self, id: ValId) -> ValId {
-        if self.len <= 2 {
-            if self.len == 2 && self.inline[1].0 == id {
-                return self.inline[1].1;
-            }
-            if self.len >= 1 && self.inline[0].0 == id {
-                return self.inline[0].1;
-            }
-            return id;
-        }
-        if (self.len >> 4) != 0 && self.len > 16 {
-            let mut j = self.spill.len();
-            while j > 0 {
-                j -= 1;
-                if self.spill[j].0 == id {
-                    return self.spill[j].1;
-                }
-            }
-        }
-        let mut i = self.len.min(16);
-        while i > 0 {
-            i -= 1;
-            if self.inline[i & 15].0 == id {
-                return self.inline[i & 15].1;
-            }
-        }
-        id
+        TAG_STMT_YIELD | TAG_STMT_BREAK | TAG_STMT_CONTINUE | TAG_STMT_RETURN => true,
+        _ => false,
     }
 }
 
-fn lookup_val(id: ValId, scope: &RemapScope) -> ValId {
-    scope.lookup(id)
-}
-
-fn fresh_val(old: ValId, scope: &mut RemapScope, next: &mut u32) -> ValId {
-    let f = ValId(*next);
-    *next = next.saturating_add(1);
-    scope.push(old, f);
-    f
-}
-
-/// Alpha-renames all locally defined `ValId`s in `region` using `initial_map`,
-/// guaranteeing newly allocated `ValId`s never collide with free uses or `initial_map`.
-pub fn remap_region_vals(region: &Region, initial_map: &[(ValId, ValId)], next_fresh: &mut u32) -> Region {
-    let mut min_safe = max_val_id_in_region(region);
-    match initial_map {
-        [] => {}
-        [(k0, v0)] => min_safe = min_safe.max(k0.0.max(v0.0).saturating_add(1)),
-        [(k0, v0), (k1, v1)] => {
-            min_safe = min_safe
-                .max(k0.0.max(v0.0).saturating_add(1))
-                .max(k1.0.max(v1.0).saturating_add(1));
-        }
-        _ => {
-            let mut m_idx = 0;
-            while m_idx < initial_map.len() {
-                let (k, v) = initial_map[m_idx];
-                min_safe = min_safe.max(k.0.max(v.0).saturating_add(1));
-                m_idx += 1;
+fn check_node_slot_ro_o1(slot: IrSlot, limit: usize, slots: &[RoSlot]) -> bool {
+    match slot.tag {
+        TAG_NODE_BLOCK => {
+            if slot.w1 == 0 {
+                return true;
             }
+            let s = slot.w0 as usize;
+            let e = s.saturating_add(slot.w1 as usize);
+            e <= limit
+                && (slots[e].stmt_cnt - slots[s].stmt_cnt == slot.w1)
+                && (slots[e].bad_cnt == slots[s].bad_cnt)
         }
-    }
-    if *next_fresh < min_safe {
-        *next_fresh = min_safe;
-    }
-    let mut scope = RemapScope::from_slice(initial_map);
-    remap_inner(region, &mut scope, next_fresh)
-}
-
-fn remap_flat_stmt(stmt: &Stmt, scope: &mut RemapScope, next: &mut u32) -> Stmt {
-    match stmt {
-        Stmt::Let { dst, ty, op } => {
-            let new_op = match op {
-                Op::Copy(v) => Op::Copy(lookup_val(*v, scope)),
-                Op::Select { cond, true_val, false_val } => Op::Select {
-                    cond: lookup_val(*cond, scope),
-                    true_val: lookup_val(*true_val, scope),
-                    false_val: lookup_val(*false_val, scope),
-                },
-                Op::Un(u, v) => Op::Un(*u, lookup_val(*v, scope)),
-                Op::Bin(b, l, r) => Op::Bin(*b, lookup_val(*l, scope), lookup_val(*r, scope)),
-                Op::Load { mem, addr, offset, width, signed, result_ty } => Op::Load {
-                    mem: *mem,
-                    addr: lookup_val(*addr, scope),
-                    offset: *offset,
-                    width: *width,
-                    signed: *signed,
-                    result_ty: *result_ty,
-                },
-                Op::MemoryGrow { mem, delta } => Op::MemoryGrow { mem: *mem, delta: lookup_val(*delta, scope) },
-                other => *other,
-            };
-            Stmt::Let { dst: fresh_val(*dst, scope, next), ty: *ty, op: new_op }
+        TAG_NODE_IF => {
+            let (t, e) = (slot.w1 as usize, slot.w2 as usize);
+            t < limit && e < limit && slots[t].ro && slots[e].ro
         }
-        Stmt::Effect(eff) => Stmt::Effect(match eff {
-            EffectOp::Store { mem, addr, offset, width, val } => EffectOp::Store {
-                mem: *mem,
-                addr: lookup_val(*addr, scope),
-                offset: *offset,
-                width: *width,
-                val: lookup_val(*val, scope),
-            },
-            EffectOp::MemoryCopy { dst_mem, src_mem, dst, src, len } => EffectOp::MemoryCopy {
-                dst_mem: *dst_mem,
-                src_mem: *src_mem,
-                dst: lookup_val(*dst, scope),
-                src: lookup_val(*src, scope),
-                len: lookup_val(*len, scope),
-            },
-            EffectOp::MemoryFill { mem, dst, val, len } => EffectOp::MemoryFill {
-                mem: *mem,
-                dst: lookup_val(*dst, scope),
-                val: lookup_val(*val, scope),
-                len: lookup_val(*len, scope),
-            },
-            EffectOp::GlobalSet { id, val } => EffectOp::GlobalSet { id: *id, val: lookup_val(*val, scope) },
-            other => *other,
-        }),
-        Stmt::Call { results, target, args } => {
-            let args = remap_vals(args, scope);
-            let new_res = match results.as_slice() {
-                [] => Vec::new(),
-                [(id0, ty0)] => vec![(fresh_val(*id0, scope, next), *ty0)],
-                _ => {
-                    let mut nr = Vec::with_capacity(results.len());
-                    let mut i = 0;
-                    while i < results.len() {
-                        nr.push((fresh_val(results[i].0, scope, next), results[i].1));
-                        i += 1;
-                    }
-                    nr
-                }
-            };
-            Stmt::Call { results: new_res, target: *target, args }
+        TAG_NODE_BLOOP => {
+            let b = slot.w5 as usize;
+            b < limit && slots[b].ro
         }
-        Stmt::Yield(vs) => Stmt::Yield(remap_vals(vs, scope)),
-        Stmt::Return(vs) => Stmt::Return(remap_vals(vs, scope)),
-        Stmt::Break { depth, cond, values } => Stmt::Break {
-            depth: *depth,
-            cond: cond.map(|c| lookup_val(c, scope)),
-            values: remap_vals(values, scope),
-        },
-        Stmt::Continue { depth, cond, values } => Stmt::Continue {
-            depth: *depth,
-            cond: cond.map(|c| lookup_val(c, scope)),
-            values: remap_vals(values, scope),
-        },
-        Stmt::Region { .. } => unreachable!(),
+        TAG_NODE_ILOOP => {
+            let (c, i, f, b) =
+                (slot.w4 as usize, slot.w5 as usize, slot.w6 as usize, slot.w7 as usize);
+            c < limit
+                && i < limit
+                && f < limit
+                && b < limit
+                && slots[c].ro
+                && slots[i].ro
+                && slots[f].ro
+                && slots[b].ro
+        }
+        _ => false,
     }
 }
 
-enum RemapTask<'a> {
-    Enter(&'a Region),
-    StepBlock { stmts: &'a [Stmt], idx: usize, saved: usize, out: Vec<Stmt> },
-    FinishSubRegion { results: &'a [(ValId, ValType)], stmts: &'a [Stmt], next_idx: usize, saved: usize, out: Vec<Stmt> },
-    BuildIfElse { cond: ValId, results: &'a [ValType] },
-    BuildBounded { max_iters: u32, init_vars: Vec<ValId>, state_vars: Vec<(ValId, ValType)>, saved: usize },
-    BuildInv { init_vars: Vec<ValId>, state_vars: Vec<(ValId, ValType)>, saved: usize },
+fn run_ro_pass(
+    region: &Region,
+    root_slot: IrSlot,
+    lim: usize,
+    registry: Option<&StratumRegistry>,
+    slots: &mut [RoSlot],
+) -> bool {
+    let mut s_cnt = 0u32;
+    let mut b_cnt = 0u32;
+    let mut idx = 0;
+    while idx < lim {
+        let slot = region.pool[idx];
+        if slot.is_stmt() {
+            s_cnt += 1;
+            if !check_slot_ro(slot, idx, registry, slots) {
+                b_cnt += 1;
+            }
+        } else if slot.is_node() {
+            slots[idx].ro = check_node_slot_ro_o1(slot, idx, slots);
+        }
+        slots[idx + 1].stmt_cnt = s_cnt;
+        slots[idx + 1].bad_cnt = b_cnt;
+        idx += 1;
+    }
+    check_node_slot_ro_o1(root_slot, lim, slots)
 }
 
-fn remap_inner(root: &Region, scope: &mut RemapScope, next: &mut u32) -> Region {
-    if let Region::Block(stmts) = root {
-        match stmts.as_slice() {
-            [] => return Region::Block(Vec::new()),
-            [s0] if !matches!(s0, Stmt::Region { .. }) => {
-                let saved = scope.len();
-                let r = remap_flat_stmt(s0, scope, next);
-                scope.truncate(saved);
-                return Region::Block(vec![r]);
-            }
-            _ => {}
-        }
-    }
-    let mut tasks = Stack2::<RemapTask<'_>>::with_first(RemapTask::Enter(root));
-    let mut vals = Stack2::<Region>::new();
-    'outer: while let Some(task) = tasks.pop() {
-        match task {
-            RemapTask::Enter(region) => match region {
-                Region::Block(stmts) => tasks.push(RemapTask::StepBlock {
-                    stmts,
-                    idx: 0,
-                    saved: scope.len(),
-                    out: Vec::new(),
-                }),
-                Region::IfElse { cond, then_region, else_region, results } => {
-                    let c = lookup_val(*cond, scope);
-                    tasks.push(RemapTask::BuildIfElse { cond: c, results });
-                    tasks.push(RemapTask::Enter(else_region));
-                    tasks.push(RemapTask::Enter(then_region));
-                }
-                Region::BoundedLoop { max_iters, init_vars, state_vars, body } => {
-                    let new_inits = remap_vals(init_vars, scope);
-                    let saved = scope.len();
-                    let mut new_states = Vec::with_capacity(state_vars.len());
-                    for &(id, ty) in state_vars {
-                        new_states.push((fresh_val(id, scope, next), ty));
-                    }
-                    tasks.push(RemapTask::BuildBounded { max_iters: *max_iters, init_vars: new_inits, state_vars: new_states, saved });
-                    tasks.push(RemapTask::Enter(body));
-                }
-                Region::InvariantLoop { init_vars, state_vars, cond, invariant_pred, fuel_measure, body } => {
-                    let new_inits = remap_vals(init_vars, scope);
-                    let saved = scope.len();
-                    let mut new_states = Vec::with_capacity(state_vars.len());
-                    for &(id, ty) in state_vars {
-                        new_states.push((fresh_val(id, scope, next), ty));
-                    }
-                    tasks.push(RemapTask::BuildInv { init_vars: new_inits, state_vars: new_states, saved });
-                    tasks.push(RemapTask::Enter(body));
-                    tasks.push(RemapTask::Enter(fuel_measure));
-                    tasks.push(RemapTask::Enter(invariant_pred));
-                    tasks.push(RemapTask::Enter(cond));
-                }
-            },
-            RemapTask::StepBlock { stmts, mut idx, saved, mut out } => {
-                while idx < stmts.len() {
-                    if let Stmt::Region { results, region: sub } = &stmts[idx] {
-                        tasks.push(RemapTask::FinishSubRegion { results, stmts, next_idx: idx + 1, saved, out });
-                        tasks.push(RemapTask::Enter(sub));
-                        continue 'outer;
-                    }
-                    out.push(remap_flat_stmt(&stmts[idx], scope, next));
-                    idx += 1;
-                }
-                scope.truncate(saved);
-                vals.push(Region::Block(out));
-            }
-            RemapTask::FinishSubRegion { results, stmts, next_idx, saved, mut out } => {
-                let sub = vals.pop().unwrap_or_else(|| Region::Block(Vec::new()));
-                let mut new_res = Vec::with_capacity(results.len());
-                for &(id, ty) in results {
-                    new_res.push((fresh_val(id, scope, next), ty));
-                }
-                out.push(Stmt::Region { results: new_res, region: sub });
-                tasks.push(RemapTask::StepBlock { stmts, idx: next_idx, saved, out });
-            }
-            RemapTask::BuildIfElse { cond, results } => {
-                let else_r = vals.pop().unwrap_or_else(|| Region::Block(Vec::new()));
-                let then_r = vals.pop().unwrap_or_else(|| Region::Block(Vec::new()));
-                vals.push(Region::IfElse {
-                    cond,
-                    results: results.to_vec(),
-                    then_region: Box::new(then_r),
-                    else_region: Box::new(else_r),
-                });
-            }
-            RemapTask::BuildBounded { max_iters, init_vars, state_vars, saved } => {
-                let body_r = vals.pop().unwrap_or_else(|| Region::Block(Vec::new()));
-                scope.truncate(saved);
-                vals.push(Region::BoundedLoop { max_iters, init_vars, state_vars, body: Box::new(body_r) });
-            }
-            RemapTask::BuildInv { init_vars, state_vars, saved } => {
-                let body_r = vals.pop().unwrap_or_else(|| Region::Block(Vec::new()));
-                let fuel_r = vals.pop().unwrap_or_else(|| Region::Block(Vec::new()));
-                let inv_r = vals.pop().unwrap_or_else(|| Region::Block(Vec::new()));
-                let cond_r = vals.pop().unwrap_or_else(|| Region::Block(Vec::new()));
-                scope.truncate(saved);
-                vals.push(Region::InvariantLoop {
-                    init_vars,
-                    state_vars,
-                    cond: Box::new(cond_r),
-                    invariant_pred: Box::new(inv_r),
-                    fuel_measure: Box::new(fuel_r),
-                    body: Box::new(body_r),
-                });
-            }
-        }
-    }
-    vals.pop().unwrap_or_else(|| Region::Block(Vec::new()))
+#[cold]
+#[inline(never)]
+fn validate_ro_upto_heap(
+    region: &Region,
+    root_slot: IrSlot,
+    lim: usize,
+    registry: Option<&StratumRegistry>,
+) -> bool {
+    let mut slots = vec![RoSlot::ZERO; lim + 1];
+    run_ro_pass(region, root_slot, lim, registry, &mut slots)
 }
 
-fn remap_vals(vs: &[ValId], scope: &RemapScope) -> Vec<ValId> {
-    match vs {
-        [] => Vec::new(),
-        [v0] => vec![lookup_val(*v0, scope)],
-        [v0, v1] => vec![lookup_val(*v0, scope), lookup_val(*v1, scope)],
-        _ => {
-            let mut out = Vec::with_capacity(vs.len());
-            let mut i = 0;
-            while i < vs.len() {
-                out.push(lookup_val(vs[i], scope));
-                i += 1;
-            }
-            out
-        }
+fn validate_ro_slot_upto(
+    region: &Region,
+    root_slot: IrSlot,
+    limit: usize,
+    registry: Option<&StratumRegistry>,
+) -> bool {
+    if root_slot.tag == TAG_NODE_BLOCK && root_slot.w1 == 0 {
+        return true;
     }
+    let lim = limit.min(region.pool.len());
+    if lim == 0 {
+        return false;
+    }
+    if lim <= 32 {
+        let mut inline = [RoSlot::ZERO; 33];
+        run_ro_pass(region, root_slot, lim, registry, &mut inline[..=lim])
+    } else {
+        validate_ro_upto_heap(region, root_slot, lim, registry)
+    }
+}
+
+pub(crate) fn validate_ro_upto(
+    region: &Region,
+    node: RegionNode,
+    limit: usize,
+    registry: Option<&StratumRegistry>,
+) -> bool {
+    validate_ro_slot_upto(region, IrSlot::from_node(node), limit, registry)
 }
 
 fn bump_id(v: ValId, m: &mut u32) {
     *m = (*m).max(v.0.saturating_add(1));
 }
 
-fn bump_ids(vs: &[ValId], m: &mut u32) {
-    match vs {
-        [] => {}
-        [v0] => bump_id(*v0, m),
-        [v0, v1] => {
-            bump_id(*v0, m);
-            bump_id(*v1, m);
-        }
-        _ => {
-            let mut i = 0;
-            while i < vs.len() {
-                bump_id(vs[i], m);
-                i += 1;
-            }
-        }
-    }
-}
-
 fn bump_typed(vs: &[(ValId, ValType)], m: &mut u32) {
-    match vs {
-        [] => {}
-        [(v0, _)] => bump_id(*v0, m),
-        [(v0, _), (v1, _)] => {
-            bump_id(*v0, m);
-            bump_id(*v1, m);
-        }
-        _ => {
-            let mut i = 0;
-            while i < vs.len() {
-                bump_id(vs[i].0, m);
-                i += 1;
-            }
-        }
+    let mut i = 0;
+    while i < vs.len() {
+        bump_id(vs[i].0, m);
+        i += 1;
     }
 }
 
 pub(crate) fn max_val_id_in_region(region: &Region) -> u32 {
-    if let Region::Block(stmts) = region {
-        match stmts.as_slice() {
-            [] => return 0,
-            [s0] if !matches!(s0, Stmt::Region { .. }) => return max_val_id_flat_one(s0),
-            _ => {}
-        }
-    }
-    max_val_id_iter(region)
-}
-
-fn max_val_id_flat_one(s: &Stmt) -> u32 {
     let mut max = 0u32;
-    match s {
-        Stmt::Let { dst, op, .. } => {
-            bump_id(*dst, &mut max);
-            match op {
-                Op::Copy(v) | Op::Un(_, v) | Op::Load { addr: v, .. } | Op::MemoryGrow { delta: v, .. } => {
-                    bump_id(*v, &mut max);
-                }
-                Op::Select { cond, true_val, false_val } => {
-                    bump_id(*cond, &mut max);
-                    bump_id(*true_val, &mut max);
-                    bump_id(*false_val, &mut max);
-                }
-                Op::Bin(_, l, r) => {
-                    bump_id(*l, &mut max);
-                    bump_id(*r, &mut max);
-                }
-                Op::ConstI32(_) | Op::ConstI64(_) | Op::GlobalGet(_) | Op::MemorySize(_) => {}
-            }
-        }
-        Stmt::Effect(eff) => match eff {
-            EffectOp::Store { addr, val, .. } => {
-                bump_id(*addr, &mut max);
-                bump_id(*val, &mut max);
-            }
-            EffectOp::MemoryCopy { dst, src, len, .. } | EffectOp::MemoryFill { dst, val: src, len, .. } => {
-                bump_id(*dst, &mut max);
-                bump_id(*src, &mut max);
-                bump_id(*len, &mut max);
-            }
-            EffectOp::GlobalSet { val, .. } => bump_id(*val, &mut max),
-            EffectOp::Trap(_) | EffectOp::Nop => {}
-        },
-        Stmt::Call { results, args, .. } => {
-            bump_typed(results, &mut max);
-            bump_ids(args, &mut max);
-        }
-        Stmt::Yield(vs) | Stmt::Return(vs) => bump_ids(vs, &mut max),
-        Stmt::Break { cond, values, .. } | Stmt::Continue { cond, values, .. } => {
-            if let Some(c) = cond {
-                bump_id(*c, &mut max);
-            }
-            bump_ids(values, &mut max);
-        }
-        Stmt::Region { .. } => {}
+    if let RegionNode::IfElse { cond, .. } = region.root {
+        bump_id(cond, &mut max);
     }
-    max
-}
-
-fn max_val_id_iter(root: &Region) -> u32 {
-    let mut max = 0u32;
-    let mut stack = Stack2::<&Region>::with_first(root);
-    while let Some(r) = stack.pop() {
-        match r {
-            Region::Block(stmts) => {
-                for s in stmts {
-                    if let Stmt::Region { results, region } = s {
-                        bump_typed(results, &mut max);
-                        stack.push(region);
-                    } else {
-                        max = max.max(max_val_id_flat_one(s));
+    let mut i = 0;
+    while i < region.pool.len() {
+        let slot = region.pool[i];
+        match slot.tag {
+            TAG_NODE_IF | TAG_VAL | TAG_VAR => bump_id(ValId(slot.w0), &mut max),
+            TAG_STMT_LET => {
+                bump_id(ValId(slot.w0), &mut max);
+                match slot.sub {
+                    OP_COPY | OP_UN => bump_id(ValId(slot.w1), &mut max),
+                    OP_SELECT => {
+                        bump_id(ValId(slot.w1), &mut max);
+                        bump_id(ValId(slot.w2), &mut max);
+                        bump_id(ValId(slot.w3), &mut max);
                     }
-                }
-            }
-            Region::IfElse { cond, then_region, else_region, .. } => {
-                bump_id(*cond, &mut max);
-                stack.push(else_region);
-                stack.push(then_region);
-            }
-            Region::BoundedLoop { init_vars, state_vars, body, .. } => {
-                bump_ids(init_vars, &mut max);
-                bump_typed(state_vars, &mut max);
-                stack.push(body);
-            }
-            Region::InvariantLoop { init_vars, state_vars, cond, invariant_pred, fuel_measure, body } => {
-                bump_ids(init_vars, &mut max);
-                bump_typed(state_vars, &mut max);
-                stack.push(body);
-                stack.push(fuel_measure);
-                stack.push(invariant_pred);
-                stack.push(cond);
-            }
-        }
-    }
-    max
-}
-
-fn flat_stmt_escapes(s: &Stmt, inner_d: u32, allow_ct: bool) -> Option<bool> {
-    match s {
-        Stmt::Return(_) => Some(true),
-        Stmt::Break { depth: br_d, .. } if *br_d >= inner_d => Some(true),
-        Stmt::Continue { depth: ct_d, .. }
-            if if allow_ct { *ct_d > inner_d } else { *ct_d >= inner_d } =>
-        {
-            Some(true)
-        }
-        Stmt::Region { .. } => None,
-        _ => Some(false),
-    }
-}
-
-/// Checks whether `region` contains `Return` or any `Break`/`Continue` escaping its boundary.
-fn has_escaping_flow(region: &Region, depth: u32, is_loop_body_root: bool, allow_root_continue: bool) -> bool {
-    if let Region::Block(stmts) = region {
-        let inner_d = if is_loop_body_root { depth } else { depth + 1 };
-        match stmts.as_slice() {
-            [] => return false,
-            [s0] => {
-                if let Some(esc) = flat_stmt_escapes(s0, inner_d, allow_root_continue) {
-                    return esc;
-                }
-            }
-            _ => {}
-        }
-    }
-    let mut stack = Stack2::with_first((region, depth, is_loop_body_root, allow_root_continue));
-    while let Some((reg, d, is_root, allow_ct)) = stack.pop() {
-        match reg {
-            Region::Block(stmts) => {
-                let inner_d = if is_root { d } else { d + 1 };
-                for s in stmts {
-                    match flat_stmt_escapes(s, inner_d, allow_ct) {
-                        Some(true) => return true,
-                        Some(false) => {}
-                        None => {
-                            if let Stmt::Region { region: sub, .. } = s {
-                                stack.push((sub, inner_d, false, allow_ct));
-                            }
-                        }
+                    OP_BIN => {
+                        bump_id(ValId(slot.w1), &mut max);
+                        bump_id(ValId(slot.w2), &mut max);
                     }
+                    OP_LOAD | OP_MEM_GROW => bump_id(ValId(slot.w2), &mut max),
+                    _ => {}
                 }
             }
-            Region::IfElse { then_region, else_region, .. } => {
-                stack.push((else_region, d, false, allow_ct));
-                stack.push((then_region, d, false, allow_ct));
-            }
-            Region::BoundedLoop { body, .. } => stack.push((body, d + 1, true, allow_ct)),
-            Region::InvariantLoop { cond, invariant_pred, fuel_measure, body, .. } => {
-                stack.push((body, d + 1, true, allow_ct));
-                stack.push((fuel_measure, 0, false, false));
-                stack.push((invariant_pred, 0, false, false));
-                stack.push((cond, 0, false, false));
-            }
-        }
-    }
-    false
-}
-
-fn clone_val_vec(vs: &[ValId]) -> Vec<ValId> {
-    match vs {
-        [] => Vec::new(),
-        [v0] => vec![*v0],
-        [v0, v1] => vec![*v0, *v1],
-        _ => vs.to_vec(),
-    }
-}
-
-fn normalize_flat_stmt(s: &Stmt, inner_d: u32) -> Stmt {
-    match s {
-        Stmt::Let { dst, ty, op } => Stmt::Let { dst: *dst, ty: *ty, op: *op },
-        Stmt::Effect(eff) => Stmt::Effect(*eff),
-        Stmt::Call { results, target, args } => {
-            Stmt::Call { results: results.clone(), target: *target, args: clone_val_vec(args) }
-        }
-        Stmt::Yield(vs) => Stmt::Yield(clone_val_vec(vs)),
-        Stmt::Return(vs) => Stmt::Return(clone_val_vec(vs)),
-        Stmt::Break { depth, cond, values } => {
-            Stmt::Break { depth: *depth, cond: *cond, values: clone_val_vec(values) }
-        }
-        Stmt::Continue { depth: d, cond, values } if *d == inner_d => {
-            Stmt::Break { depth: *d, cond: *cond, values: clone_val_vec(values) }
-        }
-        Stmt::Continue { depth, cond, values } => {
-            Stmt::Continue { depth: *depth, cond: *cond, values: clone_val_vec(values) }
-        }
-        Stmt::Region { .. } => unreachable!(),
-    }
-}
-
-enum NormTask<'a> {
-    Enter { region: &'a Region, depth: u32, is_root: bool },
-    StepBlock { stmts: &'a [Stmt], idx: usize, inner_d: u32, out: Vec<Stmt> },
-    FinishSubRegion { results: &'a [(ValId, ValType)], stmts: &'a [Stmt], next_idx: usize, inner_d: u32, out: Vec<Stmt> },
-    BuildIfElse { cond: ValId, results: &'a [ValType] },
-    BuildBounded { max_iters: u32, init_vars: &'a [ValId], state_vars: &'a [(ValId, ValType)] },
-    BuildInv { init_vars: &'a [ValId], state_vars: &'a [(ValId, ValType)], cond: &'a Region, inv: &'a Region, fuel: &'a Region },
-}
-
-fn normalize_loop_body_for_vc(region: &Region, depth: u32, is_loop_body_root: bool) -> Region {
-    if let Region::Block(stmts) = region {
-        let inner_d = if is_loop_body_root { depth } else { depth + 1 };
-        match stmts.as_slice() {
-            [] => return Region::Block(Vec::new()),
-            [s0] if !matches!(s0, Stmt::Region { .. }) => {
-                return Region::Block(vec![normalize_flat_stmt(s0, inner_d)]);
-            }
-            _ => {}
-        }
-    }
-    let mut tasks = Stack2::with_first(NormTask::Enter { region, depth, is_root: is_loop_body_root });
-    let mut vals = Stack2::<Region>::new();
-    'outer: while let Some(task) = tasks.pop() {
-        match task {
-            NormTask::Enter { region: r, depth: d, is_root } => match r {
-                Region::Block(stmts) => tasks.push(NormTask::StepBlock {
-                    stmts,
-                    idx: 0,
-                    inner_d: if is_root { d } else { d + 1 },
-                    out: Vec::new(),
-                }),
-                Region::IfElse { cond, then_region, else_region, results } => {
-                    tasks.push(NormTask::BuildIfElse { cond: *cond, results });
-                    tasks.push(NormTask::Enter { region: else_region, depth: d, is_root: false });
-                    tasks.push(NormTask::Enter { region: then_region, depth: d, is_root: false });
+            TAG_STMT_EFFECT => match slot.sub {
+                EFF_STORE => {
+                    bump_id(ValId(slot.w1), &mut max);
+                    bump_id(ValId(slot.w3), &mut max);
                 }
-                Region::BoundedLoop { max_iters, init_vars, state_vars, body } => {
-                    tasks.push(NormTask::BuildBounded { max_iters: *max_iters, init_vars, state_vars });
-                    tasks.push(NormTask::Enter { region: body, depth: d + 1, is_root: true });
+                EFF_MEM_COPY => {
+                    bump_id(ValId(slot.w2), &mut max);
+                    bump_id(ValId(slot.w3), &mut max);
+                    bump_id(ValId(slot.w4), &mut max);
                 }
-                Region::InvariantLoop { init_vars, state_vars, cond, invariant_pred, fuel_measure, body } => {
-                    tasks.push(NormTask::BuildInv { init_vars, state_vars, cond, inv: invariant_pred, fuel: fuel_measure });
-                    tasks.push(NormTask::Enter { region: body, depth: d + 1, is_root: true });
+                EFF_MEM_FILL => {
+                    bump_id(ValId(slot.w1), &mut max);
+                    bump_id(ValId(slot.w2), &mut max);
+                    bump_id(ValId(slot.w3), &mut max);
                 }
+                EFF_GLOBAL_SET => bump_id(ValId(slot.w1), &mut max),
+                _ => {}
             },
-            NormTask::StepBlock { stmts, mut idx, inner_d, mut out } => {
-                while idx < stmts.len() {
-                    if let Stmt::Region { results, region: sub } = &stmts[idx] {
-                        tasks.push(NormTask::FinishSubRegion { results, stmts, next_idx: idx + 1, inner_d, out });
-                        tasks.push(NormTask::Enter { region: sub, depth: inner_d, is_root: false });
-                        continue 'outer;
+            TAG_STMT_BREAK | TAG_STMT_CONTINUE if slot.sub != 0 => {
+                bump_id(ValId(slot.w1), &mut max);
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    max
+}
+
+#[derive(Clone, Copy)]
+struct FlowMask {
+    bad: bool,
+    br: u64,
+    ct: u64,
+}
+
+impl FlowMask {
+    const ZERO: Self = Self { bad: false, br: 0, ct: 0 };
+    const BAD: Self = Self { bad: true, br: 0, ct: 0 };
+}
+
+#[derive(Clone, Copy)]
+struct FlowSlot {
+    norm: FlowMask,
+    body: FlowMask,
+    stmt_br: u64,
+    stmt_ct: u64,
+    stmt_cnt: u32,
+    bad_cnt: u32,
+    br_ct_cnt: u32,
+}
+
+impl FlowSlot {
+    const ZERO: Self = Self {
+        norm: FlowMask::BAD,
+        body: FlowMask::BAD,
+        stmt_br: 0,
+        stmt_ct: 0,
+        stmt_cnt: 0,
+        bad_cnt: 0,
+        br_ct_cnt: 0,
+    };
+}
+
+#[cold]
+#[inline(never)]
+fn scan_block_br_ct(s: usize, e: usize, slots: &[FlowSlot]) -> (u64, u64) {
+    let mut br = 0u64;
+    let mut ct = 0u64;
+    let mut k = s;
+    while k < e {
+        br |= slots[k].stmt_br;
+        ct |= slots[k].stmt_ct;
+        k += 1;
+    }
+    (br, ct)
+}
+
+fn compute_flow_o1(root_slot: IrSlot, limit: usize, slots: &[FlowSlot]) -> (FlowMask, FlowMask) {
+    match root_slot.tag {
+        TAG_NODE_BLOCK => {
+            if root_slot.w1 == 0 {
+                return (FlowMask::ZERO, FlowMask::ZERO);
+            }
+            let s = root_slot.w0 as usize;
+            let e = s.saturating_add(root_slot.w1 as usize);
+            if e > limit || (slots[e].stmt_cnt - slots[s].stmt_cnt != root_slot.w1) {
+                return (FlowMask::BAD, FlowMask::BAD);
+            }
+            let bad = slots[e].bad_cnt != slots[s].bad_cnt;
+            let (br, ct) = if slots[e].br_ct_cnt == slots[s].br_ct_cnt {
+                (0u64, 0u64)
+            } else {
+                scan_block_br_ct(s, e, slots)
+            };
+            let as_body = FlowMask { bad, br, ct };
+            let as_norm = FlowMask { bad: bad || ((ct & 1) != 0), br: br >> 1, ct: ct >> 1 };
+            (as_norm, as_body)
+        }
+        TAG_NODE_IF => {
+            let (t_i, e_i) = (root_slot.w1 as usize, root_slot.w2 as usize);
+            if t_i >= limit || e_i >= limit {
+                return (FlowMask::BAD, FlowMask::BAD);
+            }
+            let (t, e) = (slots[t_i].norm, slots[e_i].norm);
+            let m = FlowMask { bad: t.bad || e.bad, br: t.br | e.br, ct: t.ct | e.ct };
+            (m, m)
+        }
+        TAG_NODE_BLOOP => {
+            let b_i = root_slot.w5 as usize;
+            if b_i >= limit {
+                return (FlowMask::BAD, FlowMask::BAD);
+            }
+            let b = slots[b_i].body;
+            let m = FlowMask { bad: b.bad, br: b.br >> 1, ct: b.ct >> 1 };
+            (m, m)
+        }
+        TAG_NODE_ILOOP => {
+            let (c_i, inv_i, f_i, b_i) = (
+                root_slot.w4 as usize,
+                root_slot.w5 as usize,
+                root_slot.w6 as usize,
+                root_slot.w7 as usize,
+            );
+            if c_i >= limit || inv_i >= limit || f_i >= limit || b_i >= limit {
+                return (FlowMask::BAD, FlowMask::BAD);
+            }
+            let (c, inv, f, b) =
+                (slots[c_i].norm, slots[inv_i].norm, slots[f_i].norm, slots[b_i].body);
+            let spec_bad = c.bad
+                || c.br != 0
+                || c.ct != 0
+                || inv.bad
+                || inv.br != 0
+                || inv.ct != 0
+                || f.bad
+                || f.br != 0
+                || f.ct != 0;
+            let m = FlowMask { bad: spec_bad || b.bad, br: b.br >> 1, ct: b.ct >> 1 };
+            (m, m)
+        }
+        _ => (FlowMask::BAD, FlowMask::BAD),
+    }
+}
+
+fn run_flow_pass(
+    region: &Region,
+    root_slot: IrSlot,
+    lim: usize,
+    slots: &mut [FlowSlot],
+) -> (FlowMask, FlowMask) {
+    let mut s_cnt = 0u32;
+    let mut b_cnt = 0u32;
+    let mut bc_cnt = 0u32;
+    let mut idx = 0;
+    while idx < lim {
+        let slot = region.pool[idx];
+        if slot.is_stmt() {
+            s_cnt += 1;
+            let mut s_bad = false;
+            let mut s_br = 0u64;
+            let mut s_ct = 0u64;
+            match slot.tag {
+                TAG_STMT_RETURN => s_bad = true,
+                TAG_STMT_BREAK => {
+                    if slot.w0 >= 64 {
+                        s_bad = true;
+                    } else {
+                        s_br = 1u64 << slot.w0;
                     }
-                    out.push(normalize_flat_stmt(&stmts[idx], inner_d));
-                    idx += 1;
                 }
-                vals.push(Region::Block(out));
+                TAG_STMT_CONTINUE => {
+                    if slot.w0 >= 64 {
+                        s_bad = true;
+                    } else {
+                        s_ct = 1u64 << slot.w0;
+                    }
+                }
+                TAG_STMT_REGION => {
+                    let sub_i = slot.w2 as usize;
+                    if sub_i < idx {
+                        let sub = slots[sub_i].norm;
+                        s_bad = sub.bad;
+                        s_br = sub.br;
+                        s_ct = sub.ct;
+                    } else {
+                        s_bad = true;
+                    }
+                }
+                _ => {}
             }
-            NormTask::FinishSubRegion { results, stmts, next_idx, inner_d, mut out } => {
-                let sub = vals.pop().unwrap_or_else(|| Region::Block(Vec::new()));
-                out.push(Stmt::Region { results: results.to_vec(), region: sub });
-                tasks.push(NormTask::StepBlock { stmts, idx: next_idx, inner_d, out });
+            slots[idx].stmt_br = s_br;
+            slots[idx].stmt_ct = s_ct;
+            if s_bad {
+                b_cnt += 1;
             }
-            NormTask::BuildIfElse { cond, results } => {
-                let else_r = vals.pop().unwrap_or_else(|| Region::Block(Vec::new()));
-                let then_r = vals.pop().unwrap_or_else(|| Region::Block(Vec::new()));
-                vals.push(Region::IfElse {
-                    cond,
-                    results: results.to_vec(),
-                    then_region: Box::new(then_r),
-                    else_region: Box::new(else_r),
-                });
+            if s_br != 0 || s_ct != 0 {
+                bc_cnt += 1;
             }
-            NormTask::BuildBounded { max_iters, init_vars, state_vars } => {
-                let body_r = vals.pop().unwrap_or_else(|| Region::Block(Vec::new()));
-                vals.push(Region::BoundedLoop {
-                    max_iters,
-                    init_vars: init_vars.to_vec(),
-                    state_vars: state_vars.to_vec(),
-                    body: Box::new(body_r),
-                });
+        } else if slot.is_node() {
+            let (a, b) = compute_flow_o1(slot, idx, slots);
+            slots[idx].norm = a;
+            slots[idx].body = b;
+        }
+        slots[idx + 1].stmt_cnt = s_cnt;
+        slots[idx + 1].bad_cnt = b_cnt;
+        slots[idx + 1].br_ct_cnt = bc_cnt;
+        idx += 1;
+    }
+    compute_flow_o1(root_slot, lim, slots)
+}
+
+#[cold]
+#[inline(never)]
+fn has_escaping_flow_heap(region: &Region, root_slot: IrSlot, lim: usize) -> (FlowMask, FlowMask) {
+    let mut slots = vec![FlowSlot::ZERO; lim + 1];
+    run_flow_pass(region, root_slot, lim, &mut slots)
+}
+
+fn has_escaping_flow_slot_upto(
+    region: &Region,
+    root_slot: IrSlot,
+    limit: usize,
+    as_loop_body_root: bool,
+) -> bool {
+    if root_slot.tag == TAG_NODE_BLOCK && root_slot.w1 == 0 {
+        return false;
+    }
+    let lim = limit.min(region.pool.len());
+    let (norm, body) = if lim == 0 {
+        compute_flow_o1(root_slot, 0, &[FlowSlot::ZERO])
+    } else if lim <= 16 {
+        let mut inline = [FlowSlot::ZERO; 17];
+        run_flow_pass(region, root_slot, lim, &mut inline[..=lim])
+    } else {
+        has_escaping_flow_heap(region, root_slot, lim)
+    };
+    if as_loop_body_root {
+        body.bad || body.br != 0 || (body.ct & !1u64) != 0
+    } else {
+        norm.bad || norm.br != 0 || norm.ct != 0
+    }
+}
+
+fn has_escaping_flow_upto(
+    region: &Region,
+    node: RegionNode,
+    limit: usize,
+    as_loop_body_root: bool,
+) -> bool {
+    has_escaping_flow_slot_upto(region, IrSlot::from_node(node), limit, as_loop_body_root)
+}
+
+enum ScopeBuf {
+    Inline([(ValId, ValId); 8]),
+    Heap(Box<[(ValId, ValId)]>),
+}
+
+struct Scope {
+    buf: ScopeBuf,
+    len: usize,
+}
+
+impl Scope {
+    fn with_max_cap(initial: &[(ValId, ValId)], extra_cap: usize) -> Self {
+        let cap = initial.len().saturating_add(extra_cap);
+        let mut s = if cap <= 8 {
+            Self { buf: ScopeBuf::Inline([(ValId(0), ValId(0)); 8]), len: 0 }
+        } else {
+            Self { buf: ScopeBuf::Heap(vec![(ValId(0), ValId(0)); cap].into_boxed_slice()), len: 0 }
+        };
+        let mut i = 0;
+        while i < initial.len() {
+            s.push(initial[i].0, initial[i].1);
+            i += 1;
+        }
+        s
+    }
+
+    fn len(&self) -> usize {
+        self.len
+    }
+
+    fn truncate(&mut self, saved: usize) {
+        self.len = saved;
+    }
+
+    fn push(&mut self, old: ValId, mapped: ValId) {
+        match &mut self.buf {
+            ScopeBuf::Inline(a) => {
+                if self.len < a.len() {
+                    a[self.len] = (old, mapped);
+                    self.len += 1;
+                }
             }
-            NormTask::BuildInv { init_vars, state_vars, cond, inv, fuel } => {
-                let body_r = vals.pop().unwrap_or_else(|| Region::Block(Vec::new()));
-                vals.push(Region::InvariantLoop {
-                    init_vars: init_vars.to_vec(),
-                    state_vars: state_vars.to_vec(),
-                    cond: Box::new(cond.clone()),
-                    invariant_pred: Box::new(inv.clone()),
-                    fuel_measure: Box::new(fuel.clone()),
-                    body: Box::new(body_r),
-                });
+            ScopeBuf::Heap(h) => {
+                if self.len < h.len() {
+                    h[self.len] = (old, mapped);
+                    self.len += 1;
+                }
             }
         }
     }
-    vals.pop().unwrap_or_else(|| Region::Block(Vec::new()))
+
+    fn lookup(&self, id: ValId) -> ValId {
+        let slice: &[(ValId, ValId)] = match &self.buf {
+            ScopeBuf::Inline(a) => &a[..self.len],
+            ScopeBuf::Heap(h) => &h[..self.len],
+        };
+        let mut i = slice.len();
+        while i > 0 {
+            i -= 1;
+            if slice[i].0 == id {
+                return slice[i].1;
+            }
+        }
+        id
+    }
+
+    fn fresh(&mut self, old: ValId, next: &mut u32) -> ValId {
+        let f = ValId(*next);
+        *next = next.saturating_add(1);
+        self.push(old, f);
+        f
+    }
 }
 
-fn push_unique_param(loop_params: &mut Vec<(ValId, ValType)>, id: ValId, ty: ValType) {
-    let exists = match loop_params.as_slice() {
-        [] => false,
-        [(s0, _)] => *s0 == id,
-        [(s0, _), (s1, _)] => *s0 == id || *s1 == id,
-        s => {
+#[allow(clippy::large_enum_variant)]
+enum PoolStorage {
+    Inline([IrSlot; 16]),
+    Heap(Vec<IrSlot>),
+}
+
+struct ExactPool {
+    buf: PoolStorage,
+    len: usize,
+}
+
+impl ExactPool {
+    fn new(cap: usize) -> Self {
+        if cap <= 16 {
+            Self { buf: PoolStorage::Inline([IrSlot::ZERO; 16]), len: 0 }
+        } else {
+            Self { buf: PoolStorage::Heap(Vec::with_capacity(cap)), len: 0 }
+        }
+    }
+    fn push(&mut self, e: IrSlot) {
+        match &mut self.buf {
+            PoolStorage::Inline(a) => {
+                if self.len < a.len() {
+                    a[self.len] = e;
+                    self.len += 1;
+                }
+            }
+            PoolStorage::Heap(h) => {
+                h.push(e);
+                self.len = h.len();
+            }
+        }
+    }
+    fn alloc_node(&mut self, n: RegionNode) -> RegionNodeId {
+        let id = RegionNodeId(self.len as u32);
+        self.push(IrSlot::from_node(n));
+        id
+    }
+    fn alloc_stmts(&mut self, stmts: &[Stmt]) -> Span {
+        if stmts.is_empty() {
+            return Span::EMPTY;
+        }
+        let start = self.len as u32;
+        let mut i = 0;
+        while i < stmts.len() {
+            self.push(IrSlot::from_stmt(stmts[i]));
+            i += 1;
+        }
+        Span { start, len: stmts.len() as u32 }
+    }
+    fn into_region(self, root: RegionNode) -> Region {
+        if self.len == 0 && matches!(root, RegionNode::Block(s) if s.is_empty()) {
+            return Region::empty();
+        }
+        match self.buf {
+            PoolStorage::Inline(a) => {
+                let mut pool = SlotPool::with_capacity(self.len);
+                pool.extend_from_slice(&a[..self.len]);
+                Region { root, pool }
+            }
+            PoolStorage::Heap(pool) => Region { root, pool: SlotPool::from_vec(pool) },
+        }
+    }
+}
+
+fn remap_vals_span(src: &Region, span: Span, scope: &Scope, out: &mut ExactPool) -> Span {
+    if span.is_empty() {
+        return Span::EMPTY;
+    }
+    let start = out.len as u32;
+    let mut i = 0;
+    while i < span.len {
+        let v = src.try_val(span, i).unwrap_or(ValId(0));
+        out.push(IrSlot::val(scope.lookup(v)));
+        i += 1;
+    }
+    Span { start, len: span.len }
+}
+
+fn remap_fresh_vars_span(
+    src: &Region,
+    span: Span,
+    scope: &mut Scope,
+    next: &mut u32,
+    out: &mut ExactPool,
+) -> Span {
+    if span.is_empty() {
+        return Span::EMPTY;
+    }
+    let start = out.len as u32;
+    let mut i = 0;
+    while i < span.len {
+        let (id, ty) = src.try_var(span, i).unwrap_or((ValId(0), ValType::I32));
+        out.push(IrSlot::var(scope.fresh(id, next), ty));
+        i += 1;
+    }
+    Span { start, len: span.len }
+}
+
+fn copy_tys_span(src: &Region, span: Span, out: &mut ExactPool) -> Span {
+    if span.is_empty() {
+        return Span::EMPTY;
+    }
+    let start = out.len as u32;
+    let mut i = 0;
+    while i < span.len {
+        let t = src.try_ty(span, i).unwrap_or(ValType::I32);
+        out.push(IrSlot::ty(t));
+        i += 1;
+    }
+    Span { start, len: span.len }
+}
+
+fn remap_leaf_stmt(
+    src: &Region,
+    stmt: Stmt,
+    scope: &mut Scope,
+    next: &mut u32,
+    inner_d: u32,
+    norm_cont: bool,
+    out: &mut ExactPool,
+) -> Stmt {
+    match stmt {
+        Stmt::Let { dst, ty, op } => {
+            let new_op = match op {
+                Op::Copy(v) => Op::Copy(scope.lookup(v)),
+                Op::Select { cond, true_val, false_val } => Op::Select {
+                    cond: scope.lookup(cond),
+                    true_val: scope.lookup(true_val),
+                    false_val: scope.lookup(false_val),
+                },
+                Op::Un(u, v) => Op::Un(u, scope.lookup(v)),
+                Op::Bin(b, l, r) => Op::Bin(b, scope.lookup(l), scope.lookup(r)),
+                Op::Load { mem, addr, offset, width, signed, result_ty } => Op::Load {
+                    mem,
+                    addr: scope.lookup(addr),
+                    offset,
+                    width,
+                    signed,
+                    result_ty,
+                },
+                Op::MemoryGrow { mem, delta } => {
+                    Op::MemoryGrow { mem, delta: scope.lookup(delta) }
+                }
+                other => other,
+            };
+            Stmt::Let { dst: scope.fresh(dst, next), ty, op: new_op }
+        }
+        Stmt::Effect(eff) => Stmt::Effect(match eff {
+            EffectOp::Store { mem, addr, offset, width, val } => EffectOp::Store {
+                mem,
+                addr: scope.lookup(addr),
+                offset,
+                width,
+                val: scope.lookup(val),
+            },
+            EffectOp::MemoryCopy { dst_mem, src_mem, dst, src, len } => EffectOp::MemoryCopy {
+                dst_mem,
+                src_mem,
+                dst: scope.lookup(dst),
+                src: scope.lookup(src),
+                len: scope.lookup(len),
+            },
+            EffectOp::MemoryFill { mem, dst, val, len } => EffectOp::MemoryFill {
+                mem,
+                dst: scope.lookup(dst),
+                val: scope.lookup(val),
+                len: scope.lookup(len),
+            },
+            EffectOp::GlobalSet { id, val } => EffectOp::GlobalSet { id, val: scope.lookup(val) },
+            other => other,
+        }),
+        Stmt::Call { results, target, args } => {
+            let new_args = remap_vals_span(src, args, scope, out);
+            let new_res = remap_fresh_vars_span(src, results, scope, next, out);
+            Stmt::Call { results: new_res, target, args: new_args }
+        }
+        Stmt::Yield(vs) => Stmt::Yield(remap_vals_span(src, vs, scope, out)),
+        Stmt::Return(vs) => Stmt::Return(remap_vals_span(src, vs, scope, out)),
+        Stmt::Break { depth, cond, values } => Stmt::Break {
+            depth,
+            cond: cond.map(|c| scope.lookup(c)),
+            values: remap_vals_span(src, values, scope, out),
+        },
+        Stmt::Continue { depth, cond, values } => {
+            let new_cond = cond.map(|c| scope.lookup(c));
+            let new_vals = remap_vals_span(src, values, scope, out);
+            if norm_cont && depth == inner_d {
+                Stmt::Break { depth, cond: new_cond, values: new_vals }
+            } else {
+                Stmt::Continue { depth, cond: new_cond, values: new_vals }
+            }
+        }
+        Stmt::Region { .. } => Stmt::Effect(EffectOp::Nop),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn remap_rec(
+    src: &Region,
+    node: RegionNode,
+    limit: usize,
+    scope: &mut Scope,
+    next_fresh: &mut u32,
+    depth: u32,
+    is_loop_body_root: bool,
+    norm_cont: bool,
+    rec: usize,
+    out: &mut ExactPool,
+    stmt_buf: &mut [Stmt],
+    buf_pos: usize,
+) -> RegionNode {
+    if rec >= MAX_VC_DEPTH {
+        return RegionNode::Block(Span::EMPTY);
+    }
+    match node {
+        RegionNode::Block(span) if span.is_empty() => RegionNode::Block(Span::EMPTY),
+        RegionNode::Block(span) => {
+            let inner_d = if is_loop_body_root { depth } else { depth + 1 };
+            let saved_scope = scope.len();
+            let mut end_pos = buf_pos;
             let mut i = 0;
-            let mut hit = false;
-            while i < s.len() {
-                if s[i].0 == id {
-                    hit = true;
-                    break;
+            while i < span.len {
+                let Some(stmt) = src.try_stmt(span, i) else { break };
+                let mapped = if let Stmt::Region { results, region: sub_id } = stmt {
+                    let sub_n =
+                        src.try_node_below(sub_id, limit).unwrap_or(RegionNode::Block(Span::EMPTY));
+                    let new_sub = remap_rec(
+                        src,
+                        sub_n,
+                        sub_id.0 as usize,
+                        scope,
+                        next_fresh,
+                        inner_d,
+                        false,
+                        norm_cont,
+                        rec + 1,
+                        out,
+                        stmt_buf,
+                        end_pos,
+                    );
+                    let new_sub_id = out.alloc_node(new_sub);
+                    let new_res = remap_fresh_vars_span(src, results, scope, next_fresh, out);
+                    Stmt::Region { results: new_res, region: new_sub_id }
+                } else {
+                    remap_leaf_stmt(src, stmt, scope, next_fresh, inner_d, norm_cont, out)
+                };
+                if end_pos < stmt_buf.len() {
+                    stmt_buf[end_pos] = mapped;
+                    end_pos += 1;
                 }
                 i += 1;
             }
-            hit
+            scope.truncate(saved_scope);
+            RegionNode::Block(out.alloc_stmts(&stmt_buf[buf_pos..end_pos]))
         }
-    };
-    if !exists {
-        loop_params.push((id, ty));
+        RegionNode::IfElse { cond, then_region, else_region, results } => {
+            let new_cond = scope.lookup(cond);
+            let new_res = copy_tys_span(src, results, out);
+            let then_n =
+                src.try_node_below(then_region, limit).unwrap_or(RegionNode::Block(Span::EMPTY));
+            let else_n =
+                src.try_node_below(else_region, limit).unwrap_or(RegionNode::Block(Span::EMPTY));
+            let new_then = remap_rec(
+                src,
+                then_n,
+                then_region.0 as usize,
+                scope,
+                next_fresh,
+                depth,
+                false,
+                norm_cont,
+                rec + 1,
+                out,
+                stmt_buf,
+                buf_pos,
+            );
+            let new_else = remap_rec(
+                src,
+                else_n,
+                else_region.0 as usize,
+                scope,
+                next_fresh,
+                depth,
+                false,
+                norm_cont,
+                rec + 1,
+                out,
+                stmt_buf,
+                buf_pos,
+            );
+            let then_id = out.alloc_node(new_then);
+            let else_id = out.alloc_node(new_else);
+            RegionNode::IfElse {
+                cond: new_cond,
+                then_region: then_id,
+                else_region: else_id,
+                results: new_res,
+            }
+        }
+        RegionNode::BoundedLoop { max_iters, init_vars, state_vars, body } => {
+            let new_inits = remap_vals_span(src, init_vars, scope, out);
+            let saved = scope.len();
+            let new_states = remap_fresh_vars_span(src, state_vars, scope, next_fresh, out);
+            let body_n = src.try_node_below(body, limit).unwrap_or(RegionNode::Block(Span::EMPTY));
+            let new_body = remap_rec(
+                src,
+                body_n,
+                body.0 as usize,
+                scope,
+                next_fresh,
+                depth + 1,
+                true,
+                norm_cont,
+                rec + 1,
+                out,
+                stmt_buf,
+                buf_pos,
+            );
+            scope.truncate(saved);
+            let body_id = out.alloc_node(new_body);
+            RegionNode::BoundedLoop {
+                max_iters,
+                init_vars: new_inits,
+                state_vars: new_states,
+                body: body_id,
+            }
+        }
+        RegionNode::InvariantLoop {
+            init_vars,
+            state_vars,
+            cond,
+            invariant_pred,
+            fuel_measure,
+            body,
+        } => {
+            let new_inits = remap_vals_span(src, init_vars, scope, out);
+            let saved = scope.len();
+            let new_states = remap_fresh_vars_span(src, state_vars, scope, next_fresh, out);
+            let cond_n = src.try_node_below(cond, limit).unwrap_or(RegionNode::Block(Span::EMPTY));
+            let inv_n =
+                src.try_node_below(invariant_pred, limit).unwrap_or(RegionNode::Block(Span::EMPTY));
+            let fuel_n =
+                src.try_node_below(fuel_measure, limit).unwrap_or(RegionNode::Block(Span::EMPTY));
+            let body_n = src.try_node_below(body, limit).unwrap_or(RegionNode::Block(Span::EMPTY));
+            let new_cond = remap_rec(
+                src,
+                cond_n,
+                cond.0 as usize,
+                scope,
+                next_fresh,
+                0,
+                false,
+                false,
+                rec + 1,
+                out,
+                stmt_buf,
+                buf_pos,
+            );
+            let new_inv = remap_rec(
+                src,
+                inv_n,
+                invariant_pred.0 as usize,
+                scope,
+                next_fresh,
+                0,
+                false,
+                false,
+                rec + 1,
+                out,
+                stmt_buf,
+                buf_pos,
+            );
+            let new_fuel = remap_rec(
+                src,
+                fuel_n,
+                fuel_measure.0 as usize,
+                scope,
+                next_fresh,
+                0,
+                false,
+                false,
+                rec + 1,
+                out,
+                stmt_buf,
+                buf_pos,
+            );
+            let new_body = remap_rec(
+                src,
+                body_n,
+                body.0 as usize,
+                scope,
+                next_fresh,
+                depth + 1,
+                true,
+                norm_cont,
+                rec + 1,
+                out,
+                stmt_buf,
+                buf_pos,
+            );
+            scope.truncate(saved);
+            let cond_id = out.alloc_node(new_cond);
+            let inv_id = out.alloc_node(new_inv);
+            let fuel_id = out.alloc_node(new_fuel);
+            let body_id = out.alloc_node(new_body);
+            RegionNode::InvariantLoop {
+                init_vars: new_inits,
+                state_vars: new_states,
+                cond: cond_id,
+                invariant_pred: inv_id,
+                fuel_measure: fuel_id,
+                body: body_id,
+            }
+        }
     }
+}
+
+fn remap_slot(
+    src: &Region,
+    root_slot: IrSlot,
+    limit: usize,
+    initial_map: &[(ValId, ValId)],
+    next_fresh: &mut u32,
+    norm_root_continue: bool,
+) -> Region {
+    if root_slot.tag == TAG_NODE_BLOCK {
+        if root_slot.w1 == 0 {
+            return Region::empty();
+        }
+        if root_slot.w1 == 1
+            && let Some(slot) =
+                src.try_stmt_slot(Span { start: root_slot.w0, len: root_slot.w1 }, 0)
+            && slot.tag == TAG_STMT_YIELD
+            && slot.w1 == 1
+            && let Some(v0) = src.try_val(Span { start: slot.w0, len: slot.w1 }, 0)
+        {
+            let mut mapped = v0;
+            let mut i = initial_map.len();
+            while i > 0 {
+                i -= 1;
+                if initial_map[i].0 == v0 {
+                    mapped = initial_map[i].1;
+                    break;
+                }
+            }
+            return Region::yield_vals(&[mapped]);
+        }
+    }
+    let Some(root) = root_slot.to_node() else {
+        return Region::empty();
+    };
+    remap_node(src, root, limit, initial_map, next_fresh, norm_root_continue)
+}
+
+fn remap_node(
+    src: &Region,
+    root: RegionNode,
+    limit: usize,
+    initial_map: &[(ValId, ValId)],
+    next_fresh: &mut u32,
+    norm_root_continue: bool,
+) -> Region {
+    if let RegionNode::Block(s) = root {
+        if s.is_empty() {
+            return Region::empty();
+        }
+        if s.len == 1
+            && let Some(slot) = src.try_stmt_slot(s, 0)
+            && slot.tag == TAG_STMT_YIELD
+            && slot.w1 == 1
+            && let Some(v0) = src.try_val(Span { start: slot.w0, len: slot.w1 }, 0)
+        {
+            let mut mapped = v0;
+            let mut i = initial_map.len();
+            while i > 0 {
+                i -= 1;
+                if initial_map[i].0 == v0 {
+                    mapped = initial_map[i].1;
+                    break;
+                }
+            }
+            return Region::yield_vals(&[mapped]);
+        }
+    }
+    let lim = limit.min(src.pool.len());
+    let max_elems = src.pool.len().saturating_mul(2).saturating_add(8);
+    let mut scope = Scope::with_max_cap(initial_map, src.pool.len() + 1);
+    let mut out = ExactPool::new(max_elems);
+    let mut inline_stmts = [Stmt::Effect(EffectOp::Nop); 8];
+    let mut heap_stmts: Box<[Stmt]> = if src.pool.len() < 8 {
+        Box::new([])
+    } else {
+        vec![Stmt::Effect(EffectOp::Nop); src.pool.len() + 1].into_boxed_slice()
+    };
+    let stmt_buf: &mut [Stmt] =
+        if src.pool.len() < 8 { &mut inline_stmts } else { &mut heap_stmts };
+    let root_out = remap_rec(
+        src,
+        root,
+        lim,
+        &mut scope,
+        next_fresh,
+        0,
+        norm_root_continue,
+        norm_root_continue,
+        0,
+        &mut out,
+        stmt_buf,
+        0,
+    );
+    out.into_region(root_out)
+}
+
+/// Alpha-renames all locally defined `ValId`s in `region` using `initial_map`,
+/// guaranteeing newly allocated `ValId`s never collide with free uses or `initial_map`.
+pub fn remap_region_vals(
+    region: &Region,
+    initial_map: &[(ValId, ValId)],
+    next_fresh: &mut u32,
+) -> Region {
+    let mut min_safe = max_val_id_in_region(region);
+    let mut i = 0;
+    while i < initial_map.len() {
+        let (k, v) = initial_map[i];
+        min_safe = min_safe.max(k.0.max(v.0).saturating_add(1));
+        i += 1;
+    }
+    if *next_fresh < min_safe {
+        *next_fresh = min_safe;
+    }
+    remap_node(region, region.root, region.pool.len(), initial_map, next_fresh, false)
+}
+
+fn single_yield_val(reg: &Region) -> Option<ValId> {
+    let RegionNode::Block(s) = reg.root else { return None };
+    if s.len != 1 {
+        return None;
+    }
+    let slot = reg.try_stmt_slot(s, 0)?;
+    if slot.tag == TAG_STMT_YIELD && slot.w1 == 1 {
+        reg.try_val(Span { start: slot.w0, len: slot.w1 }, 0)
+    } else {
+        None
+    }
+}
+
+fn push_sub_stmt(b: &mut RegionBuilder, results: &[(ValId, ValType)], reg: &Region) {
+    if let RegionNode::Block(s) = reg.root {
+        if s.is_empty() {
+            if results.is_empty() {
+                b.push_effect(EffectOp::Nop);
+            } else {
+                b.push_effect(EffectOp::Trap(TrapCode::Unreachable));
+            }
+            return;
+        }
+        if s.len == 1
+            && let Some(slot) = reg.try_stmt_slot(s, 0)
+            && slot.tag == TAG_STMT_YIELD
+        {
+            let vs = Span { start: slot.w0, len: slot.w1 };
+            if vs.len == 1 && results.len() == 1
+                && let Some(v0) = reg.try_val(vs, 0)
+            {
+                b.push_let(results[0].0, results[0].1, Op::Copy(v0));
+                return;
+            }
+            if vs.is_empty() && results.is_empty() {
+                b.push_effect(EffectOp::Nop);
+                return;
+            }
+            if vs.len_usize() != results.len() {
+                b.push_effect(EffectOp::Trap(TrapCode::Unreachable));
+                return;
+            }
+        }
+    }
+    b.push_subregion(results, reg);
 }
 
 /// Splits an `InvariantLoop` deterministically into `VC_Init`, `VC_Preservation`, and `VC_Exit`.
@@ -819,275 +1263,275 @@ pub fn split_invariant_loop(
     loop_region: &Region,
     postcondition: Region,
 ) -> Result<LoopVcs, VcError> {
-    let Region::InvariantLoop { init_vars, state_vars, cond, invariant_pred, fuel_measure, body } = loop_region
+    let RegionNode::InvariantLoop {
+        init_vars,
+        state_vars,
+        cond,
+        invariant_pred,
+        fuel_measure,
+        body,
+    } = loop_region.root
     else {
         return Err(VcError::NotAnInvariantLoop);
     };
-    if init_vars.len() != state_vars.len() {
+    if init_vars.len != state_vars.len {
         return Err(VcError::ArityMismatch);
     }
+    let lp_lim = loop_region.pool.len();
+    let get_node_slot = |id: RegionNodeId| -> Option<IrSlot> {
+        let idx = id.0 as usize;
+        if idx >= lp_lim {
+            return None;
+        }
+        let slot = loop_region.pool[idx];
+        if slot.is_node() { Some(slot) } else { None }
+    };
+    let (Some(cond_s), Some(inv_s), Some(fuel_s), Some(body_s)) = (
+        get_node_slot(cond),
+        get_node_slot(invariant_pred),
+        get_node_slot(fuel_measure),
+        get_node_slot(body),
+    ) else {
+        return Err(VcError::NotAnInvariantLoop);
+    };
     if !precondition.as_ref().is_none_or(validate_read_only)
-        || !validate_read_only(cond)
-        || !validate_read_only(invariant_pred)
-        || !validate_read_only(fuel_measure)
+        || !validate_ro_slot_upto(loop_region, cond_s, cond.0 as usize, None)
+        || !validate_ro_slot_upto(loop_region, inv_s, invariant_pred.0 as usize, None)
+        || !validate_ro_slot_upto(loop_region, fuel_s, fuel_measure.0 as usize, None)
         || !validate_read_only(&postcondition)
     {
         return Err(VcError::ImpureSpecificationRegion);
     }
-    if precondition.as_ref().is_some_and(|p| has_escaping_flow(p, 0, false, false))
-        || has_escaping_flow(cond, 0, false, false)
-        || has_escaping_flow(invariant_pred, 0, false, false)
-        || has_escaping_flow(fuel_measure, 0, false, false)
-        || has_escaping_flow(&postcondition, 0, false, false)
-        || has_escaping_flow(body, 0, true, true)
+    if precondition
+        .as_ref()
+        .is_some_and(|p| has_escaping_flow_upto(p, p.root, p.pool.len(), false))
+        || has_escaping_flow_slot_upto(loop_region, cond_s, cond.0 as usize, false)
+        || has_escaping_flow_slot_upto(loop_region, inv_s, invariant_pred.0 as usize, false)
+        || has_escaping_flow_slot_upto(loop_region, fuel_s, fuel_measure.0 as usize, false)
+        || has_escaping_flow_upto(&postcondition, postcondition.root, postcondition.pool.len(), false)
+        || has_escaping_flow_slot_upto(loop_region, body_s, body.0 as usize, true)
     {
         return Err(VcError::UnstructuredControlFlow);
     }
 
-    let mut max_param_id = 0u32;
-    bump_typed(&init_params, &mut max_param_id);
-    bump_ids(init_vars, &mut max_param_id);
-    bump_typed(state_vars, &mut max_param_id);
-    let mut next_fresh = 1u32
-        .max(max_param_id)
-        .max(precondition.as_ref().map_or(0, max_val_id_in_region))
-        .max(max_val_id_in_region(cond))
-        .max(max_val_id_in_region(invariant_pred))
-        .max(max_val_id_in_region(fuel_measure))
-        .max(max_val_id_in_region(body))
-        .max(max_val_id_in_region(&postcondition));
+    let mut next_fresh = 1u32.max(max_val_id_in_region(loop_region)).max(max_val_id_in_region(&postcondition));
+    bump_typed(&init_params, &mut next_fresh);
+    if let Some(p) = &precondition {
+        next_fresh = next_fresh.max(max_val_id_in_region(p));
+    }
     let fresh = |nf: &mut u32| {
         let id = ValId(*nf);
         *nf = nf.saturating_add(1);
         id
     };
 
-    let mut loop_params = match state_vars.as_slice() {
-        [] => Vec::new(),
-        [p0] => vec![*p0],
-        [p0, p1] => vec![*p0, *p1],
-        sv => sv.to_vec(),
-    };
-    match init_params.as_slice() {
-        [] => {}
-        [(id0, ty0)] => push_unique_param(&mut loop_params, *id0, *ty0),
-        [(id0, ty0), (id1, ty1)] => {
-            push_unique_param(&mut loop_params, *id0, *ty0);
-            push_unique_param(&mut loop_params, *id1, *ty1);
+    let n_state = state_vars.len_usize();
+    let mut loop_params = Vec::with_capacity(n_state + init_params.len());
+    let mut init_map_inline = [(ValId(0), ValId(0)); 4];
+    let mut init_map_spill = if n_state > 4 { Vec::with_capacity(n_state) } else { Vec::new() };
+    let mut i = 0;
+    while i < state_vars.len {
+        let (sv_id, sv_ty) = loop_region.try_var(state_vars, i).ok_or(VcError::ArityMismatch)?;
+        let iv_id = loop_region.try_val(init_vars, i).ok_or(VcError::ArityMismatch)?;
+        loop_params.push((sv_id, sv_ty));
+        if n_state <= 4 {
+            init_map_inline[i as usize] = (sv_id, iv_id);
+        } else {
+            init_map_spill.push((sv_id, iv_id));
         }
-        ip => {
-            let mut i = 0;
-            while i < ip.len() {
-                push_unique_param(&mut loop_params, ip[i].0, ip[i].1);
-                i += 1;
-            }
+        i += 1;
+    }
+    let init_map: &[(ValId, ValId)] =
+        if n_state <= 4 { &init_map_inline[..n_state] } else { &init_map_spill };
+    let mut ip_idx = 0;
+    while ip_idx < init_params.len() {
+        let (id, ty) = init_params[ip_idx];
+        if !loop_params.iter().any(|&(existing, _)| existing == id) {
+            loop_params.push((id, ty));
         }
+        ip_idx += 1;
     }
 
-    let init_map: Vec<(ValId, ValId)> = match (state_vars.as_slice(), init_vars.as_slice()) {
-        ([], []) => Vec::new(),
-        ([(s0, _)], [i0]) => vec![(*s0, *i0)],
-        ([(s0, _), (s1, _)], [i0, i1]) => vec![(*s0, *i0), (*s1, *i1)],
-        (sv, iv) => {
-            let mut m = Vec::with_capacity(sv.len());
-            let mut idx = 0;
-            while idx < sv.len() {
-                m.push((sv[idx].0, iv[idx]));
-                idx += 1;
-            }
-            m
-        }
-    };
     let init = VcObligation {
         kind: VcKind::Init,
         params: init_params,
         assumptions: match precondition {
-            Some(p) => vec![p],
-            None => Vec::new(),
+            Some(p) => RegionList::single(p),
+            None => RegionList::empty(),
         },
-        goal: remap_region_vals(invariant_pred, &init_map, &mut next_fresh),
+        goal: remap_slot(loop_region, inv_s, invariant_pred.0 as usize, init_map, &mut next_fresh, false),
     };
 
     let (c_val, ok_val, one, zero, f_before, f_after, inv_after, fuel_dec, chk_raw) = (
-        fresh(&mut next_fresh), fresh(&mut next_fresh), fresh(&mut next_fresh),
-        fresh(&mut next_fresh), fresh(&mut next_fresh), fresh(&mut next_fresh),
-        fresh(&mut next_fresh), fresh(&mut next_fresh), fresh(&mut next_fresh),
+        fresh(&mut next_fresh),
+        fresh(&mut next_fresh),
+        fresh(&mut next_fresh),
+        fresh(&mut next_fresh),
+        fresh(&mut next_fresh),
+        fresh(&mut next_fresh),
+        fresh(&mut next_fresh),
+        fresh(&mut next_fresh),
+        fresh(&mut next_fresh),
     );
-    let (s_next, after_map): (Vec<(ValId, ValType)>, Vec<(ValId, ValId)>) = match state_vars.as_slice() {
-        [] => (Vec::new(), Vec::new()),
-        [(s0, ty0)] => {
-            let n0 = fresh(&mut next_fresh);
-            (vec![(n0, *ty0)], vec![(*s0, n0)])
+    let mut s_next = Vec::with_capacity(n_state);
+    let mut after_map = Vec::with_capacity(n_state);
+    let mut s_idx = 0;
+    while s_idx < state_vars.len {
+        let (sv_id, sv_ty) = loop_region.try_var(state_vars, s_idx).ok_or(VcError::ArityMismatch)?;
+        let n = fresh(&mut next_fresh);
+        s_next.push((n, sv_ty));
+        after_map.push((sv_id, n));
+        s_idx += 1;
+    }
+
+    let norm_body = remap_slot(loop_region, body_s, body.0 as usize, &[], &mut next_fresh, true);
+    let body_block = if matches!(norm_body.root, RegionNode::Block(_)) {
+        norm_body
+    } else {
+        let mut tmp = Vec::with_capacity(n_state);
+        let mut tmp_ids = Vec::with_capacity(n_state);
+        for &(_, ty) in &s_next {
+            let id = fresh(&mut next_fresh);
+            tmp.push((id, ty));
+            tmp_ids.push(id);
         }
-        [(s0, ty0), (s1, ty1)] => {
-            let (n0, n1) = (fresh(&mut next_fresh), fresh(&mut next_fresh));
-            (vec![(n0, *ty0), (n1, *ty1)], vec![(*s0, n0), (*s1, n1)])
-        }
-        sv => {
-            let mut sn = Vec::with_capacity(sv.len());
-            let mut am = Vec::with_capacity(sv.len());
-            let mut idx = 0;
-            while idx < sv.len() {
-                let n = fresh(&mut next_fresh);
-                sn.push((n, sv[idx].1));
-                am.push((sv[idx].0, n));
-                idx += 1;
-            }
-            (sn, am)
+        let mut wb = RegionBuilder::new();
+        wb.push_subregion(&tmp, &norm_body);
+        wb.push_yield(&tmp_ids);
+        wb.finish()
+    };
+
+    let remapped_cond = remap_slot(loop_region, cond_s, cond.0 as usize, &[], &mut next_fresh, false);
+    let pres_goal = if remapped_cond.is_empty_block() {
+        Region::single_slot(IrSlot::effect(EffectOp::Trap(TrapCode::Unreachable)))
+    } else {
+        let fuel_before_reg = remap_slot(loop_region, fuel_s, fuel_measure.0 as usize, &[], &mut next_fresh, false);
+        let inv_after_reg = remap_slot(loop_region, inv_s, invariant_pred.0 as usize, &after_map, &mut next_fresh, false);
+        let fuel_after_reg = remap_slot(loop_region, fuel_s, fuel_measure.0 as usize, &after_map, &mut next_fresh, false);
+
+        let mut tb = RegionBuilder::new();
+        push_sub_stmt(&mut tb, &[(f_before, ValType::I64)], &fuel_before_reg);
+        push_sub_stmt(&mut tb, &s_next, &body_block);
+        push_sub_stmt(&mut tb, &[(inv_after, ValType::I32)], &inv_after_reg);
+        push_sub_stmt(&mut tb, &[(f_after, ValType::I64)], &fuel_after_reg);
+        tb.push_let(zero, ValType::I32, Op::ConstI32(0));
+        tb.push_let(fuel_dec, ValType::I32, Op::Bin(BinOp::I64LtU, f_after, f_before));
+        tb.push_let(
+            chk_raw,
+            ValType::I32,
+            Op::Select { cond: inv_after, true_val: fuel_dec, false_val: zero },
+        );
+        tb.push_yield(&[chk_raw]);
+        let then_branch = tb.finish();
+
+        let mut eb = RegionBuilder::new();
+        eb.push_let(one, ValType::I32, Op::ConstI32(1));
+        eb.push_yield(&[one]);
+        let else_branch = eb.finish();
+
+        if let Some(only_c) = single_yield_val(&remapped_cond) {
+            Region::if_else(only_c, &then_branch, &else_branch, &[ValType::I32])
+        } else {
+            let if_reg = Region::if_else(c_val, &then_branch, &else_branch, &[ValType::I32]);
+            let mut pb = RegionBuilder::new();
+            push_sub_stmt(&mut pb, &[(c_val, ValType::I32)], &remapped_cond);
+            pb.push_subregion(&[(ok_val, ValType::I32)], &if_reg);
+            pb.push_yield(&[ok_val]);
+            pb.finish()
         }
     };
 
-    let norm_body = normalize_loop_body_for_vc(body, 0, true);
-    let body_block = match norm_body {
-        Region::Block(_) => remap_region_vals(&norm_body, &[], &mut next_fresh),
-        other => {
-            let tmp: Vec<(ValId, ValType)> = state_vars.iter().map(|&(_, ty)| (fresh(&mut next_fresh), ty)).collect();
-            let tmp_ids: Vec<ValId> = tmp.iter().map(|&(id, _)| id).collect();
-            let remapped = remap_region_vals(&other, &[], &mut next_fresh);
-            Region::Block(vec![Stmt::Region { results: tmp, region: remapped }, Stmt::Yield(tmp_ids)])
-        }
-    };
-
-    let slet = |dst, op| Stmt::Let { dst, ty: ValType::I32, op };
-    let sreg = |res, reg| Stmt::Region { results: res, region: reg };
-    let then_branch = Region::Block(vec![
-        sreg(vec![(f_before, ValType::I64)], remap_region_vals(fuel_measure, &[], &mut next_fresh)),
-        sreg(s_next, body_block),
-        sreg(vec![(inv_after, ValType::I32)], remap_region_vals(invariant_pred, &after_map, &mut next_fresh)),
-        sreg(vec![(f_after, ValType::I64)], remap_region_vals(fuel_measure, &after_map, &mut next_fresh)),
-        slet(zero, Op::ConstI32(0)),
-        slet(fuel_dec, Op::Bin(BinOp::I64LtU, f_after, f_before)),
-        slet(chk_raw, Op::Select { cond: inv_after, true_val: fuel_dec, false_val: zero }),
-        Stmt::Yield(vec![chk_raw]),
-    ]);
-    let else_branch = Region::Block(vec![slet(one, Op::ConstI32(1)), Stmt::Yield(vec![one])]);
-    let loop_params_pres = match loop_params.as_slice() {
-        [] => Vec::new(),
-        [p0] => vec![*p0],
-        [p0, p1] => vec![*p0, *p1],
-        lp => lp.to_vec(),
-    };
     let preservation = VcObligation {
         kind: VcKind::Preservation,
-        params: loop_params_pres,
-        assumptions: vec![remap_region_vals(invariant_pred, &[], &mut next_fresh)],
-        goal: Region::Block(vec![
-            sreg(vec![(c_val, ValType::I32)], remap_region_vals(cond, &[], &mut next_fresh)),
-            sreg(vec![(ok_val, ValType::I32)], Region::IfElse {
-                cond: c_val,
-                then_region: Box::new(then_branch),
-                else_region: Box::new(else_branch),
-                results: vec![ValType::I32],
-            }),
-            Stmt::Yield(vec![ok_val]),
-        ]),
+        params: loop_params.clone(),
+        assumptions: RegionList::single(remap_slot(
+            loop_region,
+            inv_s,
+            invariant_pred.0 as usize,
+            &[],
+            &mut next_fresh,
+            false,
+        )),
+        goal: pres_goal,
     };
 
     let (ec, ez) = (fresh(&mut next_fresh), fresh(&mut next_fresh));
-    let not_cond = Region::Block(vec![
-        sreg(vec![(ec, ValType::I32)], remap_region_vals(cond, &[], &mut next_fresh)),
-        slet(ez, Op::Un(UnOp::I32Eqz, ec)),
-        Stmt::Yield(vec![ez]),
-    ]);
+    let exit_cond_reg = remap_slot(loop_region, cond_s, cond.0 as usize, &[], &mut next_fresh, false);
+    let mut ncb = RegionBuilder::new();
+    push_sub_stmt(&mut ncb, &[(ec, ValType::I32)], &exit_cond_reg);
+    ncb.push_let(ez, ValType::I32, Op::Un(UnOp::I32Eqz, ec));
+    ncb.push_yield(&[ez]);
+    let not_cond = ncb.finish();
+
     let exit = VcObligation {
         kind: VcKind::Exit,
         params: loop_params,
-        assumptions: vec![remap_region_vals(invariant_pred, &[], &mut next_fresh), not_cond],
-        goal: remap_region_vals(&postcondition, &[], &mut next_fresh),
+        assumptions: RegionList::pair(
+            remap_slot(loop_region, inv_s, invariant_pred.0 as usize, &[], &mut next_fresh, false),
+            not_cond,
+        ),
+        goal: remap_node(&postcondition, postcondition.root, postcondition.pool.len(), &[], &mut next_fresh, false),
     };
+
     Ok(LoopVcs { init, preservation, exit })
 }
 
-fn eval_assumption_holds(
+/// Evaluates a concrete test point against one loop-free `VcObligation`.
+pub fn eval_vc(
     module: &Module,
     registry: &StratumRegistry,
-    assumption: &Region,
-    bindings: &[(ValId, Val)],
-    heap: &HeapState,
-) -> bool {
-    let mut h_chk = if heap.memories.is_empty() && heap.globals.is_empty() {
-        HeapState { memories: Vec::new(), globals: Vec::new(), fuel_remaining: heap.fuel_remaining }
-    } else {
-        heap.clone()
-    };
-    matches!(
-        eval_region_first(module, registry, assumption, bindings, &mut h_chk),
-        Ok(Some(v)) if v.as_i32().unwrap_or(0) != 0
-    )
-}
-
-/// Evaluates a concrete test point against one loop-free `VcObligation`.
-pub fn eval_vc(module: &Module, registry: &StratumRegistry, vc: &VcObligation, args: &[Val], mut heap: HeapState) -> VcEvalResult {
+    vc: &VcObligation,
+    args: &[Val],
+    mut heap: HeapState,
+) -> VcEvalResult {
     if args.len() != vc.params.len() {
         return VcEvalResult::Violated(None);
     }
-    let mut inline_binds = [(ValId(0), Val::I32(0)); 8];
-    let spill_binds: Vec<(ValId, Val)>;
-    let bindings: &[(ValId, Val)] = match (vc.params.as_slice(), args) {
-        ([], []) => &[],
-        ([(id0, ty0)], [v0]) => {
-            if v0.val_type() != *ty0 {
+    let mut inline_b = [(ValId(0), Val::I32(0)); 8];
+    let mut spill_b: Vec<(ValId, Val)> = Vec::new();
+    if vc.params.len() <= 8 {
+        let mut i = 0;
+        while i < vc.params.len() {
+            if args[i].val_type() != vc.params[i].1 {
                 return VcEvalResult::Violated(None);
             }
-            inline_binds[0] = (*id0, *v0);
-            &inline_binds[..1]
+            inline_b[i] = (vc.params[i].0, args[i]);
+            i += 1;
         }
-        ([(id0, ty0), (id1, ty1)], [v0, v1]) => {
-            if v0.val_type() != *ty0 || v1.val_type() != *ty1 {
+    } else {
+        spill_b.reserve(vc.params.len());
+        let mut i = 0;
+        while i < vc.params.len() {
+            if args[i].val_type() != vc.params[i].1 {
                 return VcEvalResult::Violated(None);
             }
-            inline_binds[0] = (*id0, *v0);
-            inline_binds[1] = (*id1, *v1);
-            &inline_binds[..2]
+            spill_b.push((vc.params[i].0, args[i]));
+            i += 1;
         }
-        (ps, vs) if ps.len() <= 8 => {
-            let mut i = 0;
-            while i < ps.len() {
-                if vs[i].val_type() != ps[i].1 {
-                    return VcEvalResult::Violated(None);
-                }
-                inline_binds[i] = (ps[i].0, vs[i]);
-                i += 1;
+    }
+    let bindings: &[(ValId, Val)] =
+        if vc.params.len() <= 8 { &inline_b[..vc.params.len()] } else { &spill_b };
+
+    let heap_empty = heap.memories.is_empty() && heap.globals.is_empty();
+    let mut a_idx = 0;
+    while a_idx < vc.assumptions.len() {
+        let mut h_chk = if heap_empty {
+            HeapState {
+                memories: Vec::new(),
+                globals: Vec::new(),
+                fuel_remaining: heap.fuel_remaining,
             }
-            &inline_binds[..ps.len()]
+        } else {
+            heap.clone()
+        };
+        let holds = matches!(
+            eval_region_first(module, registry, &vc.assumptions[a_idx], bindings, &mut h_chk),
+            Ok(Some(v)) if v.as_i32().unwrap_or(0) != 0
+        );
+        if !holds {
+            return VcEvalResult::Vacuous;
         }
-        (ps, vs) => {
-            let mut sb = Vec::with_capacity(ps.len());
-            let mut i = 0;
-            while i < ps.len() {
-                if vs[i].val_type() != ps[i].1 {
-                    return VcEvalResult::Violated(None);
-                }
-                sb.push((ps[i].0, vs[i]));
-                i += 1;
-            }
-            spill_binds = sb;
-            &spill_binds
-        }
-    };
-    match vc.assumptions.as_slice() {
-        [] => {}
-        [a0] => {
-            if !eval_assumption_holds(module, registry, a0, bindings, &heap) {
-                return VcEvalResult::Vacuous;
-            }
-        }
-        [a0, a1] => {
-            if !eval_assumption_holds(module, registry, a0, bindings, &heap)
-                || !eval_assumption_holds(module, registry, a1, bindings, &heap)
-            {
-                return VcEvalResult::Vacuous;
-            }
-        }
-        assumps => {
-            let mut i = 0;
-            while i < assumps.len() {
-                if !eval_assumption_holds(module, registry, &assumps[i], bindings, &heap) {
-                    return VcEvalResult::Vacuous;
-                }
-                i += 1;
-            }
-        }
+        a_idx += 1;
     }
     match eval_region_first(module, registry, &vc.goal, bindings, &mut heap) {
         Err(trap) => VcEvalResult::Violated(Some(trap)),

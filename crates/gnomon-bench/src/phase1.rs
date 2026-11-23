@@ -6,8 +6,8 @@
 use std::time::Instant;
 
 use gnomon_kernel::{
-    CallTarget, FuncId, HeapState, Module, Region, StratumRegistry, TrapCode, Val, ValId,
-    eval_func, remap_region_vals,
+    CallTarget, FuncId, HeapState, Module, Region, RegionNode, RegionRef, Stmt, StratumRegistry,
+    TrapCode, Val, ValId, eval_func, remap_region_vals,
 };
 use gnomon_sieve::{
     BitwuzlaNativeBackend, BitwuzlaPipeBackend, EgglogSimplifier, SmtBackend, SmtResult,
@@ -112,26 +112,27 @@ fn build_probe_vectors(params: &[(ValId, gnomon_kernel::ValType)], count: usize,
 }
 
 fn region_is_smt_checkable(region: &Region) -> bool {
-    match region {
-        Region::Block(stmts) => stmts.iter().all(|s| match s {
-            gnomon_kernel::Stmt::Region { region, .. } => region_is_smt_checkable(region),
-            gnomon_kernel::Stmt::Call { target, .. } => {
-                matches!(target, CallTarget::Func(_) | CallTarget::Stratum(_))
+    fn check(r: RegionRef<'_>) -> bool {
+        match r.node {
+            RegionNode::Block(span) => r.stmts(span).all(|s| match s {
+                Stmt::Region { region: sub, .. } => r.child(sub).is_some_and(check),
+                Stmt::Call { target, .. } => {
+                    matches!(target, CallTarget::Func(_) | CallTarget::Stratum(_))
+                }
+                Stmt::Let { .. }
+                | Stmt::Effect(_)
+                | Stmt::Yield(_)
+                | Stmt::Break { .. }
+                | Stmt::Continue { .. }
+                | Stmt::Return(_) => true,
+            }),
+            RegionNode::IfElse { then_region, else_region, .. } => {
+                r.child(then_region).is_some_and(check) && r.child(else_region).is_some_and(check)
             }
-            gnomon_kernel::Stmt::Let { .. }
-            | gnomon_kernel::Stmt::Effect(_)
-            | gnomon_kernel::Stmt::Yield(_)
-            | gnomon_kernel::Stmt::Break { .. }
-            | gnomon_kernel::Stmt::Continue { .. }
-            | gnomon_kernel::Stmt::Return(_) => true,
-        }),
-        Region::IfElse {
-            then_region,
-            else_region,
-            ..
-        } => region_is_smt_checkable(then_region) && region_is_smt_checkable(else_region),
-        Region::BoundedLoop { .. } | Region::InvariantLoop { .. } => false,
+            RegionNode::BoundedLoop { .. } | RegionNode::InvariantLoop { .. } => false,
+        }
     }
+    check(region.as_ref())
 }
 
 fn max_val_id_in_func(module: &Module) -> u32 {

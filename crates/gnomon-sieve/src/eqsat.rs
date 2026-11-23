@@ -7,8 +7,9 @@ use egglog::ast::{Action, Command, Literal};
 use egglog::prelude::{EGraph, exprs};
 use egglog::{Term, TermDag, TermId, Value, add_primitive};
 use gnomon_kernel::{
-    BinOp, CallTarget, EffectOp, GlobalId, LawKind, MemId, MemWidth, Op, Region, Stmt, StratumId,
-    StratumRegistry, UnOp, ValId, ValType, validate_read_only_with_registry,
+    BinOp, CallTarget, EffectOp, GlobalId, LawKind, MemId, MemWidth, Op, Region, RegionBuilder,
+    RegionNode, RegionRef, Span, Stmt, StratumId, StratumRegistry, UnOp, ValId, ValType,
+    validate_read_only_with_registry,
 };
 
 use crate::{EqSatConfig, EqSatReport, SieveError};
@@ -53,7 +54,7 @@ impl EgglogSimplifier {
         let inferred_outer = infer_free_var_types(region, registry);
         let mut agg = ReportAcc::default();
         let simplified = self.simplify_inner(
-            region,
+            region.as_ref(),
             registry,
             &inferred_outer,
             &mut next_fresh,
@@ -78,7 +79,7 @@ impl EgglogSimplifier {
     #[allow(clippy::too_many_arguments)]
     fn simplify_inner(
         &self,
-        region: &Region,
+        region: RegionRef<'_>,
         registry: &StratumRegistry,
         outer_types: &BTreeMap<ValId, ValType>,
         next_fresh: &mut u32,
@@ -87,8 +88,9 @@ impl EgglogSimplifier {
         start: Instant,
         agg: &mut ReportAcc,
     ) -> Result<Region, SieveError> {
-        match region {
-            Region::Block(stmts) => self.simplify_block(
+        match region.node {
+            RegionNode::Block(stmts) => self.simplify_block(
+                region,
                 stmts,
                 registry,
                 outer_types,
@@ -98,11 +100,11 @@ impl EgglogSimplifier {
                 start,
                 agg,
             ),
-            Region::IfElse { cond, then_region, else_region, results } => {
+            RegionNode::IfElse { cond, then_region, else_region, results } => {
                 let mut child_types = outer_types.clone();
-                child_types.entry(*cond).or_insert(ValType::I32);
+                child_types.entry(cond).or_insert(ValType::I32);
                 let then_s = self.simplify_inner(
-                    then_region,
+                    region.child_or_empty(then_region),
                     registry,
                     &child_types,
                     next_fresh,
@@ -112,7 +114,7 @@ impl EgglogSimplifier {
                     agg,
                 )?;
                 let else_s = self.simplify_inner(
-                    else_region,
+                    region.child_or_empty(else_region),
                     registry,
                     &child_types,
                     next_fresh,
@@ -121,20 +123,18 @@ impl EgglogSimplifier {
                     start,
                     agg,
                 )?;
-                Ok(Region::IfElse {
-                    cond: *cond,
-                    then_region: Box::new(then_s),
-                    else_region: Box::new(else_s),
-                    results: results.clone(),
-                })
+                let res_tys = region.region.tys_vec(results);
+                Ok(Region::if_else(cond, &then_s, &else_s, &res_tys))
             }
-            Region::BoundedLoop { max_iters: loop_iters, init_vars, state_vars, body } => {
+            RegionNode::BoundedLoop { max_iters: loop_iters, init_vars, state_vars, body } => {
+                let inits = region.region.vals_vec(init_vars);
+                let states = region.region.vars_vec(state_vars);
                 let mut child_types = outer_types.clone();
-                for &(id, ty) in state_vars {
+                for &(id, ty) in &states {
                     child_types.insert(id, ty);
                 }
                 let body_s = self.simplify_inner(
-                    body,
+                    region.child_or_empty(body),
                     registry,
                     &child_types,
                     next_fresh,
@@ -143,14 +143,9 @@ impl EgglogSimplifier {
                     start,
                     agg,
                 )?;
-                Ok(Region::BoundedLoop {
-                    max_iters: *loop_iters,
-                    init_vars: init_vars.clone(),
-                    state_vars: state_vars.clone(),
-                    body: Box::new(body_s),
-                })
+                Ok(Region::bounded_loop(loop_iters, &inits, &states, &body_s))
             }
-            Region::InvariantLoop {
+            RegionNode::InvariantLoop {
                 init_vars,
                 state_vars,
                 cond,
@@ -158,54 +153,53 @@ impl EgglogSimplifier {
                 fuel_measure,
                 body,
             } => {
+                let inits = region.region.vals_vec(init_vars);
+                let states = region.region.vars_vec(state_vars);
                 let mut child_types = outer_types.clone();
-                for &(id, ty) in state_vars {
+                for &(id, ty) in &states {
                     child_types.insert(id, ty);
                 }
-                Ok(Region::InvariantLoop {
-                    init_vars: init_vars.clone(),
-                    state_vars: state_vars.clone(),
-                    cond: Box::new(self.simplify_inner(
-                        cond,
-                        registry,
-                        &child_types,
-                        next_fresh,
-                        max_iters,
-                        max_nodes,
-                        start,
-                        agg,
-                    )?),
-                    invariant_pred: Box::new(self.simplify_inner(
-                        invariant_pred,
-                        registry,
-                        &child_types,
-                        next_fresh,
-                        max_iters,
-                        max_nodes,
-                        start,
-                        agg,
-                    )?),
-                    fuel_measure: Box::new(self.simplify_inner(
-                        fuel_measure,
-                        registry,
-                        &child_types,
-                        next_fresh,
-                        max_iters,
-                        max_nodes,
-                        start,
-                        agg,
-                    )?),
-                    body: Box::new(self.simplify_inner(
-                        body,
-                        registry,
-                        &child_types,
-                        next_fresh,
-                        max_iters,
-                        max_nodes,
-                        start,
-                        agg,
-                    )?),
-                })
+                let cond_s = self.simplify_inner(
+                    region.child_or_empty(cond),
+                    registry,
+                    &child_types,
+                    next_fresh,
+                    max_iters,
+                    max_nodes,
+                    start,
+                    agg,
+                )?;
+                let inv_s = self.simplify_inner(
+                    region.child_or_empty(invariant_pred),
+                    registry,
+                    &child_types,
+                    next_fresh,
+                    max_iters,
+                    max_nodes,
+                    start,
+                    agg,
+                )?;
+                let fuel_s = self.simplify_inner(
+                    region.child_or_empty(fuel_measure),
+                    registry,
+                    &child_types,
+                    next_fresh,
+                    max_iters,
+                    max_nodes,
+                    start,
+                    agg,
+                )?;
+                let body_s = self.simplify_inner(
+                    region.child_or_empty(body),
+                    registry,
+                    &child_types,
+                    next_fresh,
+                    max_iters,
+                    max_nodes,
+                    start,
+                    agg,
+                )?;
+                Ok(Region::invariant_loop(&inits, &states, &cond_s, &inv_s, &fuel_s, &body_s))
             }
         }
     }
@@ -213,7 +207,8 @@ impl EgglogSimplifier {
     #[allow(clippy::too_many_arguments)]
     fn simplify_block(
         &self,
-        stmts: &[Stmt],
+        r: RegionRef<'_>,
+        stmts: Span,
         registry: &StratumRegistry,
         outer_types: &BTreeMap<ValId, ValType>,
         next_fresh: &mut u32,
@@ -223,7 +218,7 @@ impl EgglogSimplifier {
         agg: &mut ReportAcc,
     ) -> Result<Region, SieveError> {
         if stmts.is_empty() {
-            return Ok(Region::Block(Vec::new()));
+            return Ok(Region::empty());
         }
 
         let mut egraph = build_egraph(registry)?;
@@ -239,23 +234,23 @@ impl EgglogSimplifier {
         let mut global_epoch = 0usize;
         let mut let_seq = 0usize;
 
-        let mut plans = Vec::with_capacity(stmts.len());
+        let mut plans = Vec::with_capacity(stmts.len as usize);
         let mut child_types = outer_types.clone();
 
-        for stmt in stmts {
+        for stmt in r.stmts(stmts) {
             match stmt {
                 Stmt::Let { dst, ty, op } => {
                     if let Op::MemoryGrow { mem, delta } = op {
-                        let delta_expr = lookup_egg(&val_env, *delta, ValType::I32);
+                        let delta_expr = lookup_egg(&val_env, delta, ValType::I32);
                         heap_seq += 1;
                         let new_h = format!("$h{heap_seq}");
                         program.push_str(&format!("(let {new_h} (OpaqueHeap {heap_seq}))\n"));
                         heap_sym = new_h;
-                        val_env.insert(*dst, (*ty, format!("(Var {} {})", dst.0, ty_tag(*ty))));
-                        child_types.insert(*dst, *ty);
+                        val_env.insert(dst, (ty, format!("(Var {} {})", dst.0, ty_tag(ty))));
+                        child_types.insert(dst, ty);
                         plans.push(StmtPlan::MemoryGrow {
-                            dst: *dst,
-                            mem: *mem,
+                            dst,
+                            mem,
                             delta_expr,
                         });
                         continue;
@@ -263,31 +258,31 @@ impl EgglogSimplifier {
                     let sym = format!("$v{let_seq}");
                     let_seq += 1;
                     let expr_str = encode_op(
-                        op,
-                        *ty,
+                        &op,
+                        ty,
                         &val_env,
                         &heap_sym,
                         global_epoch,
                     );
                     program.push_str(&format!("(let {sym} {expr_str})\n"));
-                    val_env.insert(*dst, (*ty, sym.clone()));
-                    child_types.insert(*dst, *ty);
+                    val_env.insert(dst, (ty, sym.clone()));
+                    child_types.insert(dst, ty);
                     plans.push(StmtPlan::Let {
-                        dst: *dst,
-                        ty: *ty,
-                        op: *op,
+                        dst,
+                        ty,
+                        op,
                         egglog_sym: sym,
                     });
                 }
                 Stmt::Effect(eff) => match eff {
                     EffectOp::Nop => plans.push(StmtPlan::Nop),
                     EffectOp::Store { mem, addr, offset, width, val } => {
-                        let addr_e = lookup_egg(&val_env, *addr, ValType::I32);
+                        let addr_e = lookup_egg(&val_env, addr, ValType::I32);
                         let v_ty = val_env
-                            .get(val)
+                            .get(&val)
                             .map(|&(t, _)| t)
-                            .unwrap_or(if *width == MemWidth::B8 { ValType::I64 } else { ValType::I32 });
-                        let val_e = lookup_egg(&val_env, *val, v_ty);
+                            .unwrap_or(if width == MemWidth::B8 { ValType::I64 } else { ValType::I32 });
+                        let val_e = lookup_egg(&val_env, val, v_ty);
                         let new_h = format!("$h{heap_seq}");
                         heap_seq += 1;
                         program.push_str(&format!(
@@ -299,21 +294,21 @@ impl EgglogSimplifier {
                         ));
                         heap_sym = new_h;
                         plans.push(StmtPlan::Effect(
-                            *eff,
+                            eff,
                             vec![(addr_e, ValType::I32), (val_e, v_ty)],
                         ));
                     }
                     EffectOp::MemoryCopy { dst_mem, src_mem, dst, src, len } => {
                         let _ = (dst_mem, src_mem);
-                        let dst_e = lookup_egg(&val_env, *dst, ValType::I32);
-                        let src_e = lookup_egg(&val_env, *src, ValType::I32);
-                        let len_e = lookup_egg(&val_env, *len, ValType::I32);
+                        let dst_e = lookup_egg(&val_env, dst, ValType::I32);
+                        let src_e = lookup_egg(&val_env, src, ValType::I32);
+                        let len_e = lookup_egg(&val_env, len, ValType::I32);
                         let new_h = format!("$h{heap_seq}");
                         heap_seq += 1;
                         program.push_str(&format!("(let {new_h} (OpaqueHeap {heap_seq}))\n"));
                         heap_sym = new_h;
                         plans.push(StmtPlan::Effect(
-                            *eff,
+                            eff,
                             vec![
                                 (dst_e, ValType::I32),
                                 (src_e, ValType::I32),
@@ -322,15 +317,15 @@ impl EgglogSimplifier {
                         ));
                     }
                     EffectOp::MemoryFill { mem: _, dst, val, len } => {
-                        let dst_e = lookup_egg(&val_env, *dst, ValType::I32);
-                        let val_e = lookup_egg(&val_env, *val, ValType::I32);
-                        let len_e = lookup_egg(&val_env, *len, ValType::I32);
+                        let dst_e = lookup_egg(&val_env, dst, ValType::I32);
+                        let val_e = lookup_egg(&val_env, val, ValType::I32);
+                        let len_e = lookup_egg(&val_env, len, ValType::I32);
                         let new_h = format!("$h{heap_seq}");
                         heap_seq += 1;
                         program.push_str(&format!("(let {new_h} (OpaqueHeap {heap_seq}))\n"));
                         heap_sym = new_h;
                         plans.push(StmtPlan::Effect(
-                            *eff,
+                            eff,
                             vec![
                                 (dst_e, ValType::I32),
                                 (val_e, ValType::I32),
@@ -339,19 +334,20 @@ impl EgglogSimplifier {
                         ));
                     }
                     EffectOp::GlobalSet { id: _, val } => {
-                        let (v_ty, val_e) = lookup_egg_typed(&val_env, *val, ValType::I32);
+                        let (v_ty, val_e) = lookup_egg_typed(&val_env, val, ValType::I32);
                         global_epoch += 1;
-                        plans.push(StmtPlan::Effect(*eff, vec![(val_e, v_ty)]));
+                        plans.push(StmtPlan::Effect(eff, vec![(val_e, v_ty)]));
                     }
                     EffectOp::Trap(_) => {
-                        plans.push(StmtPlan::Effect(*eff, Vec::new()));
+                        plans.push(StmtPlan::Effect(eff, Vec::new()));
                     }
                 },
                 Stmt::Call { results, target, args } => {
-                    let typed_args: Vec<(String, ValType)> = args
-                        .iter()
+                    let res_vec = r.region.vars_vec(results);
+                    let typed_args: Vec<(String, ValType)> = r
+                        .vals(args)
                         .map(|id| {
-                            let (ty, s) = lookup_egg_typed(&val_env, *id, ValType::I32);
+                            let (ty, s) = lookup_egg_typed(&val_env, id, ValType::I32);
                             (s, ty)
                         })
                         .collect();
@@ -360,13 +356,13 @@ impl EgglogSimplifier {
                     let arg_list = encode_expr_list(&arg_exprs_only);
                     let is_ro = match target {
                         CallTarget::Stratum(sid) => registry
-                            .get_op(*sid)
+                            .get_op(sid)
                             .is_some_and(|op| validate_read_only_with_registry(&op.body, registry)),
                         _ => false,
                     };
                     if let CallTarget::Stratum(sid) = target {
                         let reads_state = registry
-                            .get_op(*sid)
+                            .get_op(sid)
                             .is_none_or(|op| region_reads_heap_or_global(&op.body, registry));
                         let (call_heap, call_epoch) = if reads_state {
                             (heap_sym.clone(), global_epoch)
@@ -383,8 +379,8 @@ impl EgglogSimplifier {
                             heap_sym = new_h;
                             global_epoch += 1;
                         }
-                        if results.len() == 1 {
-                            let (dst, ty) = results[0];
+                        if res_vec.len() == 1 {
+                            let (dst, ty) = res_vec[0];
                             let sym = format!("$v{let_seq}");
                             let_seq += 1;
                             program.push_str(&format!(
@@ -396,7 +392,7 @@ impl EgglogSimplifier {
                             plans.push(StmtPlan::StratumCallSingle {
                                 dst,
                                 ty,
-                                sid: *sid,
+                                sid,
                                 is_ro,
                                 arg_exprs: typed_args,
                                 egglog_sym: sym,
@@ -410,19 +406,20 @@ impl EgglogSimplifier {
                         heap_sym = new_h;
                         global_epoch += 1;
                     }
-                    for &(id, ty) in results {
+                    for &(id, ty) in &res_vec {
                         val_env.insert(id, (ty, format!("(Var {} {})", id.0, ty_tag(ty))));
                         child_types.insert(id, ty);
                     }
                     plans.push(StmtPlan::CallOpaque {
-                        results: results.clone(),
-                        target: *target,
+                        results: res_vec,
+                        target,
                         arg_exprs: typed_args,
                     });
                 }
-                Stmt::Region { results, region } => {
+                Stmt::Region { results, region: sub_id } => {
+                    let res_vec = r.region.vars_vec(results);
                     let sub_simplified = self.simplify_inner(
-                        region,
+                        r.child_or_empty(sub_id),
                         registry,
                         &child_types,
                         next_fresh,
@@ -447,31 +444,31 @@ impl EgglogSimplifier {
                         heap_sym = new_h;
                         global_epoch += 1;
                     }
-                    for &(id, ty) in results {
+                    for &(id, ty) in &res_vec {
                         val_env.insert(id, (ty, format!("(Var {} {})", id.0, ty_tag(ty))));
                         child_types.insert(id, ty);
                     }
                     plans.push(StmtPlan::SubRegion {
-                        results: results.clone(),
+                        results: res_vec,
                         region: sub_simplified,
                         outer_refs,
                     });
                 }
                 Stmt::Yield(vs) => {
-                    let es = vs
-                        .iter()
+                    let es = r
+                        .vals(vs)
                         .map(|id| {
-                            let (ty, s) = lookup_egg_typed(&val_env, *id, ValType::I32);
+                            let (ty, s) = lookup_egg_typed(&val_env, id, ValType::I32);
                             (s, ty)
                         })
                         .collect();
                     plans.push(StmtPlan::Yield(es));
                 }
                 Stmt::Return(vs) => {
-                    let es = vs
-                        .iter()
+                    let es = r
+                        .vals(vs)
                         .map(|id| {
-                            let (ty, s) = lookup_egg_typed(&val_env, *id, ValType::I32);
+                            let (ty, s) = lookup_egg_typed(&val_env, id, ValType::I32);
                             (s, ty)
                         })
                         .collect();
@@ -479,25 +476,25 @@ impl EgglogSimplifier {
                 }
                 Stmt::Break { depth, cond, values } => {
                     let ce = cond.map(|c| lookup_egg(&val_env, c, ValType::I32));
-                    let es = values
-                        .iter()
+                    let es = r
+                        .vals(values)
                         .map(|id| {
-                            let (ty, s) = lookup_egg_typed(&val_env, *id, ValType::I32);
+                            let (ty, s) = lookup_egg_typed(&val_env, id, ValType::I32);
                             (s, ty)
                         })
                         .collect();
-                    plans.push(StmtPlan::Break { depth: *depth, cond: ce, values: es });
+                    plans.push(StmtPlan::Break { depth, cond: ce, values: es });
                 }
                 Stmt::Continue { depth, cond, values } => {
                     let ce = cond.map(|c| lookup_egg(&val_env, c, ValType::I32));
-                    let es = values
-                        .iter()
+                    let es = r
+                        .vals(values)
                         .map(|id| {
-                            let (ty, s) = lookup_egg_typed(&val_env, *id, ValType::I32);
+                            let (ty, s) = lookup_egg_typed(&val_env, id, ValType::I32);
                             (s, ty)
                         })
                         .collect();
-                    plans.push(StmtPlan::Continue { depth: *depth, cond: ce, values: es });
+                    plans.push(StmtPlan::Continue { depth, cond: ce, values: es });
                 }
             }
         }
@@ -541,6 +538,7 @@ struct ReportAcc {
     laws_fired: BTreeSet<String>,
 }
 
+#[allow(clippy::large_enum_variant)]
 enum StmtPlan {
     Let {
         dst: ValId,
@@ -623,35 +621,40 @@ fn lookup_egg_typed(
 }
 
 fn region_reads_heap_or_global(region: &Region, registry: &StratumRegistry) -> bool {
-    match region {
-        Region::Block(stmts) => stmts.iter().any(|s| match s {
-            Stmt::Let { op, .. } => matches!(
-                op,
-                Op::Load { .. }
-                    | Op::MemorySize(_)
-                    | Op::MemoryGrow { .. }
-                    | Op::GlobalGet(_)
-            ),
-            Stmt::Effect(eff) => !matches!(eff, EffectOp::Nop | EffectOp::Trap(_)),
-            Stmt::Region { region: sub, .. } => region_reads_heap_or_global(sub, registry),
-            Stmt::Call { target: CallTarget::Stratum(sid), .. } => registry
-                .get_op(*sid)
-                .is_none_or(|op| region_reads_heap_or_global(&op.body, registry)),
-            Stmt::Call { .. } => true,
-            Stmt::Yield(_) | Stmt::Break { .. } | Stmt::Continue { .. } | Stmt::Return(_) => false,
-        }),
-        Region::IfElse { then_region, else_region, .. } => {
-            region_reads_heap_or_global(then_region, registry)
-                || region_reads_heap_or_global(else_region, registry)
-        }
-        Region::BoundedLoop { body, .. } => region_reads_heap_or_global(body, registry),
-        Region::InvariantLoop { cond, invariant_pred, fuel_measure, body, .. } => {
-            region_reads_heap_or_global(cond, registry)
-                || region_reads_heap_or_global(invariant_pred, registry)
-                || region_reads_heap_or_global(fuel_measure, registry)
-                || region_reads_heap_or_global(body, registry)
+    fn walk(r: RegionRef<'_>, registry: &StratumRegistry) -> bool {
+        match r.node {
+            RegionNode::Block(stmts) => r.stmts(stmts).any(|s| match s {
+                Stmt::Let { op, .. } => matches!(
+                    op,
+                    Op::Load { .. }
+                        | Op::MemorySize(_)
+                        | Op::MemoryGrow { .. }
+                        | Op::GlobalGet(_)
+                ),
+                Stmt::Effect(eff) => !matches!(eff, EffectOp::Nop | EffectOp::Trap(_)),
+                Stmt::Region { region: sub, .. } => walk(r.child_or_empty(sub), registry),
+                Stmt::Call { target: CallTarget::Stratum(sid), .. } => registry
+                    .get_op(sid)
+                    .is_none_or(|op| region_reads_heap_or_global(&op.body, registry)),
+                Stmt::Call { .. } => true,
+                Stmt::Yield(_) | Stmt::Break { .. } | Stmt::Continue { .. } | Stmt::Return(_) => {
+                    false
+                }
+            }),
+            RegionNode::IfElse { then_region, else_region, .. } => {
+                walk(r.child_or_empty(then_region), registry)
+                    || walk(r.child_or_empty(else_region), registry)
+            }
+            RegionNode::BoundedLoop { body, .. } => walk(r.child_or_empty(body), registry),
+            RegionNode::InvariantLoop { cond, invariant_pred, fuel_measure, body, .. } => {
+                walk(r.child_or_empty(cond), registry)
+                    || walk(r.child_or_empty(invariant_pred), registry)
+                    || walk(r.child_or_empty(fuel_measure), registry)
+                    || walk(r.child_or_empty(body), registry)
+            }
         }
     }
+    walk(region.as_ref(), registry)
 }
 
 fn encode_expr_list(items: &[String]) -> String {
@@ -779,7 +782,7 @@ fn extract_str(egraph: &mut EGraph, expr_str: &str) -> Result<(Value, TermDag, T
 
 struct ReconstructCtx<'a> {
     registry: &'a StratumRegistry,
-    out_stmts: Vec<Stmt>,
+    builder: RegionBuilder,
     next_fresh: &'a mut u32,
     eclass_to_val: HashMap<Value, (ValId, ValType)>,
     term_to_val: HashMap<String, (ValId, ValType)>,
@@ -815,13 +818,13 @@ impl ReconstructCtx<'_> {
                 "ConstI32" => {
                     let v = expect_int(dag, children[0])? as i32;
                     let dst = self.fresh_id();
-                    self.out_stmts.push(Stmt::Let { dst, ty: ValType::I32, op: Op::ConstI32(v) });
+                    self.builder.push_let(dst, ValType::I32, Op::ConstI32(v));
                     (dst, ValType::I32)
                 }
                 "ConstI64" => {
                     let v = expect_int(dag, children[0])?;
                     let dst = self.fresh_id();
-                    self.out_stmts.push(Stmt::Let { dst, ty: ValType::I64, op: Op::ConstI64(v) });
+                    self.builder.push_let(dst, ValType::I64, Op::ConstI64(v));
                     (dst, ValType::I64)
                 }
                 "GlobalGet" => {
@@ -829,7 +832,7 @@ impl ReconstructCtx<'_> {
                     let epoch_ty = expect_int(dag, children[1])?;
                     let ty = if epoch_ty % 2 == 0 { ValType::I32 } else { ValType::I64 };
                     let dst = self.fresh_id();
-                    self.out_stmts.push(Stmt::Let { dst, ty, op: Op::GlobalGet(GlobalId(gid)) });
+                    self.builder.push_let(dst, ty, Op::GlobalGet(GlobalId(gid)));
                     (dst, ty)
                 }
                 "Select" => {
@@ -837,11 +840,7 @@ impl ReconstructCtx<'_> {
                     let (t, t_ty) = self.emit_term(dag, children[1], ty_hint)?;
                     let (f, _) = self.emit_term(dag, children[2], t_ty)?;
                     let dst = self.fresh_id();
-                    self.out_stmts.push(Stmt::Let {
-                        dst,
-                        ty: t_ty,
-                        op: Op::Select { cond: c, true_val: t, false_val: f },
-                    });
+                    self.builder.push_let(dst, t_ty, Op::Select { cond: c, true_val: t, false_val: f });
                     (dst, t_ty)
                 }
                 "Un" => {
@@ -851,7 +850,7 @@ impl ReconstructCtx<'_> {
                     let (a, _) = self.emit_term(dag, children[1], u.input_ty())?;
                     let dst = self.fresh_id();
                     let out_ty = u.output_ty();
-                    self.out_stmts.push(Stmt::Let { dst, ty: out_ty, op: Op::Un(u, a) });
+                    self.builder.push_let(dst, out_ty, Op::Un(u, a));
                     (dst, out_ty)
                 }
                 "Bin" => {
@@ -862,7 +861,7 @@ impl ReconstructCtx<'_> {
                     let (r, _) = self.emit_term(dag, children[2], b.operand_ty())?;
                     let dst = self.fresh_id();
                     let out_ty = b.output_ty();
-                    self.out_stmts.push(Stmt::Let { dst, ty: out_ty, op: Op::Bin(b, l, r) });
+                    self.builder.push_let(dst, out_ty, Op::Bin(b, l, r));
                     (dst, out_ty)
                 }
                 "Load" => {
@@ -876,21 +875,17 @@ impl ReconstructCtx<'_> {
                     let signed = expect_int(dag, children[5])? != 0;
                     let result_ty = expect_ty(dag, children[6])?;
                     let dst = self.fresh_id();
-                    self.out_stmts.push(Stmt::Let {
+                    self.builder.push_let(
                         dst,
-                        ty: result_ty,
-                        op: Op::Load { mem, addr, offset, width, signed, result_ty },
-                    });
+                        result_ty,
+                        Op::Load { mem, addr, offset, width, signed, result_ty },
+                    );
                     (dst, result_ty)
                 }
                 "MemSize" => {
                     let mem = MemId(expect_int(dag, children[0])? as u16);
                     let dst = self.fresh_id();
-                    self.out_stmts.push(Stmt::Let {
-                        dst,
-                        ty: ValType::I32,
-                        op: Op::MemorySize(mem),
-                    });
+                    self.builder.push_let(dst, ValType::I32, Op::MemorySize(mem));
                     (dst, ValType::I32)
                 }
                 "StratumCall" => {
@@ -908,11 +903,7 @@ impl ReconstructCtx<'_> {
                     }
                     let res_ty = op.results.first().copied().unwrap_or(ty_hint);
                     let dst = self.fresh_id();
-                    self.out_stmts.push(Stmt::Call {
-                        results: vec![(dst, res_ty)],
-                        target: CallTarget::Stratum(sid),
-                        args: arg_vals,
-                    });
+                    self.builder.push_call(&[(dst, res_ty)], CallTarget::Stratum(sid), &arg_vals);
                     (dst, res_ty)
                 }
                 other => {
@@ -984,7 +975,7 @@ fn reconstruct_block(
 ) -> Result<Region, SieveError> {
     let mut ctx = ReconstructCtx {
         registry,
-        out_stmts: Vec::new(),
+        builder: RegionBuilder::new(),
         next_fresh,
         eclass_to_val: HashMap::new(),
         term_to_val: HashMap::new(),
@@ -997,11 +988,7 @@ fn reconstruct_block(
             StmtPlan::MemoryGrow { dst, mem, delta_expr } => {
                 let delta_id = ctx.emit_from_expr_str(egraph, delta_expr, ValType::I32)?;
                 let new_dst = ctx.fresh_id();
-                ctx.out_stmts.push(Stmt::Let {
-                    dst: new_dst,
-                    ty: ValType::I32,
-                    op: Op::MemoryGrow { mem: *mem, delta: delta_id },
-                });
+                ctx.builder.push_let(new_dst, ValType::I32, Op::MemoryGrow { mem: *mem, delta: delta_id });
                 ctx.orig_to_val.insert(*dst, new_dst);
             }
             StmtPlan::Let { dst, ty, op, egglog_sym } => {
@@ -1067,11 +1054,7 @@ fn reconstruct_block(
                         (emitted, Some(emitted_ty))
                     };
                     let call_dst = ctx.fresh_id();
-                    ctx.out_stmts.push(Stmt::Call {
-                        results: vec![(call_dst, *ty)],
-                        target: CallTarget::Stratum(*sid),
-                        args: arg_ids,
-                    });
+                    ctx.builder.push_call(&[(call_dst, *ty)], CallTarget::Stratum(*sid), &arg_ids);
                     if let Some(emitted_ty) = simplified_res.1 {
                         ctx.eclass_to_val.insert(val, (simplified_res.0, emitted_ty));
                     }
@@ -1086,11 +1069,7 @@ fn reconstruct_block(
                 for &(id, _) in results {
                     ctx.orig_to_val.insert(id, id);
                 }
-                ctx.out_stmts.push(Stmt::Call {
-                    results: results.clone(),
-                    target: *target,
-                    args: arg_ids,
-                });
+                ctx.builder.push_call(results, *target, &arg_ids);
             }
             StmtPlan::Effect(eff, arg_exprs) => {
                 let emitted_eff = match eff {
@@ -1117,7 +1096,7 @@ fn reconstruct_block(
                     }
                     other => *other,
                 };
-                ctx.out_stmts.push(Stmt::Effect(emitted_eff));
+                ctx.builder.push_effect(emitted_eff);
             }
             StmtPlan::SubRegion { results, region, outer_refs } => {
                 for &(fid, ty, ref expr_s) in outer_refs {
@@ -1128,21 +1107,21 @@ fn reconstruct_block(
                 for &(id, _) in results {
                     ctx.orig_to_val.insert(id, id);
                 }
-                ctx.out_stmts.push(Stmt::Region { results: results.clone(), region: remapped });
+                ctx.builder.push_subregion(results, &remapped);
             }
             StmtPlan::Yield(es) => {
                 let mut ids = Vec::with_capacity(es.len());
                 for (e, ty) in es {
                     ids.push(ctx.emit_from_expr_str(egraph, e, *ty)?);
                 }
-                ctx.out_stmts.push(Stmt::Yield(ids));
+                ctx.builder.push_yield(&ids);
             }
             StmtPlan::Return(es) => {
                 let mut ids = Vec::with_capacity(es.len());
                 for (e, ty) in es {
                     ids.push(ctx.emit_from_expr_str(egraph, e, *ty)?);
                 }
-                ctx.out_stmts.push(Stmt::Return(ids));
+                ctx.builder.push_return(&ids);
             }
             StmtPlan::Break { depth, cond, values } => {
                 let c_id = match cond {
@@ -1153,7 +1132,7 @@ fn reconstruct_block(
                 for (e, ty) in values {
                     ids.push(ctx.emit_from_expr_str(egraph, e, *ty)?);
                 }
-                ctx.out_stmts.push(Stmt::Break { depth: *depth, cond: c_id, values: ids });
+                ctx.builder.push_break(*depth, c_id, &ids);
             }
             StmtPlan::Continue { depth, cond, values } => {
                 let c_id = match cond {
@@ -1164,82 +1143,82 @@ fn reconstruct_block(
                 for (e, ty) in values {
                     ids.push(ctx.emit_from_expr_str(egraph, e, *ty)?);
                 }
-                ctx.out_stmts.push(Stmt::Continue { depth: *depth, cond: c_id, values: ids });
+                ctx.builder.push_continue(*depth, c_id, &ids);
             }
         }
     }
 
-    Ok(Region::Block(ctx.out_stmts))
+    Ok(ctx.builder.finish())
 }
 
 fn collect_free_vars_in_region(region: &Region) -> BTreeSet<ValId> {
-    fn walk(r: &Region, bound: &mut Vec<ValId>, free: &mut BTreeSet<ValId>) {
+    fn walk(r: RegionRef<'_>, bound: &mut Vec<ValId>, free: &mut BTreeSet<ValId>) {
         let rec = |v: ValId, b: &[ValId], f: &mut BTreeSet<ValId>| {
             if !b.contains(&v) {
                 f.insert(v);
             }
         };
-        match r {
-            Region::Block(stmts) => {
+        match r.node {
+            RegionNode::Block(stmts) => {
                 let saved = bound.len();
-                for s in stmts {
+                for s in r.stmts(stmts) {
                     match s {
                         Stmt::Let { dst, op, .. } => {
                             match op {
                                 Op::Copy(v) | Op::Un(_, v) | Op::Load { addr: v, .. } | Op::MemoryGrow { delta: v, .. } => {
-                                    rec(*v, bound, free);
+                                    rec(v, bound, free);
                                 }
                                 Op::Select { cond, true_val, false_val } => {
-                                    rec(*cond, bound, free);
-                                    rec(*true_val, bound, free);
-                                    rec(*false_val, bound, free);
+                                    rec(cond, bound, free);
+                                    rec(true_val, bound, free);
+                                    rec(false_val, bound, free);
                                 }
                                 Op::Bin(_, l, r) => {
-                                    rec(*l, bound, free);
-                                    rec(*r, bound, free);
+                                    rec(l, bound, free);
+                                    rec(r, bound, free);
                                 }
                                 _ => {}
                             }
-                            bound.push(*dst);
+                            bound.push(dst);
                         }
                         Stmt::Effect(eff) => match eff {
                             EffectOp::Store { addr, val, .. } => {
-                                rec(*addr, bound, free);
-                                rec(*val, bound, free);
+                                rec(addr, bound, free);
+                                rec(val, bound, free);
                             }
                             EffectOp::MemoryCopy { dst, src, len, .. }
                             | EffectOp::MemoryFill { dst, val: src, len, .. } => {
-                                rec(*dst, bound, free);
-                                rec(*src, bound, free);
-                                rec(*len, bound, free);
+                                rec(dst, bound, free);
+                                rec(src, bound, free);
+                                rec(len, bound, free);
                             }
-                            EffectOp::GlobalSet { val, .. } => rec(*val, bound, free),
+                            EffectOp::GlobalSet { val, .. } => rec(val, bound, free),
                             EffectOp::Trap(_) | EffectOp::Nop => {}
                         },
-                        Stmt::Region { results, region } => {
-                            walk(region, bound, free);
-                            for &(id, _) in results {
+                        Stmt::Region { results, region: sub_id } => {
+                            walk(r.child_or_empty(sub_id), bound, free);
+                            for (id, _) in r.vars(results) {
                                 bound.push(id);
                             }
                         }
                         Stmt::Call { results, args, .. } => {
-                            for &a in args {
+                            for a in r.vals(args) {
                                 rec(a, bound, free);
                             }
-                            for &(id, _) in results {
+                            for (id, _) in r.vars(results) {
                                 bound.push(id);
                             }
                         }
                         Stmt::Yield(vs) | Stmt::Return(vs) => {
-                            for &v in vs {
+                            for v in r.vals(vs) {
                                 rec(v, bound, free);
                             }
                         }
                         Stmt::Break { cond, values, .. } | Stmt::Continue { cond, values, .. } => {
                             if let Some(c) = cond {
-                                rec(*c, bound, free);
+                                rec(c, bound, free);
                             }
-                            for &v in values {
+                            for v in r.vals(values) {
                                 rec(v, bound, free);
                             }
                         }
@@ -1247,23 +1226,23 @@ fn collect_free_vars_in_region(region: &Region) -> BTreeSet<ValId> {
                 }
                 bound.truncate(saved);
             }
-            Region::IfElse { cond, then_region, else_region, .. } => {
-                rec(*cond, bound, free);
-                walk(then_region, bound, free);
-                walk(else_region, bound, free);
+            RegionNode::IfElse { cond, then_region, else_region, .. } => {
+                rec(cond, bound, free);
+                walk(r.child_or_empty(then_region), bound, free);
+                walk(r.child_or_empty(else_region), bound, free);
             }
-            Region::BoundedLoop { init_vars, state_vars, body, .. } => {
-                for &iv in init_vars {
+            RegionNode::BoundedLoop { init_vars, state_vars, body, .. } => {
+                for iv in r.vals(init_vars) {
                     rec(iv, bound, free);
                 }
                 let saved = bound.len();
-                for &(sv, _) in state_vars {
+                for (sv, _) in r.vars(state_vars) {
                     bound.push(sv);
                 }
-                walk(body, bound, free);
+                walk(r.child_or_empty(body), bound, free);
                 bound.truncate(saved);
             }
-            Region::InvariantLoop {
+            RegionNode::InvariantLoop {
                 init_vars,
                 state_vars,
                 cond,
@@ -1271,23 +1250,23 @@ fn collect_free_vars_in_region(region: &Region) -> BTreeSet<ValId> {
                 fuel_measure,
                 body,
             } => {
-                for &iv in init_vars {
+                for iv in r.vals(init_vars) {
                     rec(iv, bound, free);
                 }
                 let saved = bound.len();
-                for &(sv, _) in state_vars {
+                for (sv, _) in r.vars(state_vars) {
                     bound.push(sv);
                 }
-                walk(cond, bound, free);
-                walk(invariant_pred, bound, free);
-                walk(fuel_measure, bound, free);
-                walk(body, bound, free);
+                walk(r.child_or_empty(cond), bound, free);
+                walk(r.child_or_empty(invariant_pred), bound, free);
+                walk(r.child_or_empty(fuel_measure), bound, free);
+                walk(r.child_or_empty(body), bound, free);
                 bound.truncate(saved);
             }
         }
     }
     let mut free = BTreeSet::new();
-    walk(region, &mut Vec::new(), &mut free);
+    walk(region.as_ref(), &mut Vec::new(), &mut free);
     free
 }
 
@@ -1298,74 +1277,74 @@ fn infer_free_var_types(region: &Region, registry: &StratumRegistry) -> BTreeMap
         }
     }
     fn walk(
-        r: &Region,
+        r: RegionRef<'_>,
         registry: &StratumRegistry,
         bound: &mut Vec<ValId>,
         out: &mut BTreeMap<ValId, ValType>,
     ) {
-        match r {
-            Region::Block(stmts) => {
+        match r.node {
+            RegionNode::Block(stmts) => {
                 let saved = bound.len();
-                for s in stmts {
+                for s in r.stmts(stmts) {
                     match s {
                         Stmt::Let { dst, ty, op } => {
                             match op {
-                                Op::Copy(v) => rec(*v, *ty, bound, out),
+                                Op::Copy(v) => rec(v, ty, bound, out),
                                 Op::Select { cond, true_val, false_val } => {
-                                    rec(*cond, ValType::I32, bound, out);
-                                    rec(*true_val, *ty, bound, out);
-                                    rec(*false_val, *ty, bound, out);
+                                    rec(cond, ValType::I32, bound, out);
+                                    rec(true_val, ty, bound, out);
+                                    rec(false_val, ty, bound, out);
                                 }
-                                Op::Un(u, v) => rec(*v, u.input_ty(), bound, out),
+                                Op::Un(u, v) => rec(v, u.input_ty(), bound, out),
                                 Op::Bin(bin, l, r) => {
-                                    rec(*l, bin.operand_ty(), bound, out);
-                                    rec(*r, bin.operand_ty(), bound, out);
+                                    rec(l, bin.operand_ty(), bound, out);
+                                    rec(r, bin.operand_ty(), bound, out);
                                 }
-                                Op::Load { addr, .. } => rec(*addr, ValType::I32, bound, out),
-                                Op::MemoryGrow { delta, .. } => rec(*delta, ValType::I32, bound, out),
+                                Op::Load { addr, .. } => rec(addr, ValType::I32, bound, out),
+                                Op::MemoryGrow { delta, .. } => rec(delta, ValType::I32, bound, out),
                                 Op::ConstI32(_)
                                 | Op::ConstI64(_)
                                 | Op::GlobalGet(_)
                                 | Op::MemorySize(_) => {}
                             }
-                            bound.push(*dst);
+                            bound.push(dst);
                         }
                         Stmt::Effect(eff) => match eff {
                             EffectOp::Store { addr, width, val, .. } => {
-                                rec(*addr, ValType::I32, bound, out);
-                                if *width == MemWidth::B8 {
-                                    rec(*val, ValType::I64, bound, out);
+                                rec(addr, ValType::I32, bound, out);
+                                if width == MemWidth::B8 {
+                                    rec(val, ValType::I64, bound, out);
                                 }
                             }
                             EffectOp::MemoryCopy { dst, src, len, .. }
                             | EffectOp::MemoryFill { dst, val: src, len, .. } => {
-                                rec(*dst, ValType::I32, bound, out);
-                                rec(*src, ValType::I32, bound, out);
-                                rec(*len, ValType::I32, bound, out);
+                                rec(dst, ValType::I32, bound, out);
+                                rec(src, ValType::I32, bound, out);
+                                rec(len, ValType::I32, bound, out);
                             }
                             EffectOp::GlobalSet { .. } | EffectOp::Trap(_) | EffectOp::Nop => {}
                         },
                         Stmt::Region { results, region: sub } => {
-                            walk(sub, registry, bound, out);
-                            for &(id, _) in results {
+                            walk(r.child_or_empty(sub), registry, bound, out);
+                            for (id, _) in r.vars(results) {
                                 bound.push(id);
                             }
                         }
                         Stmt::Call { results, target, args } => {
                             if let CallTarget::Stratum(sid) = target
-                                && let Some(op) = registry.get_op(*sid)
+                                && let Some(op) = registry.get_op(sid)
                             {
-                                for (&a, &(_, pt)) in args.iter().zip(&op.params) {
+                                for (a, &(_, pt)) in r.vals(args).zip(&op.params) {
                                     rec(a, pt, bound, out);
                                 }
                             }
-                            for &(id, _) in results {
+                            for (id, _) in r.vars(results) {
                                 bound.push(id);
                             }
                         }
                         Stmt::Break { cond, .. } | Stmt::Continue { cond, .. } => {
                             if let Some(c) = cond {
-                                rec(*c, ValType::I32, bound, out);
+                                rec(c, ValType::I32, bound, out);
                             }
                         }
                         Stmt::Yield(_) | Stmt::Return(_) => {}
@@ -1373,23 +1352,23 @@ fn infer_free_var_types(region: &Region, registry: &StratumRegistry) -> BTreeMap
                 }
                 bound.truncate(saved);
             }
-            Region::IfElse { cond, then_region, else_region, .. } => {
-                rec(*cond, ValType::I32, bound, out);
-                walk(then_region, registry, bound, out);
-                walk(else_region, registry, bound, out);
+            RegionNode::IfElse { cond, then_region, else_region, .. } => {
+                rec(cond, ValType::I32, bound, out);
+                walk(r.child_or_empty(then_region), registry, bound, out);
+                walk(r.child_or_empty(else_region), registry, bound, out);
             }
-            Region::BoundedLoop { init_vars, state_vars, body, .. } => {
-                for (&iv, &(_, st)) in init_vars.iter().zip(state_vars) {
+            RegionNode::BoundedLoop { init_vars, state_vars, body, .. } => {
+                for (iv, (_, st)) in r.vals(init_vars).zip(r.vars(state_vars)) {
                     rec(iv, st, bound, out);
                 }
                 let saved = bound.len();
-                for &(sv, _) in state_vars {
+                for (sv, _) in r.vars(state_vars) {
                     bound.push(sv);
                 }
-                walk(body, registry, bound, out);
+                walk(r.child_or_empty(body), registry, bound, out);
                 bound.truncate(saved);
             }
-            Region::InvariantLoop {
+            RegionNode::InvariantLoop {
                 init_vars,
                 state_vars,
                 cond,
@@ -1397,144 +1376,147 @@ fn infer_free_var_types(region: &Region, registry: &StratumRegistry) -> BTreeMap
                 fuel_measure,
                 body,
             } => {
-                for (&iv, &(_, st)) in init_vars.iter().zip(state_vars) {
+                for (iv, (_, st)) in r.vals(init_vars).zip(r.vars(state_vars)) {
                     rec(iv, st, bound, out);
                 }
                 let saved = bound.len();
-                for &(sv, _) in state_vars {
+                for (sv, _) in r.vars(state_vars) {
                     bound.push(sv);
                 }
-                walk(cond, registry, bound, out);
-                walk(invariant_pred, registry, bound, out);
-                walk(fuel_measure, registry, bound, out);
-                walk(body, registry, bound, out);
+                walk(r.child_or_empty(cond), registry, bound, out);
+                walk(r.child_or_empty(invariant_pred), registry, bound, out);
+                walk(r.child_or_empty(fuel_measure), registry, bound, out);
+                walk(r.child_or_empty(body), registry, bound, out);
                 bound.truncate(saved);
             }
         }
     }
     let mut out = BTreeMap::new();
-    walk(region, registry, &mut Vec::new(), &mut out);
+    walk(region.as_ref(), registry, &mut Vec::new(), &mut out);
     out
 }
 
 fn remap_free_uses(region: &Region, map: &HashMap<ValId, ValId>) -> Region {
-    fn walk(r: &Region, map: &HashMap<ValId, ValId>, shadowed: &mut Vec<ValId>) -> Region {
+    fn walk(r: RegionRef<'_>, map: &HashMap<ValId, ValId>, shadowed: &mut Vec<ValId>) -> Region {
         let m = |v: ValId, sh: &[ValId]| -> ValId {
             if sh.contains(&v) { v } else { map.get(&v).copied().unwrap_or(v) }
         };
-        match r {
-            Region::Block(stmts) => {
+        match r.node {
+            RegionNode::Block(stmts) => {
                 let saved = shadowed.len();
-                let out = stmts
-                    .iter()
-                    .map(|s| match s {
+                let mut b = RegionBuilder::new();
+                for s in r.stmts(stmts) {
+                    match s {
                         Stmt::Let { dst, ty, op } => {
                             let new_op = match op {
-                                Op::Copy(v) => Op::Copy(m(*v, shadowed)),
+                                Op::Copy(v) => Op::Copy(m(v, shadowed)),
                                 Op::Select { cond, true_val, false_val } => Op::Select {
-                                    cond: m(*cond, shadowed),
-                                    true_val: m(*true_val, shadowed),
-                                    false_val: m(*false_val, shadowed),
+                                    cond: m(cond, shadowed),
+                                    true_val: m(true_val, shadowed),
+                                    false_val: m(false_val, shadowed),
                                 },
-                                Op::Un(u, v) => Op::Un(*u, m(*v, shadowed)),
-                                Op::Bin(b, l, r) => Op::Bin(*b, m(*l, shadowed), m(*r, shadowed)),
+                                Op::Un(u, v) => Op::Un(u, m(v, shadowed)),
+                                Op::Bin(bin, l, rhs) => Op::Bin(bin, m(l, shadowed), m(rhs, shadowed)),
                                 Op::Load { mem, addr, offset, width, signed, result_ty } => Op::Load {
-                                    mem: *mem,
-                                    addr: m(*addr, shadowed),
-                                    offset: *offset,
-                                    width: *width,
-                                    signed: *signed,
-                                    result_ty: *result_ty,
+                                    mem,
+                                    addr: m(addr, shadowed),
+                                    offset,
+                                    width,
+                                    signed,
+                                    result_ty,
                                 },
                                 Op::MemoryGrow { mem, delta } => {
-                                    Op::MemoryGrow { mem: *mem, delta: m(*delta, shadowed) }
+                                    Op::MemoryGrow { mem, delta: m(delta, shadowed) }
                                 }
-                                other => *other,
+                                other => other,
                             };
-                            shadowed.push(*dst);
-                            Stmt::Let { dst: *dst, ty: *ty, op: new_op }
+                            shadowed.push(dst);
+                            b.push_let(dst, ty, new_op);
                         }
-                        Stmt::Effect(eff) => Stmt::Effect(match eff {
+                        Stmt::Effect(eff) => b.push_effect(match eff {
                             EffectOp::Store { mem, addr, offset, width, val } => EffectOp::Store {
-                                mem: *mem,
-                                addr: m(*addr, shadowed),
-                                offset: *offset,
-                                width: *width,
-                                val: m(*val, shadowed),
+                                mem,
+                                addr: m(addr, shadowed),
+                                offset,
+                                width,
+                                val: m(val, shadowed),
                             },
                             EffectOp::MemoryCopy { dst_mem, src_mem, dst, src, len } => {
                                 EffectOp::MemoryCopy {
-                                    dst_mem: *dst_mem,
-                                    src_mem: *src_mem,
-                                    dst: m(*dst, shadowed),
-                                    src: m(*src, shadowed),
-                                    len: m(*len, shadowed),
+                                    dst_mem,
+                                    src_mem,
+                                    dst: m(dst, shadowed),
+                                    src: m(src, shadowed),
+                                    len: m(len, shadowed),
                                 }
                             }
                             EffectOp::MemoryFill { mem, dst, val, len } => EffectOp::MemoryFill {
-                                mem: *mem,
-                                dst: m(*dst, shadowed),
-                                val: m(*val, shadowed),
-                                len: m(*len, shadowed),
+                                mem,
+                                dst: m(dst, shadowed),
+                                val: m(val, shadowed),
+                                len: m(len, shadowed),
                             },
                             EffectOp::GlobalSet { id, val } => {
-                                EffectOp::GlobalSet { id: *id, val: m(*val, shadowed) }
+                                EffectOp::GlobalSet { id, val: m(val, shadowed) }
                             }
-                            other => *other,
+                            other => other,
                         }),
-                        Stmt::Region { results, region } => {
-                            let new_reg = walk(region, map, shadowed);
-                            for &(id, _) in results {
+                        Stmt::Region { results, region: sub_id } => {
+                            let res_vec = r.region.vars_vec(results);
+                            let new_reg = walk(r.child_or_empty(sub_id), map, shadowed);
+                            for &(id, _) in &res_vec {
                                 shadowed.push(id);
                             }
-                            Stmt::Region { results: results.clone(), region: new_reg }
+                            b.push_subregion(&res_vec, &new_reg);
                         }
                         Stmt::Call { results, target, args } => {
-                            let new_args = args.iter().copied().map(|a| m(a, shadowed)).collect();
-                            for &(id, _) in results {
+                            let res_vec = r.region.vars_vec(results);
+                            let new_args: Vec<ValId> = r.vals(args).map(|a| m(a, shadowed)).collect();
+                            for &(id, _) in &res_vec {
                                 shadowed.push(id);
                             }
-                            Stmt::Call { results: results.clone(), target: *target, args: new_args }
+                            b.push_call(&res_vec, target, &new_args);
                         }
-                        Stmt::Yield(vs) => Stmt::Yield(vs.iter().copied().map(|v| m(v, shadowed)).collect()),
-                        Stmt::Return(vs) => Stmt::Return(vs.iter().copied().map(|v| m(v, shadowed)).collect()),
-                        Stmt::Break { depth, cond, values } => Stmt::Break {
-                            depth: *depth,
-                            cond: cond.map(|c| m(c, shadowed)),
-                            values: values.iter().copied().map(|v| m(v, shadowed)).collect(),
-                        },
-                        Stmt::Continue { depth, cond, values } => Stmt::Continue {
-                            depth: *depth,
-                            cond: cond.map(|c| m(c, shadowed)),
-                            values: values.iter().copied().map(|v| m(v, shadowed)).collect(),
-                        },
-                    })
-                    .collect();
+                        Stmt::Yield(vs) => {
+                            let vals: Vec<ValId> = r.vals(vs).map(|v| m(v, shadowed)).collect();
+                            b.push_yield(&vals);
+                        }
+                        Stmt::Return(vs) => {
+                            let vals: Vec<ValId> = r.vals(vs).map(|v| m(v, shadowed)).collect();
+                            b.push_return(&vals);
+                        }
+                        Stmt::Break { depth, cond, values } => {
+                            let vals: Vec<ValId> = r.vals(values).map(|v| m(v, shadowed)).collect();
+                            b.push_break(depth, cond.map(|c| m(c, shadowed)), &vals);
+                        }
+                        Stmt::Continue { depth, cond, values } => {
+                            let vals: Vec<ValId> = r.vals(values).map(|v| m(v, shadowed)).collect();
+                            b.push_continue(depth, cond.map(|c| m(c, shadowed)), &vals);
+                        }
+                    }
+                }
                 shadowed.truncate(saved);
-                Region::Block(out)
+                b.finish()
             }
-            Region::IfElse { cond, then_region, else_region, results } => Region::IfElse {
-                cond: m(*cond, shadowed),
-                then_region: Box::new(walk(then_region, map, shadowed)),
-                else_region: Box::new(walk(else_region, map, shadowed)),
-                results: results.clone(),
-            },
-            Region::BoundedLoop { max_iters, init_vars, state_vars, body } => {
-                let init_vars = init_vars.iter().copied().map(|v| m(v, shadowed)).collect();
+            RegionNode::IfElse { cond, then_region, else_region, results } => {
+                let c = m(cond, shadowed);
+                let then_r = walk(r.child_or_empty(then_region), map, shadowed);
+                let else_r = walk(r.child_or_empty(else_region), map, shadowed);
+                let res_tys = r.region.tys_vec(results);
+                Region::if_else(c, &then_r, &else_r, &res_tys)
+            }
+            RegionNode::BoundedLoop { max_iters, init_vars, state_vars, body } => {
+                let inits: Vec<ValId> = r.vals(init_vars).map(|v| m(v, shadowed)).collect();
+                let states = r.region.vars_vec(state_vars);
                 let saved = shadowed.len();
-                for &(sv, _) in state_vars {
+                for &(sv, _) in &states {
                     shadowed.push(sv);
                 }
-                let body = Box::new(walk(body, map, shadowed));
+                let body_r = walk(r.child_or_empty(body), map, shadowed);
                 shadowed.truncate(saved);
-                Region::BoundedLoop {
-                    max_iters: *max_iters,
-                    init_vars,
-                    state_vars: state_vars.clone(),
-                    body,
-                }
+                Region::bounded_loop(max_iters, &inits, &states, &body_r)
             }
-            Region::InvariantLoop {
+            RegionNode::InvariantLoop {
                 init_vars,
                 state_vars,
                 cond,
@@ -1542,25 +1524,22 @@ fn remap_free_uses(region: &Region, map: &HashMap<ValId, ValId>) -> Region {
                 fuel_measure,
                 body,
             } => {
-                let init_vars = init_vars.iter().copied().map(|v| m(v, shadowed)).collect();
+                let inits: Vec<ValId> = r.vals(init_vars).map(|v| m(v, shadowed)).collect();
+                let states = r.region.vars_vec(state_vars);
                 let saved = shadowed.len();
-                for &(sv, _) in state_vars {
+                for &(sv, _) in &states {
                     shadowed.push(sv);
                 }
-                let res = Region::InvariantLoop {
-                    init_vars,
-                    state_vars: state_vars.clone(),
-                    cond: Box::new(walk(cond, map, shadowed)),
-                    invariant_pred: Box::new(walk(invariant_pred, map, shadowed)),
-                    fuel_measure: Box::new(walk(fuel_measure, map, shadowed)),
-                    body: Box::new(walk(body, map, shadowed)),
-                };
+                let cond_r = walk(r.child_or_empty(cond), map, shadowed);
+                let inv_r = walk(r.child_or_empty(invariant_pred), map, shadowed);
+                let fuel_r = walk(r.child_or_empty(fuel_measure), map, shadowed);
+                let body_r = walk(r.child_or_empty(body), map, shadowed);
                 shadowed.truncate(saved);
-                res
+                Region::invariant_loop(&inits, &states, &cond_r, &inv_r, &fuel_r, &body_r)
             }
         }
     }
-    walk(region, map, &mut Vec::new())
+    walk(region.as_ref(), map, &mut Vec::new())
 }
 
 fn build_egraph(registry: &StratumRegistry) -> Result<EGraph, SieveError> {
@@ -1639,7 +1618,7 @@ fn build_egraph(registry: &StratumRegistry) -> Result<EGraph, SieveError> {
     // Register proved StratumRegistry laws.
     let mut reg_rules = String::new();
     for stratum in registry.promoted() {
-        for law in &stratum.laws {
+        for law in stratum.laws.iter() {
             match law.kind {
                 LawKind::MemoryFrame { untouched_mem } => {
                     let rule_name = escape_str(&law.name);
@@ -1649,7 +1628,7 @@ fn build_egraph(registry: &StratumRegistry) -> Result<EGraph, SieveError> {
                     ));
                 }
                 LawKind::Algebraic => {
-                    if law.precondition.is_some() {
+                    if law.has_precondition() {
                         continue;
                     }
                     if let (Some(lhs_pat), Some(rhs_pat)) = (
@@ -1934,7 +1913,7 @@ fn region_to_pattern(
     params: &[(ValId, ValType)],
     registry: &StratumRegistry,
 ) -> Option<String> {
-    let Region::Block(stmts) = region else {
+    let RegionNode::Block(stmts) = region.root else {
         return None;
     };
     let mut env: HashMap<ValId, (String, ValType)> = params
@@ -1943,60 +1922,61 @@ fn region_to_pattern(
         .collect();
     let mut heap = "?h_law".to_string();
     let mut h_idx = 0usize;
-    for stmt in stmts {
+    for stmt in region.stmts(stmts) {
         match stmt {
             Stmt::Let { dst, ty, op } => {
                 let expr = match op {
-                    Op::ConstI32(v) => format!("(ConstI32 {})", *v as i64),
+                    Op::ConstI32(v) => format!("(ConstI32 {})", v as i64),
                     Op::ConstI64(v) => format!("(ConstI64 {v})"),
-                    Op::Copy(v) => env.get(v)?.0.clone(),
+                    Op::Copy(v) => env.get(&v)?.0.clone(),
                     Op::Select { cond, true_val, false_val } => format!(
                         "(Select {} {} {})",
-                        env.get(cond)?.0,
-                        env.get(true_val)?.0,
-                        env.get(false_val)?.0
+                        env.get(&cond)?.0,
+                        env.get(&true_val)?.0,
+                        env.get(&false_val)?.0
                     ),
-                    Op::Un(u, a) => format!("(Un {} {})", unop_tag(*u), env.get(a)?.0),
+                    Op::Un(u, a) => format!("(Un {} {})", unop_tag(u), env.get(&a)?.0),
                     Op::Bin(b, l, r) => format!(
                         "(Bin {} {} {})",
-                        binop_tag(*b),
-                        env.get(l)?.0,
-                        env.get(r)?.0
+                        binop_tag(b),
+                        env.get(&l)?.0,
+                        env.get(&r)?.0
                     ),
                     Op::Load { mem, addr, offset, width, signed, result_ty } => format!(
                         "(Load {} {heap} {} {} {} {} {})",
                         mem.0,
-                        env.get(addr)?.0,
+                        env.get(&addr)?.0,
                         offset,
-                        width_bytes(*width),
-                        i64::from(*signed),
-                        ty_tag(*result_ty)
+                        width_bytes(width),
+                        i64::from(signed),
+                        ty_tag(result_ty)
                     ),
                     Op::GlobalGet(_) | Op::MemorySize(_) | Op::MemoryGrow { .. } => return None,
                 };
-                env.insert(*dst, (expr, *ty));
+                env.insert(dst, (expr, ty));
             }
             Stmt::Effect(EffectOp::Store { mem, addr, offset, width, val }) => {
                 h_idx += 1;
                 let _ = h_idx;
-                let (val_s, val_ty) = env.get(val)?;
+                let (val_s, val_ty) = env.get(&val)?;
                 heap = format!(
                     "(StoreHeap {} {heap} {} {} {} {} {})",
                     mem.0,
-                    env.get(addr)?.0,
+                    env.get(&addr)?.0,
                     offset,
-                    width_bytes(*width),
+                    width_bytes(width),
                     val_s,
                     ty_tag(*val_ty)
                 );
             }
             Stmt::Effect(EffectOp::Nop) => {}
-            Stmt::Call { results, target: CallTarget::Stratum(sid), args } if results.len() == 1 => {
+            Stmt::Call { results, target: CallTarget::Stratum(sid), args } if results.len == 1 => {
+                let (res_id, res_ty) = region.try_var(results, 0)?;
                 let arg_strs: Option<Vec<String>> =
-                    args.iter().map(|a| env.get(a).map(|(s, _)| s.clone())).collect();
+                    region.vals(args).map(|a| env.get(&a).map(|(s, _)| s.clone())).collect();
                 let list = encode_expr_list(&arg_strs?);
                 let reads_state = registry
-                    .get_op(*sid)
+                    .get_op(sid)
                     .is_none_or(|op| region_reads_heap_or_global(&op.body, registry));
                 let call_pat = if reads_state {
                     format!("(StratumCall {} {heap} ?ge_law {list})", sid.0)
@@ -2004,14 +1984,17 @@ fn region_to_pattern(
                     format!("(StratumCall {} (InitHeap) 0 {list})", sid.0)
                 };
                 let is_ro = registry
-                    .get_op(*sid)
+                    .get_op(sid)
                     .is_some_and(|op| validate_read_only_with_registry(&op.body, registry));
                 if !is_ro {
                     heap = format!("(CallHeap {} {list} {heap})", sid.0);
                 }
-                env.insert(results[0].0, (call_pat, results[0].1));
+                env.insert(res_id, (call_pat, res_ty));
             }
-            Stmt::Yield(vs) if vs.len() == 1 => return env.get(&vs[0]).map(|(s, _)| s.clone()),
+            Stmt::Yield(vs) if vs.len == 1 => {
+                let v0 = region.try_val(vs, 0)?;
+                return env.get(&v0).map(|(s, _)| s.clone());
+            }
             _ => return None,
         }
     }
@@ -2035,116 +2018,124 @@ fn pattern_vars_covered(lhs: &str, rhs: &str) -> bool {
 }
 
 pub fn count_region_nodes(region: &Region) -> usize {
-    match region {
-        Region::Block(stmts) => {
-            1 + stmts
-                .iter()
-                .map(|s| match s {
-                    Stmt::Let { .. } => 2,
-                    Stmt::Effect(EffectOp::Nop) => 0,
-                    Stmt::Effect(_) => 2,
-                    Stmt::Region { region, .. } => 1 + count_region_nodes(region),
-                    Stmt::Call { args, .. } => 1 + args.len(),
-                    Stmt::Yield(vs) | Stmt::Return(vs) => 1 + vs.len(),
-                    Stmt::Break { values, .. } | Stmt::Continue { values, .. } => 1 + values.len(),
-                })
-                .sum::<usize>()
-        }
-        Region::IfElse { then_region, else_region, .. } => {
-            1 + count_region_nodes(then_region) + count_region_nodes(else_region)
-        }
-        Region::BoundedLoop { body, .. } => 1 + count_region_nodes(body),
-        Region::InvariantLoop { cond, invariant_pred, fuel_measure, body, .. } => {
-            1 + count_region_nodes(cond)
-                + count_region_nodes(invariant_pred)
-                + count_region_nodes(fuel_measure)
-                + count_region_nodes(body)
+    fn walk(r: RegionRef<'_>) -> usize {
+        match r.node {
+            RegionNode::Block(stmts) => {
+                1 + r
+                    .stmts(stmts)
+                    .map(|s| match s {
+                        Stmt::Let { .. } => 2,
+                        Stmt::Effect(EffectOp::Nop) => 0,
+                        Stmt::Effect(_) => 2,
+                        Stmt::Region { region: sub_id, .. } => 1 + walk(r.child_or_empty(sub_id)),
+                        Stmt::Call { args, .. } => 1 + args.len as usize,
+                        Stmt::Yield(vs) | Stmt::Return(vs) => 1 + vs.len as usize,
+                        Stmt::Break { values, .. } | Stmt::Continue { values, .. } => {
+                            1 + values.len as usize
+                        }
+                    })
+                    .sum::<usize>()
+            }
+            RegionNode::IfElse { then_region, else_region, .. } => {
+                1 + walk(r.child_or_empty(then_region)) + walk(r.child_or_empty(else_region))
+            }
+            RegionNode::BoundedLoop { body, .. } => 1 + walk(r.child_or_empty(body)),
+            RegionNode::InvariantLoop { cond, invariant_pred, fuel_measure, body, .. } => {
+                1 + walk(r.child_or_empty(cond))
+                    + walk(r.child_or_empty(invariant_pred))
+                    + walk(r.child_or_empty(fuel_measure))
+                    + walk(r.child_or_empty(body))
+            }
         }
     }
+    walk(region.as_ref())
 }
 
 fn max_val_id_in_region(region: &Region) -> u32 {
-    let mut max = 0u32;
-    let bump = |v: ValId, m: &mut u32| *m = (*m).max(v.0 + 1);
-    match region {
-        Region::Block(stmts) => {
-            for s in stmts {
-                match s {
-                    Stmt::Let { dst, op, .. } => {
-                        bump(*dst, &mut max);
-                        match op {
-                            Op::Copy(v) | Op::Un(_, v) | Op::Load { addr: v, .. } | Op::MemoryGrow { delta: v, .. } => bump(*v, &mut max),
-                            Op::Select { cond, true_val, false_val } => {
-                                bump(*cond, &mut max);
-                                bump(*true_val, &mut max);
-                                bump(*false_val, &mut max);
+    fn walk(r: RegionRef<'_>, max: &mut u32) {
+        let bump = |v: ValId, m: &mut u32| *m = (*m).max(v.0 + 1);
+        match r.node {
+            RegionNode::Block(stmts) => {
+                for s in r.stmts(stmts) {
+                    match s {
+                        Stmt::Let { dst, op, .. } => {
+                            bump(dst, max);
+                            match op {
+                                Op::Copy(v)
+                                | Op::Un(_, v)
+                                | Op::Load { addr: v, .. }
+                                | Op::MemoryGrow { delta: v, .. } => bump(v, max),
+                                Op::Select { cond, true_val, false_val } => {
+                                    bump(cond, max);
+                                    bump(true_val, max);
+                                    bump(false_val, max);
+                                }
+                                Op::Bin(_, l, rhs) => {
+                                    bump(l, max);
+                                    bump(rhs, max);
+                                }
+                                _ => {}
                             }
-                            Op::Bin(_, l, r) => {
-                                bump(*l, &mut max);
-                                bump(*r, &mut max);
+                        }
+                        Stmt::Region { results, region: sub_id } => {
+                            r.vars(results).for_each(|(id, _)| bump(id, max));
+                            walk(r.child_or_empty(sub_id), max);
+                        }
+                        Stmt::Call { results, args, .. } => {
+                            r.vars(results).for_each(|(id, _)| bump(id, max));
+                            r.vals(args).for_each(|a| bump(a, max));
+                        }
+                        Stmt::Yield(vs) | Stmt::Return(vs) => r.vals(vs).for_each(|v| bump(v, max)),
+                        Stmt::Break { cond, values, .. } | Stmt::Continue { cond, values, .. } => {
+                            cond.into_iter().chain(r.vals(values)).for_each(|v| bump(v, max));
+                        }
+                        Stmt::Effect(eff) => match eff {
+                            EffectOp::Store { addr, val, .. } => {
+                                bump(addr, max);
+                                bump(val, max);
                             }
-                            _ => {}
-                        }
+                            EffectOp::MemoryCopy { dst, src, len, .. }
+                            | EffectOp::MemoryFill { dst, val: src, len, .. } => {
+                                bump(dst, max);
+                                bump(src, max);
+                                bump(len, max);
+                            }
+                            EffectOp::GlobalSet { val, .. } => bump(val, max),
+                            EffectOp::Trap(_) | EffectOp::Nop => {}
+                        },
                     }
-                    Stmt::Region { results, region } => {
-                        results.iter().for_each(|&(id, _)| bump(id, &mut max));
-                        max = max.max(max_val_id_in_region(region));
-                    }
-                    Stmt::Call { results, args, .. } => {
-                        results.iter().for_each(|&(id, _)| bump(id, &mut max));
-                        args.iter().for_each(|&a| bump(a, &mut max));
-                    }
-                    Stmt::Yield(vs) | Stmt::Return(vs) => vs.iter().for_each(|&v| bump(v, &mut max)),
-                    Stmt::Break { cond, values, .. } | Stmt::Continue { cond, values, .. } => {
-                        cond.iter().chain(values).for_each(|&v| bump(v, &mut max));
-                    }
-                    Stmt::Effect(eff) => match eff {
-                        EffectOp::Store { addr, val, .. } => {
-                            bump(*addr, &mut max);
-                            bump(*val, &mut max);
-                        }
-                        EffectOp::MemoryCopy { dst, src, len, .. }
-                        | EffectOp::MemoryFill { dst, val: src, len, .. } => {
-                            bump(*dst, &mut max);
-                            bump(*src, &mut max);
-                            bump(*len, &mut max);
-                        }
-                        EffectOp::GlobalSet { val, .. } => bump(*val, &mut max),
-                        EffectOp::Trap(_) | EffectOp::Nop => {}
-                    },
+                }
+            }
+            RegionNode::IfElse { cond, then_region, else_region, .. } => {
+                bump(cond, max);
+                walk(r.child_or_empty(then_region), max);
+                walk(r.child_or_empty(else_region), max);
+            }
+            RegionNode::BoundedLoop { init_vars, state_vars, body, .. } => {
+                r.vals(init_vars)
+                    .chain(r.vars(state_vars).map(|(v, _)| v))
+                    .for_each(|v| bump(v, max));
+                walk(r.child_or_empty(body), max);
+            }
+            RegionNode::InvariantLoop {
+                init_vars,
+                state_vars,
+                cond,
+                invariant_pred,
+                fuel_measure,
+                body,
+            } => {
+                r.vals(init_vars)
+                    .chain(r.vars(state_vars).map(|(v, _)| v))
+                    .for_each(|v| bump(v, max));
+                for c in [cond, invariant_pred, fuel_measure, body] {
+                    walk(r.child_or_empty(c), max);
                 }
             }
         }
-        Region::IfElse { cond, then_region, else_region, .. } => {
-            bump(*cond, &mut max);
-            max = max
-                .max(max_val_id_in_region(then_region))
-                .max(max_val_id_in_region(else_region));
-        }
-        Region::BoundedLoop { init_vars, state_vars, body, .. } => {
-            init_vars
-                .iter()
-                .chain(state_vars.iter().map(|(v, _)| v))
-                .for_each(|&v| bump(v, &mut max));
-            max = max.max(max_val_id_in_region(body));
-        }
-        Region::InvariantLoop {
-            init_vars,
-            state_vars,
-            cond,
-            invariant_pred,
-            fuel_measure,
-            body,
-        } => {
-            init_vars
-                .iter()
-                .chain(state_vars.iter().map(|(v, _)| v))
-                .for_each(|&v| bump(v, &mut max));
-            [cond, invariant_pred, fuel_measure, body]
-                .into_iter()
-                .for_each(|r| max = max.max(max_val_id_in_region(r)));
-        }
     }
+    let mut max = 0u32;
+    walk(region.as_ref(), &mut max);
     max
 }
 
