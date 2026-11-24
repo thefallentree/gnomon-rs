@@ -3,18 +3,16 @@
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use gnomon_sieve::ConsolidationConfig;
+use gnomon_sieve::{ConsolidationConfig, ConsolidationReport};
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{CallToolResult, ContentBlock, Implementation, ServerCapabilities, ServerConfig};
 use rmcp::{ErrorData as McpError, ServerHandler, ServiceExt, tool, tool_handler, tool_router};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::GnomonError;
 use crate::engine::{CheckContractRequest, ContractPred, GnomonEngine};
-use crate::ir_codec::{
-    InputType, IrLawKind, IrTypedVar, IrVal, IrValType, load_artifact_from_mcp_arg,
-};
+use crate::ir_codec::{InputType, IrLawKind, IrTypedVar, IrVal, IrValType, LoadedArtifact};
 
 /// Single stateful Gnomon MCP Server serving all 7 verification & abstraction tools.
 #[derive(Clone)]
@@ -112,11 +110,11 @@ fn default_true() -> bool {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct LiftCheckParams {
-    /// Inline `.ir` JSON string or base64/hex encoded `.wasm` bytes.
+    /// Inline `.ir` JSON string, strict `#![no_std]` Rust source, or base64/hex encoded `.wasm` bytes.
     pub content: Option<String>,
-    /// Optional local file path to a `.wasm` or `.ir` file.
+    /// Optional local file path to a `.wasm`, `.rs`, or `.ir` file.
     pub path: Option<String>,
-    /// Input format: `auto`, `wasm`, or `ir`.
+    /// Input format: `auto`, `wasm`, `ir`, or `rust`.
     #[serde(default = "default_input_type")]
     pub input_type: InputType,
     /// Include full serialized `.ir` document in the response.
@@ -126,11 +124,11 @@ pub struct LiftCheckParams {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct RunTraceParams {
-    /// Optional inline `.ir` JSON or base64/hex `.wasm` to run (defaults to last lifted module).
+    /// Optional inline `.ir` JSON, strict `#![no_std]` Rust, or base64/hex `.wasm` to run (defaults to last lifted module).
     pub content: Option<String>,
-    /// Optional local file path to `.wasm` or `.ir`.
+    /// Optional local file path to `.wasm`, `.rs`, or `.ir`.
     pub path: Option<String>,
-    /// Input format: `auto`, `wasm`, or `ir`.
+    /// Input format: `auto`, `wasm`, `ir`, or `rust`.
     #[serde(default = "default_input_type")]
     pub input_type: InputType,
     /// Optional entry function name (defaults to func 0).
@@ -147,6 +145,9 @@ pub struct RunTraceParams {
 pub struct DefineOpParams {
     /// Name of the Layer-k Stratum op.
     pub name: String,
+    /// Optional entry function name inside a multi-function `.wasm`/`.rs` module (defaults to matching `name`, else func 0).
+    #[serde(default)]
+    pub entry: Option<String>,
     /// Strictly positive DAG layer (`>= 1`).
     pub layer: u16,
     /// Typed parameter list `[{"id":0,"ty":"i32"}]`.
@@ -155,11 +156,11 @@ pub struct DefineOpParams {
     /// Result types `["i32"]`.
     #[serde(default)]
     pub results: Vec<IrValType>,
-    /// Inline `.ir` JSON or base64/hex `.wasm` defining the op body.
+    /// Inline `.ir` JSON, strict `#![no_std]` Rust, or base64/hex `.wasm` defining the op body.
     pub body_content: Option<String>,
-    /// Optional local file path to `.wasm` or `.ir` defining the op body.
+    /// Optional local file path to `.wasm`, `.rs`, or `.ir` defining the op body.
     pub body_path: Option<String>,
-    /// Input format for body: `auto`, `wasm`, or `ir`.
+    /// Input format for body: `auto`, `wasm`, `ir`, or `rust`.
     #[serde(default = "default_input_type")]
     pub input_type: InputType,
     /// Human-readable docstring for AutoDoc prompt cache.
@@ -183,38 +184,52 @@ pub struct ProveLawParams {
     /// Quantified parameters `[{"id":0,"ty":"i32"}]`.
     #[serde(default)]
     pub params: Vec<IrTypedVar>,
-    /// LHS pattern (`.ir` JSON or base64/hex `.wasm`).
+    /// LHS pattern (`.ir` JSON, strict `#![no_std]` Rust, or base64/hex `.wasm`).
     pub lhs_content: Option<String>,
     pub lhs_path: Option<String>,
-    /// RHS pattern (`.ir` JSON or base64/hex `.wasm`; omitted for `memory_frame` laws).
+    #[serde(default)]
+    pub lhs_entry: Option<String>,
+    /// RHS pattern (`.ir` JSON, strict `#![no_std]` Rust, or base64/hex `.wasm`; omitted for `memory_frame` laws).
     pub rhs_content: Option<String>,
     pub rhs_path: Option<String>,
-    /// Optional precondition region (`.ir` JSON or `.wasm`).
+    #[serde(default)]
+    pub rhs_entry: Option<String>,
+    /// Optional precondition region (`.ir` JSON, `.rs`, or `.wasm`).
     pub pre_content: Option<String>,
     pub pre_path: Option<String>,
-    /// Input format: `auto`, `wasm`, or `ir`.
+    #[serde(default)]
+    pub pre_entry: Option<String>,
+    /// Input format: `auto`, `wasm`, `ir`, or `rust`.
     #[serde(default = "default_input_type")]
     pub input_type: InputType,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct CheckGoalParams {
-    /// Candidate region/module (`.ir` JSON or base64/hex `.wasm`).
+    /// Candidate region/module (`.ir` JSON, strict `#![no_std]` Rust, or base64/hex `.wasm`).
     pub candidate_content: Option<String>,
     pub candidate_path: Option<String>,
-    /// Specification region/module (`.ir` JSON or base64/hex `.wasm`).
+    #[serde(default)]
+    pub candidate_entry: Option<String>,
+    /// Specification region/module (`.ir` JSON, strict `#![no_std]` Rust, or base64/hex `.wasm`).
     pub spec_content: Option<String>,
     pub spec_path: Option<String>,
+    #[serde(default)]
+    pub spec_entry: Option<String>,
     /// Optional precondition region.
     pub pre_content: Option<String>,
     pub pre_path: Option<String>,
+    #[serde(default)]
+    pub pre_entry: Option<String>,
     /// Optional explicit postcondition for `InvariantLoop` VC splitting.
     pub post_content: Option<String>,
     pub post_path: Option<String>,
+    #[serde(default)]
+    pub post_entry: Option<String>,
     /// Free parameters `[{"id":0,"ty":"i32"}]`.
     #[serde(default)]
     pub params: Vec<IrTypedVar>,
-    /// Input format: `auto`, `wasm`, or `ir`.
+    /// Input format: `auto`, `wasm`, `ir`, or `rust`.
     #[serde(default = "default_input_type")]
     pub input_type: InputType,
     /// EqSat / solver budget in milliseconds.
@@ -224,13 +239,24 @@ pub struct CheckGoalParams {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct ConsolidateParams {
-    /// Additional verified solution `.ir` JSON strings to include in MDL scoring.
+    /// Additional verified solution `.ir` JSON or strict `#![no_std]` Rust strings to include in MDL scoring.
     #[serde(default)]
     pub solutions: Vec<String>,
     /// Minimum distinct solutions required to keep an op (default 2).
     pub min_solutions: Option<usize>,
     /// Max `egglog` steps for law redundancy pruning (default 3, clamped to 1..=3).
     pub max_derivation_steps: Option<usize>,
+    /// When `true`, include auto-generated `#![no_std]` `strata.rs` bindings in `strata_rs`.
+    #[serde(default)]
+    pub emit_rust: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct ConsolidateMcpOutput {
+    #[serde(flatten)]
+    report: ConsolidationReport,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    strata_rs: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -279,13 +305,14 @@ pub struct CheckContractParams {
 }
 
 fn load_mcp_contract_pred(
+    eng: &GnomonEngine,
     name: Option<String>,
     content: Option<&str>,
     path: Option<&str>,
     input_type: InputType,
 ) -> Result<Option<ContractPred>, GnomonError> {
     if content.is_some() || path.is_some() {
-        let (_, artifact) = load_artifact_from_mcp_arg(content, path, input_type)?;
+        let (_, artifact) = eng.load_artifact_from_mcp_arg(content, path, input_type)?;
         Ok(Some(ContractPred::Artifact { artifact: Box::new(artifact), entry: name }))
     } else {
         Ok(name.map(ContractPred::FuncName))
@@ -296,7 +323,7 @@ fn load_mcp_contract_pred(
 impl GnomonMcpServer {
     #[tool(
         name = "gnomon_lift_check",
-        description = "Lift a .wasm module or .ir document into typed GnomonIR, check round-trip emission, and return static diagnostics."
+        description = "Lift a .wasm module, strict #![no_std] Rust source, or .ir document into typed GnomonIR, bind stratum imports, check round-trip emission, and return static diagnostics."
     )]
     async fn gnomon_lift_check(
         &self,
@@ -304,7 +331,7 @@ impl GnomonMcpServer {
     ) -> Result<CallToolResult, McpError> {
         let out = self
             .with_engine(true, move |eng| {
-                let (detected, artifact) = load_artifact_from_mcp_arg(
+                let (detected, artifact) = eng.load_artifact_from_mcp_arg(
                     p.content.as_deref(),
                     p.path.as_deref(),
                     p.input_type,
@@ -317,7 +344,7 @@ impl GnomonMcpServer {
 
     #[tool(
         name = "gnomon_run_trace",
-        description = "Execute a lifted module or .ir region on the deterministic gnomon-kernel interpreter, returning outputs, traps, fuel consumed, and sparse memory diff."
+        description = "Execute a lifted module, strict #![no_std] Rust source, or .ir region on the deterministic gnomon-kernel interpreter, returning outputs, traps, fuel consumed, and sparse memory diff."
     )]
     async fn gnomon_run_trace(
         &self,
@@ -326,7 +353,7 @@ impl GnomonMcpServer {
         let out = self
             .with_engine(false, move |eng| {
                 let artifact = if p.content.is_some() || p.path.is_some() {
-                    let (_, art) = load_artifact_from_mcp_arg(
+                    let (_, art) = eng.load_artifact_from_mcp_arg(
                         p.content.as_deref(),
                         p.path.as_deref(),
                         p.input_type,
@@ -343,7 +370,7 @@ impl GnomonMcpServer {
 
     #[tool(
         name = "gnomon_define_op",
-        description = "Register a candidate Layer-k Stratum op after gnomon-kernel DAG acyclicity and type validation."
+        description = "Register a candidate Layer-k Stratum op from .wasm, strict #![no_std] Rust, or .ir after gnomon-kernel DAG acyclicity and type validation."
     )]
     async fn gnomon_define_op(
         &self,
@@ -351,12 +378,23 @@ impl GnomonMcpServer {
     ) -> Result<CallToolResult, McpError> {
         let out = self
             .with_engine(true, move |eng| {
-                let (_, art) = load_artifact_from_mcp_arg(
+                let (_, art) = eng.load_artifact_from_mcp_arg(
                     p.body_content.as_deref(),
                     p.body_path.as_deref(),
                     p.input_type,
                 )?;
-                let (_, art_params, art_results, body) = art.into_region(None)?;
+                let auto_entry = match (&p.entry, &art) {
+                    (Some(e), _) => Some(e.as_str()),
+                    (None, LoadedArtifact::Module(m))
+                        if m.funcs.iter().any(|f| {
+                            f.name == p.name || f.export_name.as_deref() == Some(p.name.as_str())
+                        }) =>
+                    {
+                        Some(p.name.as_str())
+                    }
+                    _ => None,
+                };
+                let (_, art_params, art_results, body) = art.into_region(auto_entry)?;
                 let params = if p.params.is_empty() {
                     art_params
                         .into_iter()
@@ -400,29 +438,29 @@ impl GnomonMcpServer {
         };
         let out = self
             .with_engine(true, move |eng| {
-                let (_, lhs_art) = load_artifact_from_mcp_arg(
+                let (_, lhs_art) = eng.load_artifact_from_mcp_arg(
                     p.lhs_content.as_deref(),
                     p.lhs_path.as_deref(),
                     p.input_type,
                 )?;
-                let (_, lhs_params, _, lhs_reg) = lhs_art.into_region(None)?;
+                let (_, lhs_params, _, lhs_reg) = lhs_art.into_region(p.lhs_entry.as_deref())?;
                 let rhs_reg = if p.rhs_content.is_some() || p.rhs_path.is_some() {
-                    let (_, rhs_art) = load_artifact_from_mcp_arg(
+                    let (_, rhs_art) = eng.load_artifact_from_mcp_arg(
                         p.rhs_content.as_deref(),
                         p.rhs_path.as_deref(),
                         p.input_type,
                     )?;
-                    rhs_art.into_region(None)?.3
+                    rhs_art.into_region(p.rhs_entry.as_deref())?.3
                 } else {
                     gnomon_kernel::Region::empty()
                 };
                 let pre_reg = if p.pre_content.is_some() || p.pre_path.is_some() {
-                    let (_, pre_art) = load_artifact_from_mcp_arg(
+                    let (_, pre_art) = eng.load_artifact_from_mcp_arg(
                         p.pre_content.as_deref(),
                         p.pre_path.as_deref(),
                         p.input_type,
                     )?;
-                    Some(pre_art.into_region(None)?.3)
+                    Some(pre_art.into_region(p.pre_entry.as_deref())?.3)
                 } else {
                     None
                 };
@@ -450,35 +488,36 @@ impl GnomonMcpServer {
     ) -> Result<CallToolResult, McpError> {
         let out = self
             .with_engine(true, move |eng| {
-                let (_, cand_art) = load_artifact_from_mcp_arg(
+                let (_, cand_art) = eng.load_artifact_from_mcp_arg(
                     p.candidate_content.as_deref(),
                     p.candidate_path.as_deref(),
                     p.input_type,
                 )?;
-                let (_, cand_params, _, cand_reg) = cand_art.into_region(None)?;
-                let (_, spec_art) = load_artifact_from_mcp_arg(
+                let (_, cand_params, _, cand_reg) =
+                    cand_art.into_region(p.candidate_entry.as_deref())?;
+                let (_, spec_art) = eng.load_artifact_from_mcp_arg(
                     p.spec_content.as_deref(),
                     p.spec_path.as_deref(),
                     p.input_type,
                 )?;
-                let (_, _, _, spec_reg) = spec_art.into_region(None)?;
+                let (_, _, _, spec_reg) = spec_art.into_region(p.spec_entry.as_deref())?;
                 let pre_reg = if p.pre_content.is_some() || p.pre_path.is_some() {
-                    let (_, pre_art) = load_artifact_from_mcp_arg(
+                    let (_, pre_art) = eng.load_artifact_from_mcp_arg(
                         p.pre_content.as_deref(),
                         p.pre_path.as_deref(),
                         p.input_type,
                     )?;
-                    Some(pre_art.into_region(None)?.3)
+                    Some(pre_art.into_region(p.pre_entry.as_deref())?.3)
                 } else {
                     None
                 };
                 let post_reg = if p.post_content.is_some() || p.post_path.is_some() {
-                    let (_, post_art) = load_artifact_from_mcp_arg(
+                    let (_, post_art) = eng.load_artifact_from_mcp_arg(
                         p.post_content.as_deref(),
                         p.post_path.as_deref(),
                         p.input_type,
                     )?;
-                    Some(post_art.into_region(None)?.3)
+                    Some(post_art.into_region(p.post_entry.as_deref())?.3)
                 } else {
                     None
                 };
@@ -498,18 +537,18 @@ impl GnomonMcpServer {
 
     #[tool(
         name = "gnomon_consolidate",
-        description = "Prune low-MDL ops (stitch_core across >=2 solutions) and redundant laws (<=3 egglog steps), rebuild the verified registry, and export compact AutoDoc / Delta Spec."
+        description = "Prune low-MDL ops (stitch_core across >=2 solutions) and redundant laws (<=3 egglog steps), rebuild the verified registry, export compact AutoDoc / Delta Spec, and optionally emit #![no_std] strata.rs bindings."
     )]
     async fn gnomon_consolidate(
         &self,
         Parameters(p): Parameters<ConsolidateParams>,
     ) -> Result<CallToolResult, McpError> {
-        let report = self
+        let out = self
             .with_engine(true, move |eng| {
                 let mut extra = Vec::with_capacity(p.solutions.len());
                 for s in &p.solutions {
                     let (_, art) =
-                        load_artifact_from_mcp_arg(Some(s.as_str()), None, InputType::Auto)?;
+                        eng.load_artifact_from_mcp_arg(Some(s.as_str()), None, InputType::Auto)?;
                     extra.push(art.into_region(None)?.3);
                 }
                 let mut cfg = ConsolidationConfig::default();
@@ -519,10 +558,12 @@ impl GnomonMcpServer {
                 if let Some(steps) = p.max_derivation_steps {
                     cfg.max_derivation_steps = steps;
                 }
-                eng.consolidate(&extra, &cfg)
+                let report = eng.consolidate(&extra, &cfg)?;
+                let strata_rs = p.emit_rust.then(|| eng.emit_rust(true));
+                Ok(ConsolidateMcpOutput { report, strata_rs })
             })
             .await?;
-        json_ok(&report)
+        json_ok(&out)
     }
 
     #[tool(
@@ -536,7 +577,7 @@ impl GnomonMcpServer {
         let out = self
             .with_engine(false, move |eng| {
                 let artifact = if p.content.is_some() || p.path.is_some() {
-                    let (_, art) = load_artifact_from_mcp_arg(
+                    let (_, art) = eng.load_artifact_from_mcp_arg(
                         p.content.as_deref(),
                         p.path.as_deref(),
                         p.input_type,
@@ -546,18 +587,21 @@ impl GnomonMcpServer {
                     None
                 };
                 let requires = load_mcp_contract_pred(
+                    eng,
                     p.requires,
                     p.requires_content.as_deref(),
                     p.requires_path.as_deref(),
                     p.input_type,
                 )?;
                 let ensures = load_mcp_contract_pred(
+                    eng,
                     p.ensures,
                     p.ensures_content.as_deref(),
                     p.ensures_path.as_deref(),
                     p.input_type,
                 )?;
                 let invariant = load_mcp_contract_pred(
+                    eng,
                     p.invariant,
                     p.invariant_content.as_deref(),
                     p.invariant_path.as_deref(),

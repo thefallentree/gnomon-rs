@@ -22,6 +22,11 @@ use crate::GnomonError;
 use crate::ir_codec::{
     InputType, IrDocument, IrLawKind, IrModule, IrRegion, IrStratum, IrStratumOp, IrTrapCode,
     IrTypedVar, IrVal, IrValType, LoadedArtifact, find_entry_func,
+    load_artifact_bytes_with_registry, load_artifact_from_mcp_arg_with_registry,
+};
+use crate::rust_bridge::{
+    bind_stratum_imports, generate_strata_rs, lower_module_strata, module_has_stratum_calls,
+    module_has_stratum_imports, normalize_nested_returns_for_stratum,
 };
 
 /// Persistent JSON snapshot for CLI `--state` / MCP session durability.
@@ -140,6 +145,41 @@ impl GnomonEngine {
         })
     }
 
+    pub fn bind_artifact(&self, artifact: LoadedArtifact) -> Result<LoadedArtifact, GnomonError> {
+        match artifact {
+            LoadedArtifact::Module(m) if module_has_stratum_imports(&m) => {
+                Ok(LoadedArtifact::Module(bind_stratum_imports(m, &self.registry)?))
+            }
+            other => Ok(other),
+        }
+    }
+
+    pub fn load_artifact_bytes(
+        &self,
+        bytes: &[u8],
+        kind: InputType,
+        path: Option<&str>,
+    ) -> Result<(InputType, LoadedArtifact), GnomonError> {
+        load_artifact_bytes_with_registry(bytes, kind, path, Some(&self.registry))
+    }
+
+    pub fn load_artifact_from_mcp_arg(
+        &self,
+        content: Option<&str>,
+        file_path: Option<&str>,
+        kind: InputType,
+    ) -> Result<(InputType, LoadedArtifact), GnomonError> {
+        load_artifact_from_mcp_arg_with_registry(content, file_path, kind, Some(&self.registry))
+    }
+
+    pub fn emit_rust(&self, include_candidates: bool) -> String {
+        generate_strata_rs(&self.registry, include_candidates)
+    }
+
+    pub fn lower_module(&self, module: &Module) -> Result<Module, GnomonError> {
+        lower_module_strata(module, &self.registry)
+    }
+
     // -----------------------------------------------------------------------
     // Tool 1: gnomon_lift_check
     // -----------------------------------------------------------------------
@@ -150,16 +190,47 @@ impl GnomonEngine {
         include_ir: bool,
     ) -> Result<LiftCheckOutput, GnomonError> {
         match artifact {
-            LoadedArtifact::Module(module) => {
+            LoadedArtifact::Module(mut module) => {
                 let mut diagnostics = Vec::new();
-                let roundtrip_ok = match emit_wasm(&module) {
-                    Ok(bytes) => {
-                        diagnostics.push(format!("round-trip emit valid ({} wasm bytes)", bytes.len()));
-                        true
+                if module_has_stratum_imports(&module) {
+                    let bound_count = module
+                        .host_contracts
+                        .iter()
+                        .filter(|hc| hc.module_name == "stratum")
+                        .count();
+                    module = bind_stratum_imports(module, &self.registry)?;
+                    diagnostics.push(format!(
+                        "bound {bound_count} stratum import(s) to CallTarget::Stratum"
+                    ));
+                }
+                let roundtrip_ok = if module_has_stratum_calls(&module) {
+                    match lower_module_strata(&module, &self.registry)
+                        .and_then(|lowered| {
+                            emit_wasm(&lowered).map_err(|e| GnomonError::Wasm(e.to_string()))
+                        }) {
+                        Ok(bytes) => {
+                            diagnostics.push(format!(
+                                "lowered standalone round-trip emit valid ({} wasm bytes)",
+                                bytes.len()
+                            ));
+                            true
+                        }
+                        Err(e) => {
+                            diagnostics.push(format!("lowered emit_wasm diagnostic: {e}"));
+                            false
+                        }
                     }
-                    Err(e) => {
-                        diagnostics.push(format!("emit_wasm diagnostic: {e}"));
-                        false
+                } else {
+                    match emit_wasm(&module) {
+                        Ok(bytes) => {
+                            diagnostics
+                                .push(format!("round-trip emit valid ({} wasm bytes)", bytes.len()));
+                            true
+                        }
+                        Err(e) => {
+                            diagnostics.push(format!("emit_wasm diagnostic: {e}"));
+                            false
+                        }
                     }
                 };
                 let functions: Vec<FuncSummary> = module
@@ -281,7 +352,10 @@ impl GnomonEngine {
                 let res = eval_region(&module, &self.registry, &region, &bindings, init_heap.clone());
                 Ok(build_trace_output("<region>", fuel, &init_heap, res))
             }
-            Some(LoadedArtifact::Module(module)) => {
+            Some(LoadedArtifact::Module(mut module)) => {
+                if module_has_stratum_imports(&module) {
+                    module = bind_stratum_imports(module, &self.registry)?;
+                }
                 let func = find_entry_func(&module, entry)?;
                 let init_heap = HeapState::from_module(&module, fuel)
                     .map_err(|t| GnomonError::Kernel(format!("heap init trap: {t:?}")))?;
@@ -332,13 +406,14 @@ impl GnomonEngine {
         if id >= self.next_stratum_id {
             self.next_stratum_id = id + 1;
         }
+        let normalized_body = normalize_nested_returns_for_stratum(&body)?;
         let op = StratumOp {
             id: StratumId(id),
             name: name.clone(),
             layer,
             params: params.into_iter().map(|v| (ValId(v.id), v.ty.into())).collect(),
             results: results.into_iter().map(Into::into).collect(),
-            body,
+            body: normalized_body,
             docstring,
         };
         let ssa_nodes = count_region_nodes(&op.body);
@@ -763,9 +838,14 @@ impl GnomonEngine {
         }
 
         // Preserve full Module (memories, globals, host_contracts, helper funcs) when loading
-        // `.wasm`/`.ir`, or fall back to `self.active_module`.
+        // `.wasm`/`.ir`/`.rs`, or fall back to `self.active_module`.
         let (mut module, standalone_region) = match req.artifact {
-            Some(LoadedArtifact::Module(m)) => (m, None),
+            Some(LoadedArtifact::Module(mut m)) => {
+                if module_has_stratum_imports(&m) {
+                    m = bind_stratum_imports(m, &self.registry)?;
+                }
+                (m, None)
+            }
             Some(LoadedArtifact::Region { params, results, region }) => {
                 if suite_mode {
                     return Err(GnomonError::InvalidInput(
@@ -782,27 +862,34 @@ impl GnomonEngine {
                 (self.active_module.clone().unwrap_or_default(), Some((params, results, region)))
             }
             None => {
-                let m = self.active_module.as_ref().ok_or_else(|| {
-                    GnomonError::InvalidInput(
-                        "no module loaded; call gnomon_lift_check or provide an input artifact"
-                            .into(),
-                    )
-                })?;
-                (m.clone(), None)
+                let mut m = self
+                    .active_module
+                    .as_ref()
+                    .ok_or_else(|| {
+                        GnomonError::InvalidInput(
+                            "no module loaded; call gnomon_lift_check or provide an input artifact"
+                                .into(),
+                        )
+                    })?
+                    .clone();
+                if module_has_stratum_imports(&m) {
+                    m = bind_stratum_imports(m, &self.registry)?;
+                }
+                (m, None)
             }
         };
 
         let resolved_req = req
             .requires
-            .map(|p| resolve_contract_pred(&module, p, "requires"))
+            .map(|p| resolve_contract_pred(&module, &self.registry, p, "requires"))
             .transpose()?;
         let resolved_ens = req
             .ensures
-            .map(|p| resolve_contract_pred(&module, p, "ensures"))
+            .map(|p| resolve_contract_pred(&module, &self.registry, p, "ensures"))
             .transpose()?;
         let resolved_inv = req
             .invariant
-            .map(|p| resolve_contract_pred(&module, p, "invariant"))
+            .map(|p| resolve_contract_pred(&module, &self.registry, p, "invariant"))
             .transpose()?;
         if let Some(ref inv) = resolved_inv
             && inv.params.as_ref().is_some_and(|p| !p.is_empty())
@@ -1378,6 +1465,7 @@ struct ResolvedPred {
 
 fn resolve_contract_pred(
     module: &Module,
+    registry: &StratumRegistry,
     pred: ContractPred,
     role: &str,
 ) -> Result<ResolvedPred, GnomonError> {
@@ -1394,7 +1482,10 @@ fn resolve_contract_pred(
             })
         }
         ContractPred::Artifact { artifact, entry } => match *artifact {
-            LoadedArtifact::Module(ext_mod) => {
+            LoadedArtifact::Module(mut ext_mod) => {
+                if module_has_stratum_imports(&ext_mod) {
+                    ext_mod = bind_stratum_imports(ext_mod, registry)?;
+                }
                 let func = find_entry_func(&ext_mod, entry.as_deref()).map_err(|e| {
                     GnomonError::InvalidInput(format!("{role} artifact error: {e}"))
                 })?;

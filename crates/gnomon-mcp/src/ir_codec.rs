@@ -1,4 +1,4 @@
-//! Lossless `.ir` JSON wire format and `-t wasm|ir|auto` input loader (files & stdin).
+//! Lossless `.ir` JSON wire format and `-t wasm|ir|rust|auto` input loader (files & stdin).
 
 use std::io::Read;
 use std::path::Path;
@@ -8,12 +8,16 @@ use gnomon_kernel::{
     BinOp, CallTarget, EffectOp, FuncDef, FuncId, GlobalDef, GlobalId, HostCallId, HostContract,
     Law, LawKind, LawList, MemId, MemWidth, MemoryDef, Module, OffsetRange, Op, Region,
     RegionBuilder, RegionNode, RegionRef, SliceBound, Span, Stmt, Stratum, StratumId, StratumOp,
-    TrapCode, UnOp, Val, ValId, ValType,
+    StratumRegistry, TrapCode, UnOp, Val, ValId, ValType,
 };
 use gnomon_wasm::lift_wasm;
 use serde::{Deserialize, Serialize};
 
 use crate::GnomonError;
+use crate::rust_bridge::{
+    bind_stratum_imports, compile_rust_to_wasm_with_registry, looks_like_rust_source,
+    module_has_stratum_imports,
+};
 
 /// Explicit input format selected via CLI `-t` / `--type` or MCP tool parameter.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
@@ -22,6 +26,7 @@ pub enum InputType {
     Auto,
     Wasm,
     Ir,
+    Rust,
 }
 
 /// Decoded payload from either a `.wasm` binary or `.ir` JSON document.
@@ -86,20 +91,15 @@ pub fn read_input_bytes(path: Option<&str>) -> Result<(Vec<u8>, Option<&str>), G
     }
 }
 
-/// Detects whether raw bytes are `.wasm` or `.ir` JSON using `-t` + path extension + magic bytes.
+/// Detects whether raw bytes are `.wasm`, `.rs`, or `.ir` JSON using `-t` + path extension + content heuristics.
 pub fn resolve_input_type(kind: InputType, path: Option<&str>, bytes: &[u8]) -> InputType {
     match kind {
         InputType::Wasm => InputType::Wasm,
         InputType::Ir => InputType::Ir,
+        InputType::Rust => InputType::Rust,
         InputType::Auto => {
             if bytes.starts_with(b"\0asm") {
                 return InputType::Wasm;
-            }
-            if let Ok(s) = std::str::from_utf8(bytes) {
-                let trimmed = s.trim_start();
-                if trimmed.starts_with("base64:") || trimmed.starts_with("hex:") {
-                    return InputType::Wasm;
-                }
             }
             if let Some(p) = path {
                 let ext = Path::new(p)
@@ -108,8 +108,18 @@ pub fn resolve_input_type(kind: InputType, path: Option<&str>, bytes: &[u8]) -> 
                     .map(|s| s.to_ascii_lowercase());
                 match ext.as_deref() {
                     Some("wasm") => return InputType::Wasm,
+                    Some("rs") => return InputType::Rust,
                     Some("ir") | Some("json") => return InputType::Ir,
                     _ => {}
+                }
+            }
+            if let Ok(s) = std::str::from_utf8(bytes) {
+                let trimmed = s.trim_start();
+                if trimmed.starts_with("base64:") || trimmed.starts_with("hex:") {
+                    return InputType::Wasm;
+                }
+                if looks_like_rust_source(trimmed) {
+                    return InputType::Rust;
                 }
             }
             InputType::Ir
@@ -117,11 +127,34 @@ pub fn resolve_input_type(kind: InputType, path: Option<&str>, bytes: &[u8]) -> 
     }
 }
 
-/// Loads raw bytes (from file or stdin) as `.wasm` or `.ir` JSON according to `kind`.
+fn maybe_bind_artifact(
+    artifact: LoadedArtifact,
+    registry: Option<&StratumRegistry>,
+) -> Result<LoadedArtifact, GnomonError> {
+    match (artifact, registry) {
+        (LoadedArtifact::Module(m), Some(reg)) if module_has_stratum_imports(&m) => {
+            Ok(LoadedArtifact::Module(bind_stratum_imports(m, reg)?))
+        }
+        (art, _) => Ok(art),
+    }
+}
+
+/// Loads raw bytes (from file or stdin) as `.wasm`, `.rs`, or `.ir` JSON according to `kind`.
 pub fn load_artifact_bytes(
     bytes: &[u8],
     kind: InputType,
     path: Option<&str>,
+) -> Result<(InputType, LoadedArtifact), GnomonError> {
+    load_artifact_bytes_with_registry(bytes, kind, path, None)
+}
+
+/// Loads raw bytes as `.wasm`, `.rs`, or `.ir` JSON, synthesizing `strata.rs` for inline Rust
+/// and automatically binding `"stratum"` Wasm imports when `registry` is provided.
+pub fn load_artifact_bytes_with_registry(
+    bytes: &[u8],
+    kind: InputType,
+    path: Option<&str>,
+    registry: Option<&StratumRegistry>,
 ) -> Result<(InputType, LoadedArtifact), GnomonError> {
     let resolved = resolve_input_type(kind, path, bytes);
     match resolved {
@@ -129,29 +162,53 @@ pub fn load_artifact_bytes(
             let wasm_bytes = decode_maybe_encoded_wasm(bytes)?;
             let module = lift_wasm(&wasm_bytes)
                 .map_err(|e| GnomonError::Wasm(e.to_string()))?;
-            Ok((InputType::Wasm, LoadedArtifact::Module(module)))
+            let art = maybe_bind_artifact(LoadedArtifact::Module(module), registry)?;
+            Ok((InputType::Wasm, art))
+        }
+        InputType::Rust => {
+            let src = std::str::from_utf8(bytes)
+                .map_err(|e| GnomonError::InvalidInput(format!("invalid UTF-8 in .rs input: {e}")))?;
+            let wasm_bytes =
+                compile_rust_to_wasm_with_registry(src, path.map(Path::new), registry)?;
+            let module = lift_wasm(&wasm_bytes)
+                .map_err(|e| GnomonError::Wasm(e.to_string()))?;
+            let art = maybe_bind_artifact(LoadedArtifact::Module(module), registry)?;
+            Ok((InputType::Rust, art))
         }
         InputType::Ir | InputType::Auto => {
             let text = std::str::from_utf8(bytes)
                 .map_err(|e| GnomonError::InvalidInput(format!("invalid UTF-8 in .ir input: {e}")))?;
             let doc: IrDocument = serde_json::from_str(text)
                 .map_err(|e| GnomonError::InvalidInput(format!("invalid .ir JSON: {e}")))?;
-            Ok((InputType::Ir, doc.into_loaded()?))
+            let art = maybe_bind_artifact(doc.into_loaded()?, registry)?;
+            Ok((InputType::Ir, art))
         }
     }
 }
 
-/// Loads a string payload (used by MCP JSON tools): accepts `.ir` JSON, `base64:` / raw base64
-/// `.wasm`, `hex:` `.wasm`, or a local file path when `file_path` is passed.
+/// Loads a string payload (used by MCP JSON tools): accepts `.ir` JSON, strict `#![no_std]` Rust
+/// source, `base64:` / raw base64 `.wasm`, `hex:` `.wasm`, or a local file path when `file_path`
+/// is passed.
 pub fn load_artifact_from_mcp_arg(
     content: Option<&str>,
     file_path: Option<&str>,
     kind: InputType,
 ) -> Result<(InputType, LoadedArtifact), GnomonError> {
+    load_artifact_from_mcp_arg_with_registry(content, file_path, kind, None)
+}
+
+/// Registry-aware MCP artifact loader that synthesizes `strata.rs` for inline Rust snippets
+/// and automatically binds `"stratum"` Wasm imports when `registry` is provided.
+pub fn load_artifact_from_mcp_arg_with_registry(
+    content: Option<&str>,
+    file_path: Option<&str>,
+    kind: InputType,
+    registry: Option<&StratumRegistry>,
+) -> Result<(InputType, LoadedArtifact), GnomonError> {
     if let Some(p) = file_path {
         let bytes = std::fs::read(p)
             .map_err(|e| GnomonError::Io(format!("failed reading '{p}': {e}")))?;
-        return load_artifact_bytes(&bytes, kind, Some(p));
+        return load_artifact_bytes_with_registry(&bytes, kind, Some(p), registry);
     }
     let raw = content
         .ok_or_else(|| GnomonError::InvalidInput("either content or path must be provided".into()))?;
@@ -160,23 +217,39 @@ pub fn load_artifact_from_mcp_arg(
         InputType::Wasm => {
             let wasm_bytes = decode_wasm_string(trimmed)?;
             let module = lift_wasm(&wasm_bytes).map_err(|e| GnomonError::Wasm(e.to_string()))?;
-            Ok((InputType::Wasm, LoadedArtifact::Module(module)))
+            let art = maybe_bind_artifact(LoadedArtifact::Module(module), registry)?;
+            Ok((InputType::Wasm, art))
+        }
+        InputType::Rust => {
+            let wasm_bytes = compile_rust_to_wasm_with_registry(raw, None, registry)?;
+            let module = lift_wasm(&wasm_bytes).map_err(|e| GnomonError::Wasm(e.to_string()))?;
+            let art = maybe_bind_artifact(LoadedArtifact::Module(module), registry)?;
+            Ok((InputType::Rust, art))
         }
         InputType::Ir => {
             let doc: IrDocument = serde_json::from_str(trimmed)
                 .map_err(|e| GnomonError::InvalidInput(format!("invalid .ir JSON: {e}")))?;
-            Ok((InputType::Ir, doc.into_loaded()?))
+            let art = maybe_bind_artifact(doc.into_loaded()?, registry)?;
+            Ok((InputType::Ir, art))
         }
         InputType::Auto => {
             if trimmed.starts_with('{') {
                 let doc: IrDocument = serde_json::from_str(trimmed)
                     .map_err(|e| GnomonError::InvalidInput(format!("invalid .ir JSON: {e}")))?;
-                Ok((InputType::Ir, doc.into_loaded()?))
+                let art = maybe_bind_artifact(doc.into_loaded()?, registry)?;
+                Ok((InputType::Ir, art))
+            } else if looks_like_rust_source(trimmed) {
+                let wasm_bytes = compile_rust_to_wasm_with_registry(raw, None, registry)?;
+                let module =
+                    lift_wasm(&wasm_bytes).map_err(|e| GnomonError::Wasm(e.to_string()))?;
+                let art = maybe_bind_artifact(LoadedArtifact::Module(module), registry)?;
+                Ok((InputType::Rust, art))
             } else {
                 let wasm_bytes = decode_wasm_string(trimmed)?;
                 let module =
                     lift_wasm(&wasm_bytes).map_err(|e| GnomonError::Wasm(e.to_string()))?;
-                Ok((InputType::Wasm, LoadedArtifact::Module(module)))
+                let art = maybe_bind_artifact(LoadedArtifact::Module(module), registry)?;
+                Ok((InputType::Wasm, art))
             }
         }
     }

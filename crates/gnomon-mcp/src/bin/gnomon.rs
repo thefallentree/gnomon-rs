@@ -7,7 +7,7 @@ use std::process::ExitCode;
 use clap::{Parser, Subcommand, ValueEnum};
 use gnomon_mcp::{
     CheckContractRequest, ContractPred, GnomonEngine, GnomonError, GnomonMcpServer, InputType,
-    IrLawKind, IrTypedVar, IrVal, IrValType, LoadedArtifact, load_artifact_bytes, read_input_bytes,
+    IrDocument, IrLawKind, IrTypedVar, IrVal, IrValType, LoadedArtifact, read_input_bytes,
 };
 use gnomon_sieve::ConsolidationConfig;
 use gnomon_wasm::emit_wasm;
@@ -17,6 +17,7 @@ enum CliInputType {
     Auto,
     Wasm,
     Ir,
+    Rust,
 }
 
 impl From<CliInputType> for InputType {
@@ -25,6 +26,7 @@ impl From<CliInputType> for InputType {
             CliInputType::Auto => InputType::Auto,
             CliInputType::Wasm => InputType::Wasm,
             CliInputType::Ir => InputType::Ir,
+            CliInputType::Rust => InputType::Rust,
         }
     }
 }
@@ -33,11 +35,11 @@ impl From<CliInputType> for InputType {
 #[command(
     name = "gnomon",
     version,
-    about = "Gnomon deterministic Wasm verification, sieve, CLI, and MCP server",
+    about = "Gnomon deterministic Wasm/no_std-Rust verification, sieve, CLI, and MCP server",
     after_help = "Exit codes:\n  0  Success / PROVED / OK\n  1  FALSIFIED / TRAP / UNKNOWN\n  2  CLI, I/O, parse, or TCB admission error\n\nRun `gnomon schema` to print a concise `.ir` JSON reference for regions, ops, and stratum calls."
 )]
 struct Cli {
-    /// Input type for .wasm / .ir / stdin payloads (`auto`, `wasm`, `ir`).
+    /// Input type for .wasm / .ir / .rs / stdin payloads (`auto`, `wasm`, `ir`, `rust`).
     #[arg(short = 't', long = "type", value_enum, global = true, default_value_t = CliInputType::Auto)]
     input_type: CliInputType,
 
@@ -51,9 +53,9 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Commands {
-    /// Lift a .wasm or .ir input (file or stdin) into typed GnomonIR and run static diagnostics.
+    /// Lift a .wasm, .rs, or .ir input (file or stdin) into typed GnomonIR and run static diagnostics.
     Lift {
-        /// Path to a .wasm or .ir file, or '-' / omitted to read from stdin.
+        /// Path to a .wasm, .rs, or .ir file, or '-' / omitted to read from stdin.
         input: Option<String>,
         /// Include full serialized .ir JSON in the output.
         #[arg(long)]
@@ -61,11 +63,14 @@ enum Commands {
         /// Optionally write round-tripped .wasm bytes to a file.
         #[arg(long)]
         emit_wasm: Option<PathBuf>,
+        /// Transitively lower CallTarget::Stratum calls into local FuncDefs for standalone .wasm/.ir emission.
+        #[arg(long)]
+        lower: bool,
     },
 
-    /// Execute a .wasm or .ir input (file or stdin) on the deterministic gnomon-kernel interpreter.
+    /// Execute a .wasm, .rs, or .ir input (file or stdin) on the deterministic gnomon-kernel interpreter.
     Trace {
-        /// Path to a .wasm or .ir file, or '-' / omitted to read from stdin.
+        /// Path to a .wasm, .rs, or .ir file, or '-' / omitted to read from stdin.
         input: Option<String>,
         /// Entry function name (defaults to func 0).
         #[arg(long)]
@@ -80,11 +85,14 @@ enum Commands {
 
     /// Register a candidate Layer-k Stratum op after gnomon-kernel DAG/type check.
     DefineOp {
-        /// Path to .wasm or .ir body file, or '-' / omitted to read from stdin.
+        /// Path to .wasm, .rs, or .ir body file, or '-' / omitted to read from stdin.
         input: Option<String>,
         /// Name of the Stratum op.
         #[arg(long)]
         name: String,
+        /// Optional entry function name inside a multi-function .wasm/.rs module (defaults to matching `--name`, else func 0).
+        #[arg(long)]
+        entry: Option<String>,
         /// Strictly positive DAG layer (>= 1).
         #[arg(long, default_value_t = 1)]
         layer: u16,
@@ -119,31 +127,52 @@ enum Commands {
         /// Optional JSON params array `[{"id":0,"ty":"i32"}]`.
         #[arg(long)]
         params: Option<String>,
-        /// Path to LHS .wasm or .ir file (or '-' for stdin).
+        /// Path to LHS .wasm, .rs, or .ir file (or '-' for stdin).
         #[arg(long)]
         lhs: String,
-        /// Path to RHS .wasm or .ir file (omitted for memory-frame).
+        /// Optional entry function name inside LHS module.
+        #[arg(long)]
+        lhs_entry: Option<String>,
+        /// Path to RHS .wasm, .rs, or .ir file (omitted for memory-frame).
         #[arg(long)]
         rhs: Option<String>,
-        /// Optional precondition .wasm or .ir file.
+        /// Optional entry function name inside RHS module.
+        #[arg(long)]
+        rhs_entry: Option<String>,
+        /// Optional precondition .wasm, .rs, or .ir file.
         #[arg(long)]
         pre: Option<String>,
+        /// Optional entry function name inside precondition module.
+        #[arg(long)]
+        pre_entry: Option<String>,
     },
 
     /// Check equivalence or InvariantLoop VCs via egglog cancellation + Bitwuzla QF_ABV.
     CheckGoal {
-        /// Path to candidate .wasm or .ir file (or '-' for stdin).
+        /// Path to candidate .wasm, .rs, or .ir file (or '-' for stdin).
         #[arg(long)]
         candidate: String,
-        /// Path to specification .wasm or .ir file.
+        /// Optional entry function name inside candidate module.
+        #[arg(long)]
+        candidate_entry: Option<String>,
+        /// Path to specification .wasm, .rs, or .ir file.
         #[arg(long)]
         spec: String,
-        /// Optional precondition .wasm or .ir file.
+        /// Optional entry function name inside specification module.
+        #[arg(long)]
+        spec_entry: Option<String>,
+        /// Optional precondition .wasm, .rs, or .ir file.
         #[arg(long)]
         pre: Option<String>,
-        /// Optional postcondition .wasm or .ir file for InvariantLoop VC splitting.
+        /// Optional entry function name inside precondition module.
+        #[arg(long)]
+        pre_entry: Option<String>,
+        /// Optional postcondition .wasm, .rs, or .ir file for InvariantLoop VC splitting.
         #[arg(long)]
         post: Option<String>,
+        /// Optional entry function name inside postcondition module.
+        #[arg(long)]
+        post_entry: Option<String>,
         /// Optional JSON params array `[{"id":0,"ty":"i32"}]`.
         #[arg(long)]
         params: Option<String>,
@@ -187,7 +216,7 @@ enum Commands {
 
     /// Run stitch_core MDL + egglog 3-step law non-redundancy consolidation and emit AutoDoc.
     Consolidate {
-        /// Additional verified solution .wasm or .ir files.
+        /// Additional verified solution .wasm, .rs, or .ir files.
         #[arg(long = "solution")]
         solutions: Vec<String>,
         /// Minimum distinct solutions required to keep an op (default 2).
@@ -196,6 +225,18 @@ enum Commands {
         /// Max egglog steps for law redundancy pruning (1..=3).
         #[arg(long, default_value_t = 3)]
         max_derivation_steps: usize,
+        /// Optionally write auto-generated `#![no_std]` `strata.rs` bindings to a file.
+        #[arg(long)]
+        emit_rust: Option<PathBuf>,
+    },
+
+    /// Emit `#![no_std]` Rust `strata.rs` bindings for registered Strata (stdout or file).
+    EmitRust {
+        /// Optional output file path (prints to stdout when omitted).
+        out_path: Option<PathBuf>,
+        /// Exclude unpromoted candidate ops (emit only promoted Strata).
+        #[arg(long)]
+        promoted_only: bool,
     },
 
     /// Start the single Gnomon MCP server over stdio (rmcp + tokio).
@@ -206,25 +247,28 @@ enum Commands {
 }
 
 fn load_cli_artifact(
+    eng: &GnomonEngine,
     path: Option<&str>,
     kind: InputType,
 ) -> Result<(InputType, LoadedArtifact), GnomonError> {
     let (bytes, resolved_path) = read_input_bytes(path)?;
-    load_artifact_bytes(&bytes, kind, resolved_path)
+    eng.load_artifact_bytes(&bytes, kind, resolved_path)
 }
 
 fn resolve_cli_contract_pred(
+    eng: &GnomonEngine,
     arg: &str,
     target_module: Option<&gnomon_kernel::Module>,
     input_type: InputType,
 ) -> Result<ContractPred, GnomonError> {
     if arg == "-" {
-        let (_, artifact) = load_cli_artifact(Some("-"), input_type)?;
+        let (_, artifact) = load_cli_artifact(eng, Some("-"), input_type)?;
         return Ok(ContractPred::Artifact { artifact: Box::new(artifact), entry: None });
     }
     let looks_like_path = arg.contains('/')
         || arg.contains('\\')
         || arg.ends_with(".wasm")
+        || arg.ends_with(".rs")
         || arg.ends_with(".ir")
         || arg.ends_with(".json");
     if !looks_like_path
@@ -237,7 +281,7 @@ fn resolve_cli_contract_pred(
         return Ok(ContractPred::FuncName(arg.to_string()));
     }
     if looks_like_path || std::path::Path::new(arg).is_file() {
-        let (_, artifact) = load_cli_artifact(Some(arg), input_type)?;
+        let (_, artifact) = load_cli_artifact(eng, Some(arg), input_type)?;
         return Ok(ContractPred::Artifact { artifact: Box::new(artifact), entry: None });
     }
     Ok(ContractPred::FuncName(arg.to_string()))
@@ -298,19 +342,30 @@ fn run(cli: Cli) -> Result<bool, GnomonError> {
             rt.block_on(server.serve_stdio())?;
             Ok(true)
         }
-        Commands::Lift { input, emit_ir, emit_wasm: emit_wasm_path } => {
+        Commands::Lift { input, emit_ir, emit_wasm: emit_wasm_path, lower } => {
             let mut eng = match &cli.state {
                 Some(p) => GnomonEngine::load_state_file(p)?,
                 None => GnomonEngine::new(),
             };
-            let (detected, art) = load_cli_artifact(input.as_deref(), input_type)?;
-            let out = eng.lift_check(detected, art, emit_ir)?;
-            if let Some(out_path) = emit_wasm_path
-                && let Some(ref m) = eng.active_module
-            {
-                let bytes = emit_wasm(m).map_err(|e| GnomonError::Wasm(e.to_string()))?;
-                std::fs::write(&out_path, bytes)
-                    .map_err(|e| GnomonError::Io(format!("failed writing wasm: {e}")))?;
+            let (detected, art) = load_cli_artifact(&eng, input.as_deref(), input_type)?;
+            let mut out = eng.lift_check(detected, art, emit_ir)?;
+            if let Some(ref m) = eng.active_module {
+                let lowered_mod = if lower { Some(eng.lower_module(m)?) } else { None };
+                if let Some(out_path) = emit_wasm_path {
+                    let target = lowered_mod.as_ref().unwrap_or(m);
+                    let bytes = emit_wasm(target).map_err(|e| GnomonError::Wasm(e.to_string()))?;
+                    if let Some(parent) = out_path.parent()
+                        && !parent.as_os_str().is_empty()
+                    {
+                        std::fs::create_dir_all(parent)
+                            .map_err(|e| GnomonError::Io(format!("failed creating wasm dir: {e}")))?;
+                    }
+                    std::fs::write(&out_path, bytes)
+                        .map_err(|e| GnomonError::Io(format!("failed writing wasm: {e}")))?;
+                }
+                if emit_ir && let Some(ref lowered) = lowered_mod {
+                    out.ir = Some(IrDocument::from_module(lowered));
+                }
             }
             if let Some(ref p) = cli.state {
                 eng.save_state_file(p)?;
@@ -334,7 +389,7 @@ fn run(cli: Cli) -> Result<bool, GnomonError> {
             {
                 None
             } else {
-                Some(load_cli_artifact(input.as_deref(), input_type)?.1)
+                Some(load_cli_artifact(&eng, input.as_deref(), input_type)?.1)
             };
             let out = eng.run_trace(art_override, entry.as_deref(), &parsed_inputs, fuel)?;
             println!(
@@ -344,13 +399,24 @@ fn run(cli: Cli) -> Result<bool, GnomonError> {
             );
             Ok(out.status == "OK")
         }
-        Commands::DefineOp { input, name, layer, params, results, doc, id } => {
+        Commands::DefineOp { input, name, entry, layer, params, results, doc, id } => {
             let mut eng = match &cli.state {
                 Some(p) => GnomonEngine::load_state_file(p)?,
                 None => GnomonEngine::new(),
             };
-            let (_, art) = load_cli_artifact(input.as_deref(), input_type)?;
-            let (_, art_params, art_results, body) = art.into_region(None)?;
+            let (_, art) = load_cli_artifact(&eng, input.as_deref(), input_type)?;
+            let auto_entry = match (&entry, &art) {
+                (Some(e), _) => Some(e.as_str()),
+                (None, LoadedArtifact::Module(m))
+                    if m.funcs
+                        .iter()
+                        .any(|f| f.name == name || f.export_name.as_deref() == Some(name.as_str())) =>
+                {
+                    Some(name.as_str())
+                }
+                _ => None,
+            };
+            let (_, art_params, art_results, body) = art.into_region(auto_entry)?;
             let k_params: Vec<IrTypedVar> = match params {
                 Some(s) => serde_json::from_str(&s)
                     .map_err(|e| GnomonError::InvalidInput(format!("invalid --params JSON: {e}")))?,
@@ -375,21 +441,41 @@ fn run(cli: Cli) -> Result<bool, GnomonError> {
             );
             Ok(true)
         }
-        Commands::ProveLaw { op, name, kind, untouched_mem, params, lhs, rhs, pre } => {
+        Commands::ProveLaw {
+            op,
+            name,
+            kind,
+            untouched_mem,
+            params,
+            lhs,
+            lhs_entry,
+            rhs,
+            rhs_entry,
+            pre,
+            pre_entry,
+        } => {
             let mut eng = match &cli.state {
                 Some(p) => GnomonEngine::load_state_file(p)?,
                 None => GnomonEngine::new(),
             };
-            let (_, lhs_art) = load_cli_artifact(Some(lhs.as_str()), input_type)?;
-            let (_, lhs_params, _, lhs_reg) = lhs_art.into_region(None)?;
+            let (_, lhs_art) = load_cli_artifact(&eng, Some(lhs.as_str()), input_type)?;
+            let (_, lhs_params, _, lhs_reg) = lhs_art.into_region(lhs_entry.as_deref())?;
             let rhs_reg = match rhs {
-                Some(r) => load_cli_artifact(Some(r.as_str()), input_type)?.1.into_region(None)?.3,
+                Some(r) => {
+                    load_cli_artifact(&eng, Some(r.as_str()), input_type)?
+                        .1
+                        .into_region(rhs_entry.as_deref())?
+                        .3
+                }
                 None => gnomon_kernel::Region::empty(),
             };
             let pre_reg = match pre {
-                Some(p) => {
-                    Some(load_cli_artifact(Some(p.as_str()), input_type)?.1.into_region(None)?.3)
-                }
+                Some(p) => Some(
+                    load_cli_artifact(&eng, Some(p.as_str()), input_type)?
+                        .1
+                        .into_region(pre_entry.as_deref())?
+                        .3,
+                ),
                 None => None,
             };
             let law_kind = match kind.as_str() {
@@ -424,25 +510,42 @@ fn run(cli: Cli) -> Result<bool, GnomonError> {
             );
             Ok(out.status == "PROVED")
         }
-        Commands::CheckGoal { candidate, spec, pre, post, params, timeout_ms } => {
+        Commands::CheckGoal {
+            candidate,
+            candidate_entry,
+            spec,
+            spec_entry,
+            pre,
+            pre_entry,
+            post,
+            post_entry,
+            params,
+            timeout_ms,
+        } => {
             let mut eng = match &cli.state {
                 Some(p) => GnomonEngine::load_state_file(p)?,
                 None => GnomonEngine::new(),
             };
-            let (_, cand_art) = load_cli_artifact(Some(candidate.as_str()), input_type)?;
-            let (_, cand_params, _, cand_reg) = cand_art.into_region(None)?;
-            let (_, spec_art) = load_cli_artifact(Some(spec.as_str()), input_type)?;
-            let (_, _, _, spec_reg) = spec_art.into_region(None)?;
+            let (_, cand_art) = load_cli_artifact(&eng, Some(candidate.as_str()), input_type)?;
+            let (_, cand_params, _, cand_reg) = cand_art.into_region(candidate_entry.as_deref())?;
+            let (_, spec_art) = load_cli_artifact(&eng, Some(spec.as_str()), input_type)?;
+            let (_, _, _, spec_reg) = spec_art.into_region(spec_entry.as_deref())?;
             let pre_reg = match pre {
-                Some(p) => {
-                    Some(load_cli_artifact(Some(p.as_str()), input_type)?.1.into_region(None)?.3)
-                }
+                Some(p) => Some(
+                    load_cli_artifact(&eng, Some(p.as_str()), input_type)?
+                        .1
+                        .into_region(pre_entry.as_deref())?
+                        .3,
+                ),
                 None => None,
             };
             let post_reg = match post {
-                Some(p) => {
-                    Some(load_cli_artifact(Some(p.as_str()), input_type)?.1.into_region(None)?.3)
-                }
+                Some(p) => Some(
+                    load_cli_artifact(&eng, Some(p.as_str()), input_type)?
+                        .1
+                        .into_region(post_entry.as_deref())?
+                        .3,
+                ),
                 None => None,
             };
             let k_params: Vec<IrTypedVar> = match params {
@@ -481,7 +584,7 @@ fn run(cli: Cli) -> Result<bool, GnomonError> {
                 None => GnomonEngine::new(),
             };
             let art_override = match input.as_deref() {
-                Some(p) => Some(load_cli_artifact(Some(p), input_type)?.1),
+                Some(p) => Some(load_cli_artifact(&eng, Some(p), input_type)?.1),
                 None => {
                     if eng.active_module.is_some() {
                         if std::io::stdin().is_terminal() {
@@ -491,11 +594,11 @@ fn run(cli: Cli) -> Result<bool, GnomonError> {
                             if bytes.is_empty() {
                                 None
                             } else {
-                                Some(load_artifact_bytes(&bytes, input_type, None)?.1)
+                                Some(eng.load_artifact_bytes(&bytes, input_type, None)?.1)
                             }
                         }
                     } else {
-                        Some(load_cli_artifact(None, input_type)?.1)
+                        Some(load_cli_artifact(&eng, None, input_type)?.1)
                     }
                 }
             };
@@ -506,15 +609,15 @@ fn run(cli: Cli) -> Result<bool, GnomonError> {
             };
             let req_pred = requires
                 .as_deref()
-                .map(|s| resolve_cli_contract_pred(s, target_module_ref, input_type))
+                .map(|s| resolve_cli_contract_pred(&eng, s, target_module_ref, input_type))
                 .transpose()?;
             let ens_pred = ensures
                 .as_deref()
-                .map(|s| resolve_cli_contract_pred(s, target_module_ref, input_type))
+                .map(|s| resolve_cli_contract_pred(&eng, s, target_module_ref, input_type))
                 .transpose()?;
             let inv_pred = invariant
                 .as_deref()
-                .map(|s| resolve_cli_contract_pred(s, target_module_ref, input_type))
+                .map(|s| resolve_cli_contract_pred(&eng, s, target_module_ref, input_type))
                 .transpose()?;
             let out = eng.check_contract(CheckContractRequest {
                 artifact: art_override,
@@ -535,14 +638,14 @@ fn run(cli: Cli) -> Result<bool, GnomonError> {
             );
             Ok(out.status == "PROVED")
         }
-        Commands::Consolidate { solutions, min_solutions, max_derivation_steps } => {
+        Commands::Consolidate { solutions, min_solutions, max_derivation_steps, emit_rust } => {
             let mut eng = match &cli.state {
                 Some(p) => GnomonEngine::load_state_file(p)?,
                 None => GnomonEngine::new(),
             };
             let mut extra = Vec::with_capacity(solutions.len());
             for s in &solutions {
-                let (_, art) = load_cli_artifact(Some(s.as_str()), input_type)?;
+                let (_, art) = load_cli_artifact(&eng, Some(s.as_str()), input_type)?;
                 extra.push(art.into_region(None)?.3);
             }
             let cfg = ConsolidationConfig {
@@ -551,6 +654,17 @@ fn run(cli: Cli) -> Result<bool, GnomonError> {
                 ..ConsolidationConfig::default()
             };
             let report = eng.consolidate(&extra, &cfg)?;
+            if let Some(ref rust_out) = emit_rust {
+                let code = eng.emit_rust(true);
+                if let Some(parent) = rust_out.parent()
+                    && !parent.as_os_str().is_empty()
+                {
+                    std::fs::create_dir_all(parent)
+                        .map_err(|e| GnomonError::Io(format!("failed creating rust output dir: {e}")))?;
+                }
+                std::fs::write(rust_out, code)
+                    .map_err(|e| GnomonError::Io(format!("failed writing '{}': {e}", rust_out.display())))?;
+            }
             if let Some(ref p) = cli.state {
                 eng.save_state_file(p)?;
             }
@@ -559,6 +673,31 @@ fn run(cli: Cli) -> Result<bool, GnomonError> {
                 serde_json::to_string_pretty(&report)
                     .map_err(|e| GnomonError::Internal(e.to_string()))?
             );
+            Ok(true)
+        }
+        Commands::EmitRust { out_path, promoted_only } => {
+            let eng = match &cli.state {
+                Some(p) => GnomonEngine::load_state_file(p)?,
+                None => GnomonEngine::new(),
+            };
+            let code = eng.emit_rust(!promoted_only);
+            match out_path {
+                Some(path) => {
+                    if let Some(parent) = path.parent()
+                        && !parent.as_os_str().is_empty()
+                    {
+                        std::fs::create_dir_all(parent).map_err(|e| {
+                            GnomonError::Io(format!("failed creating output dir: {e}"))
+                        })?;
+                    }
+                    std::fs::write(&path, code).map_err(|e| {
+                        GnomonError::Io(format!("failed writing '{}': {e}", path.display()))
+                    })?;
+                }
+                None => {
+                    print!("{code}");
+                }
+            }
             Ok(true)
         }
     }
