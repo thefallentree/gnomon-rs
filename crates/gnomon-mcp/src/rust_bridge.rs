@@ -798,7 +798,7 @@ fn collect_stratum_ids_in_region(region: &Region, out: &mut BTreeSet<StratumId>)
     });
 }
 
-fn rewrite_region_call_targets(
+pub(crate) fn rewrite_region_call_targets(
     region: &Region,
     map_target: &mut impl FnMut(CallTarget) -> Result<CallTarget, GnomonError>,
 ) -> Result<Region, GnomonError> {

@@ -3,7 +3,8 @@
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use gnomon_sieve::{ConsolidationConfig, ConsolidationReport};
+use gnomon_kernel::{MemId, ValId};
+use gnomon_sieve::{ConsolidationConfig, ConsolidationReport, SliceBoundExpr, SliceFrameSpec};
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{CallToolResult, ContentBlock, Implementation, ServerCapabilities, ServerConfig};
@@ -11,7 +12,7 @@ use rmcp::{ErrorData as McpError, ServerHandler, ServiceExt, tool, tool_handler,
 use serde::{Deserialize, Serialize};
 
 use crate::GnomonError;
-use crate::engine::{CheckContractRequest, ContractPred, GnomonEngine};
+use crate::engine::{CheckContractRequest, ContractPred, GnomonEngine, prepare_goal_artifacts};
 use crate::ir_codec::{InputType, IrLawKind, IrTypedVar, IrVal, IrValType, LoadedArtifact};
 
 /// Single stateful Gnomon MCP Server serving all 7 verification & abstraction tools.
@@ -235,6 +236,81 @@ pub struct CheckGoalParams {
     /// EqSat / solver budget in milliseconds.
     #[serde(default = "default_timeout_ms")]
     pub timeout_ms: u64,
+    /// Ignore dead shadow-stack bytes below SP_in (`Global(0)`) while proving SP preservation and exact live-memory equivalence.
+    #[serde(default)]
+    pub ignore_dead_stack: bool,
+}
+
+/// Optional intra-memory write-frame restriction for `gnomon_check_contract`.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct SliceFrameParam {
+    /// Target linear memory ID (defaults to `0`).
+    #[serde(default)]
+    pub mem: u16,
+    /// When `true`, proves the function writes zero bytes to live memory (`base = 0, len = 0`).
+    #[serde(default)]
+    pub readonly: bool,
+    /// 0-based `ValId` of an `i32` entry parameter giving the writable slice base address.
+    pub base_param: Option<u32>,
+    /// Constant 32-bit unsigned byte offset giving the writable slice base address.
+    pub base_const: Option<u32>,
+    /// 0-based `ValId` of an `i32` entry parameter giving the writable slice byte length.
+    pub len_param: Option<u32>,
+    /// Constant 32-bit unsigned byte length giving the writable slice byte length.
+    pub len_const: Option<u32>,
+}
+
+impl SliceFrameParam {
+    pub fn into_spec(self) -> Result<SliceFrameSpec, GnomonError> {
+        let has_explicit = self.base_param.is_some()
+            || self.base_const.is_some()
+            || self.len_param.is_some()
+            || self.len_const.is_some();
+        if self.readonly {
+            if has_explicit {
+                return Err(GnomonError::InvalidInput(
+                    "slice_frame: cannot combine 'readonly: true' with explicit base/len bounds"
+                        .into(),
+                ));
+            }
+            return Ok(SliceFrameSpec {
+                mem: MemId(self.mem),
+                base: SliceBoundExpr::Const(0),
+                len: SliceBoundExpr::Const(0),
+            });
+        }
+        let base = match (self.base_param, self.base_const) {
+            (Some(p), None) => SliceBoundExpr::Param(ValId(p)),
+            (None, Some(c)) => SliceBoundExpr::Const(c),
+            (Some(_), Some(_)) => {
+                return Err(GnomonError::InvalidInput(
+                    "slice_frame: specify only one of 'base_param' or 'base_const'".into(),
+                ));
+            }
+            (None, None) => {
+                return Err(GnomonError::InvalidInput(
+                    "slice_frame: must specify 'base_param', 'base_const', or 'readonly: true'"
+                        .into(),
+                ));
+            }
+        };
+        let len = match (self.len_param, self.len_const) {
+            (Some(p), None) => SliceBoundExpr::Param(ValId(p)),
+            (None, Some(c)) => SliceBoundExpr::Const(c),
+            (Some(_), Some(_)) => {
+                return Err(GnomonError::InvalidInput(
+                    "slice_frame: specify only one of 'len_param' or 'len_const'".into(),
+                ));
+            }
+            (None, None) => {
+                return Err(GnomonError::InvalidInput(
+                    "slice_frame: must specify 'len_param', 'len_const', or 'readonly: true'"
+                        .into(),
+                ));
+            }
+        };
+        Ok(SliceFrameSpec { mem: MemId(self.mem), base, len })
+    }
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -299,6 +375,12 @@ pub struct CheckContractParams {
     /// Require trap-freedom on assumption-satisfying paths (default `true`).
     #[serde(default = "default_true")]
     pub check_trap_free: bool,
+    /// Ignore dead shadow-stack bytes below SP_in (`Global(0)`) while proving SP preservation.
+    #[serde(default)]
+    pub ignore_dead_stack: bool,
+    /// Optional intra-memory write-frame restriction (`readonly: true`, or `base_param`/`base_const` + `len_param`/`len_const`, optional `mem`).
+    #[serde(default)]
+    pub slice_frame: Option<SliceFrameParam>,
     /// Bitwuzla per-check timeout budget in milliseconds (default `5000`).
     #[serde(default = "default_timeout_ms")]
     pub timeout_ms: u64,
@@ -480,7 +562,7 @@ impl GnomonMcpServer {
 
     #[tool(
         name = "gnomon_check_goal",
-        description = "Check equivalence or InvariantLoop VCs by running bounded egglog cancellation with proved Strata laws, sound Ackermann UF congruence CEGAR for shared pure-total Strata, and residual Bitwuzla QF_ABV proving."
+        description = "Check equivalence or InvariantLoop VCs by running bounded egglog cancellation with proved Strata laws, sound Ackermann UF congruence CEGAR for shared pure-total Strata, and residual Bitwuzla QF_ABV proving (supports ignore_dead_stack for shadow-stack refinement)."
     )]
     async fn gnomon_check_goal(
         &self,
@@ -493,43 +575,97 @@ impl GnomonMcpServer {
                     p.candidate_path.as_deref(),
                     p.input_type,
                 )?;
-                let (_, cand_params, _, cand_reg) =
-                    cand_art.into_region(p.candidate_entry.as_deref())?;
-                let (_, spec_art) = eng.load_artifact_from_mcp_arg(
-                    p.spec_content.as_deref(),
-                    p.spec_path.as_deref(),
-                    p.input_type,
+                let spec_art = if p.spec_content.is_none()
+                    && p.candidate_content.is_none()
+                    && p.spec_path.is_some()
+                    && p.spec_path == p.candidate_path
+                {
+                    cand_art.clone()
+                } else {
+                    eng.load_artifact_from_mcp_arg(
+                        p.spec_content.as_deref(),
+                        p.spec_path.as_deref(),
+                        p.input_type,
+                    )?
+                    .1
+                };
+                let pre_art = if p.pre_content.is_some() || p.pre_path.is_some() {
+                    let art = if p.pre_content.is_none()
+                        && p.candidate_content.is_none()
+                        && p.pre_path.is_some()
+                        && p.pre_path == p.candidate_path
+                    {
+                        cand_art.clone()
+                    } else if p.pre_content.is_none()
+                        && p.spec_content.is_none()
+                        && p.pre_path.is_some()
+                        && p.pre_path == p.spec_path
+                    {
+                        spec_art.clone()
+                    } else {
+                        eng.load_artifact_from_mcp_arg(
+                            p.pre_content.as_deref(),
+                            p.pre_path.as_deref(),
+                            p.input_type,
+                        )?
+                        .1
+                    };
+                    Some((art, p.pre_entry))
+                } else {
+                    None
+                };
+                let post_art = if p.post_content.is_some() || p.post_path.is_some() {
+                    let art = if p.post_content.is_none()
+                        && p.candidate_content.is_none()
+                        && p.post_path.is_some()
+                        && p.post_path == p.candidate_path
+                    {
+                        cand_art.clone()
+                    } else if p.post_content.is_none()
+                        && p.spec_content.is_none()
+                        && p.post_path.is_some()
+                        && p.post_path == p.spec_path
+                    {
+                        spec_art.clone()
+                    } else {
+                        eng.load_artifact_from_mcp_arg(
+                            p.post_content.as_deref(),
+                            p.post_path.as_deref(),
+                            p.input_type,
+                        )?
+                        .1
+                    };
+                    Some((art, p.post_entry))
+                } else {
+                    None
+                };
+                let prepared = prepare_goal_artifacts(
+                    cand_art,
+                    p.candidate_entry.as_deref(),
+                    spec_art,
+                    p.spec_entry.as_deref(),
+                    pre_art.as_ref().map(|(a, e)| (a.clone(), e.as_deref())),
+                    post_art.as_ref().map(|(a, e)| (a.clone(), e.as_deref())),
                 )?;
-                let (_, _, _, spec_reg) = spec_art.into_region(p.spec_entry.as_deref())?;
-                let pre_reg = if p.pre_content.is_some() || p.pre_path.is_some() {
-                    let (_, pre_art) = eng.load_artifact_from_mcp_arg(
-                        p.pre_content.as_deref(),
-                        p.pre_path.as_deref(),
-                        p.input_type,
-                    )?;
-                    Some(pre_art.into_region(p.pre_entry.as_deref())?.3)
-                } else {
-                    None
-                };
-                let post_reg = if p.post_content.is_some() || p.post_path.is_some() {
-                    let (_, post_art) = eng.load_artifact_from_mcp_arg(
-                        p.post_content.as_deref(),
-                        p.post_path.as_deref(),
-                        p.input_type,
-                    )?;
-                    Some(post_art.into_region(p.post_entry.as_deref())?.3)
-                } else {
-                    None
-                };
                 let params = if p.params.is_empty() {
-                    cand_params
+                    prepared
+                        .candidate_params
                         .into_iter()
                         .map(|(id, ty)| IrTypedVar { id: id.0, ty: ty.into() })
                         .collect()
                 } else {
                     p.params
                 };
-                eng.check_goal(cand_reg, spec_reg, params, pre_reg, post_reg, p.timeout_ms)
+                eng.check_goal_with_module(
+                    prepared.context_module,
+                    prepared.candidate,
+                    prepared.spec,
+                    params,
+                    prepared.precondition,
+                    prepared.loop_postcondition,
+                    p.timeout_ms,
+                    p.ignore_dead_stack,
+                )
             })
             .await?;
         json_ok(&out)
@@ -568,7 +704,7 @@ impl GnomonMcpServer {
 
     #[tool(
         name = "gnomon_check_contract",
-        description = "Verify function contracts (requires/ensures, trap-freedom, inline gnomon_assume/gnomon_assert) or multi-op inductive state-invariant suites (init + ops + invariant) via Bitwuzla QF_ABV."
+        description = "Verify function contracts (requires/ensures, trap-freedom, intra-memory slice_frame write-frame bounds, shadow-stack ignore_dead_stack, inline gnomon_assume/gnomon_assert) or multi-op inductive state-invariant suites (init + ops + invariant) via Bitwuzla QF_ABV."
     )]
     async fn gnomon_check_contract(
         &self,
@@ -576,6 +712,7 @@ impl GnomonMcpServer {
     ) -> Result<CallToolResult, McpError> {
         let out = self
             .with_engine(false, move |eng| {
+                let slice_frame = p.slice_frame.map(SliceFrameParam::into_spec).transpose()?;
                 let artifact = if p.content.is_some() || p.path.is_some() {
                     let (_, art) = eng.load_artifact_from_mcp_arg(
                         p.content.as_deref(),
@@ -617,6 +754,8 @@ impl GnomonMcpServer {
                     invariant,
                     use_initial_state: p.use_initial_state,
                     check_trap_free: p.check_trap_free,
+                    ignore_dead_stack: p.ignore_dead_stack,
+                    slice_frame,
                     timeout_ms: p.timeout_ms,
                 })
             })
@@ -631,12 +770,13 @@ impl ServerHandler for GnomonMcpServer {
         let mut info = ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
             .with_instructions(
                 "Gnomon deterministic wasm32 formal verification and recursive Stratum abstraction server. \
-                 Workflow: (1) gnomon_lift_check to lift .wasm/.ir, (2) gnomon_run_trace to inspect concrete outputs/traps/memory diffs, \
+                 Workflow: (1) gnomon_lift_check to lift .wasm/.rs/.ir and report static SMT-cliff warnings, \
+                 (2) gnomon_run_trace to inspect concrete outputs/traps/memory diffs, \
                  (3) gnomon_define_op to decompose hard nonlinear/stateful tasks into Layer-k Strata, \
                  (4) gnomon_prove_law to prove algebraic or unconditional MemoryFrame laws (Wasmtime -> Bitwuzla QF_ABV -> kernel TCB), \
-                 (5) gnomon_check_goal to verify composite goals via egglog + Ackermann UF CEGAR + Bitwuzla (or 3-way InvariantLoop VC split), \
+                 (5) gnomon_check_goal to verify equivalence via egglog + Ackermann UF CEGAR + Bitwuzla (supports ignore_dead_stack for shadow-stack refinement and 3-way InvariantLoop VC splits), \
                  (6) gnomon_consolidate to prune low-MDL ops (stitch_core) and redundant laws (<=3 egglog steps) into a compact AutoDoc, \
-                 (7) gnomon_check_contract to verify pre/post contracts, trap-freedom, inline gnomon_assume/gnomon_assert harnesses, and multi-op inductive state-invariant suites (init + ops + invariant).",
+                 (7) gnomon_check_contract to verify pre/post contracts, trap-freedom, intra-memory slice_frame write-frame bounds (including readonly), shadow-stack ignore_dead_stack, inline gnomon_assume/gnomon_assert harnesses, and multi-op inductive state-invariant suites (init + ops + invariant).",
             );
         info.server_info = Implementation::new("gnomon", env!("CARGO_PKG_VERSION"));
         info

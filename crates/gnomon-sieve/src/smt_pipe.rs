@@ -8,8 +8,10 @@ use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 
 use gnomon_kernel::{Module, Region, StratumRegistry, VcObligation};
 
-use crate::smt_ir::{RawSat, SmtTarget, run_check_contract, run_check_equivalence, run_check_vc};
-use crate::{ContractSpec, SieveError, SmtBackend, SmtResult};
+use crate::smt_ir::{
+    RawSat, SmtTarget, run_check_contract, run_check_equivalence_with_options, run_check_vc,
+};
+use crate::{ContractSpec, EquivOptions, SieveError, SmtBackend, SmtResult};
 
 /// Persistent incremental `bitwuzla` SMT-LIB2 child-process backend.
 pub struct BitwuzlaPipeBackend {
@@ -201,17 +203,27 @@ impl SmtBackend for BitwuzlaPipeBackend {
         })
     }
 
-    fn check_equivalence(
+    fn check_equivalence_with_options(
         &mut self,
         module: &Module,
         registry: &StratumRegistry,
         lhs: &Region,
         rhs: &Region,
         precondition: Option<&Region>,
+        opts: &EquivOptions,
     ) -> Result<SmtResult, SieveError> {
         self.run_in_frame(|session| {
             let prefix = format!("pq{}", session.qid);
-            run_check_equivalence(session, module, registry, lhs, rhs, precondition, &prefix)
+            run_check_equivalence_with_options(
+                session,
+                module,
+                registry,
+                lhs,
+                rhs,
+                precondition,
+                opts,
+                &prefix,
+            )
         })
     }
 

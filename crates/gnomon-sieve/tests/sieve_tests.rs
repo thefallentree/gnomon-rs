@@ -6,8 +6,9 @@ use gnomon_kernel::{
     eval_region, split_invariant_loop,
 };
 use gnomon_sieve::{
-    BitwuzlaNativeBackend, BitwuzlaPipeBackend, ContractSpec, EgglogSimplifier, EqSatConfig,
-    SieveError, SmtBackend, SmtResult,
+    BitwuzlaNativeBackend, BitwuzlaPipeBackend, CliffLevel, ContractSpec, EgglogSimplifier,
+    EqSatConfig, EquivOptions, SieveError, SliceBoundExpr, SliceFrameSpec, SmtBackend, SmtResult,
+    StackRefinement, estimate_region_cliff, estimate_smt_cliff,
 };
 
 fn mod_with_mems(mems: &[(u16, u32, Option<u32>)]) -> Module {
@@ -2145,5 +2146,1451 @@ fn test_contract_allow_traps_assert_and_pre_loop_overflow_both_backends() {
             }
             other => panic!("{name}: expected Sat for Unreachable branch, got {other:?}"),
         }
+    });
+}
+
+fn rustc_wasm_stack_module() -> Module {
+    Module {
+        memories: vec![MemoryDef {
+            id: MemId(0),
+            min_pages: 17, // 16 pages (1 MiB) stack + 1 page (64 KiB) live arena
+            max_pages: None,
+            init_data: vec![],
+        }],
+        globals: vec![GlobalDef {
+            id: GlobalId(0),
+            ty: ValType::I32,
+            mutable: true,
+            init: Val::I32(1_048_576), // 0x100000
+        }],
+        ..Module::default()
+    }
+}
+
+#[test]
+fn test_shadow_stack_refinement_equivalence_both_backends() {
+    let module = rustc_wasm_stack_module();
+    let reg = StratumRegistry::new();
+
+    // LHS: spills two i64 params onto [SP - 16 .. SP), reloads, xors, restores SP.
+    let lhs_spill = Region::build(|b| {
+        b.push_let(ValId(10), ValType::I32, Op::GlobalGet(GlobalId(0)));
+        b.push_let(ValId(11), ValType::I32, Op::ConstI32(16));
+        b.push_let(ValId(12), ValType::I32, Op::Bin(BinOp::I32Sub, ValId(10), ValId(11)));
+        b.push_effect(EffectOp::GlobalSet { id: GlobalId(0), val: ValId(12) });
+        b.push_effect(EffectOp::Store {
+            mem: MemId(0),
+            addr: ValId(12),
+            offset: 0,
+            width: MemWidth::B8,
+            val: ValId(0),
+        });
+        b.push_effect(EffectOp::Store {
+            mem: MemId(0),
+            addr: ValId(12),
+            offset: 8,
+            width: MemWidth::B8,
+            val: ValId(1),
+        });
+        b.push_let(
+            ValId(13),
+            ValType::I64,
+            Op::Load {
+                mem: MemId(0),
+                addr: ValId(12),
+                offset: 0,
+                width: MemWidth::B8,
+                signed: false,
+                result_ty: ValType::I64,
+            },
+        );
+        b.push_let(
+            ValId(14),
+            ValType::I64,
+            Op::Load {
+                mem: MemId(0),
+                addr: ValId(12),
+                offset: 8,
+                width: MemWidth::B8,
+                signed: false,
+                result_ty: ValType::I64,
+            },
+        );
+        b.push_let(ValId(15), ValType::I64, Op::Bin(BinOp::I64Xor, ValId(13), ValId(14)));
+        b.push_let(ValId(16), ValType::I32, Op::Bin(BinOp::I32Add, ValId(12), ValId(11)));
+        b.push_effect(EffectOp::GlobalSet { id: GlobalId(0), val: ValId(16) });
+        b.push_yield(&[ValId(15)]);
+    });
+
+    // RHS: pure zero-stack implementation (touches neither Global(0) nor Mem(0)).
+    let rhs_clean = Region::build(|b| {
+        b.push_let(ValId(15), ValType::I64, Op::Bin(BinOp::I64Xor, ValId(0), ValId(1)));
+        b.push_yield(&[ValId(15)]);
+    });
+
+    // Mutant 1: spills to stack and FORGETS to restore SP (SP leak).
+    let lhs_sp_leak = Region::build(|b| {
+        b.push_let(ValId(10), ValType::I32, Op::GlobalGet(GlobalId(0)));
+        b.push_let(ValId(11), ValType::I32, Op::ConstI32(16));
+        b.push_let(ValId(12), ValType::I32, Op::Bin(BinOp::I32Sub, ValId(10), ValId(11)));
+        b.push_effect(EffectOp::GlobalSet { id: GlobalId(0), val: ValId(12) });
+        b.push_effect(EffectOp::Store {
+            mem: MemId(0),
+            addr: ValId(12),
+            offset: 0,
+            width: MemWidth::B8,
+            val: ValId(0),
+        });
+        b.push_let(ValId(15), ValType::I64, Op::Bin(BinOp::I64Xor, ValId(0), ValId(1)));
+        b.push_yield(&[ValId(15)]);
+    });
+
+    // Mutant 2: leaks SP without touching memory at all.
+    let lhs_sp_leak_no_mem = Region::build(|b| {
+        b.push_let(ValId(10), ValType::I32, Op::GlobalGet(GlobalId(0)));
+        b.push_let(ValId(11), ValType::I32, Op::ConstI32(16));
+        b.push_let(ValId(12), ValType::I32, Op::Bin(BinOp::I32Sub, ValId(10), ValId(11)));
+        b.push_effect(EffectOp::GlobalSet { id: GlobalId(0), val: ValId(12) });
+        b.push_let(ValId(15), ValType::I64, Op::Bin(BinOp::I64Xor, ValId(0), ValId(1)));
+        b.push_yield(&[ValId(15)]);
+    });
+
+    // Mutant 3: writes live memory at SP_in + offset (restoring SP cleanly).
+    let make_live_write = |offset: u32| {
+        Region::build(|b| {
+            b.push_let(ValId(10), ValType::I32, Op::GlobalGet(GlobalId(0)));
+            b.push_let(ValId(11), ValType::I32, Op::ConstI32(0x5a));
+            b.push_effect(EffectOp::Store {
+                mem: MemId(0),
+                addr: ValId(10),
+                offset,
+                width: MemWidth::B1,
+                val: ValId(11),
+            });
+            b.push_let(ValId(15), ValType::I64, Op::Bin(BinOp::I64Xor, ValId(0), ValId(1)));
+            b.push_yield(&[ValId(15)]);
+        })
+    };
+    let lhs_live_plus8 = make_live_write(8);
+    let lhs_live_plus0 = make_live_write(0);
+
+    let pinned_opts = EquivOptions {
+        stack_refinement: Some(StackRefinement {
+            stack_pointer_global: GlobalId(0),
+            stack_mem: MemId(0),
+            min_stack_bytes: 4096,
+            pin_initial_sp: true,
+        }),
+    };
+    let sym_sp_opts = EquivOptions {
+        stack_refinement: Some(StackRefinement {
+            stack_pointer_global: GlobalId(0),
+            stack_mem: MemId(0),
+            min_stack_bytes: 4096,
+            pin_initial_sp: false,
+        }),
+    };
+
+    with_both_backends(|backend, name| {
+        // Without StackRefinement, dirty dead stack bytes cause Sat!
+        assert!(
+            matches!(
+                backend.check_equivalence(&module, &reg, &lhs_spill, &rhs_clean, None).unwrap(),
+                SmtResult::Sat(_)
+            ),
+            "{name}: spill vs clean must FAIL without StackRefinement"
+        );
+
+        // With StackRefinement (both pinned and symbolic SP_in), spill vs clean is PROVED!
+        assert_eq!(
+            backend
+                .check_equivalence_with_options(
+                    &module,
+                    &reg,
+                    &lhs_spill,
+                    &rhs_clean,
+                    None,
+                    &pinned_opts,
+                )
+                .unwrap(),
+            SmtResult::Unsat,
+            "{name}: spill vs clean must be PROVED with pinned StackRefinement"
+        );
+        assert_eq!(
+            backend
+                .check_equivalence_with_options(
+                    &module,
+                    &reg,
+                    &lhs_spill,
+                    &rhs_clean,
+                    None,
+                    &sym_sp_opts,
+                )
+                .unwrap(),
+            SmtResult::Unsat,
+            "{name}: spill vs clean must be PROVED with symbolic SP_in StackRefinement"
+        );
+
+        // Stack-pointer leak in LHS vs clean RHS -> FALSIFIED!
+        assert!(
+            matches!(
+                backend
+                    .check_equivalence_with_options(
+                        &module,
+                        &reg,
+                        &lhs_sp_leak,
+                        &rhs_clean,
+                        None,
+                        &pinned_opts,
+                    )
+                    .unwrap(),
+                SmtResult::Sat(_)
+            ),
+            "{name}: SP leak in LHS must be FALSIFIED even with StackRefinement"
+        );
+
+        // Identical SP leak in BOTH LHS and RHS -> STILL FALSIFIED!
+        assert!(
+            matches!(
+                backend
+                    .check_equivalence_with_options(
+                        &module,
+                        &reg,
+                        &lhs_sp_leak,
+                        &lhs_sp_leak,
+                        None,
+                        &pinned_opts,
+                    )
+                    .unwrap(),
+                SmtResult::Sat(_)
+            ),
+            "{name}: identical SP leak in both LHS & RHS must still be FALSIFIED"
+        );
+
+        // SP leak with zero memory writes -> STILL FALSIFIED!
+        assert!(
+            matches!(
+                backend
+                    .check_equivalence_with_options(
+                        &module,
+                        &reg,
+                        &lhs_sp_leak_no_mem,
+                        &lhs_sp_leak_no_mem,
+                        None,
+                        &pinned_opts,
+                    )
+                    .unwrap(),
+                SmtResult::Sat(_)
+            ),
+            "{name}: memory-free SP leak must be FALSIFIED"
+        );
+
+        // Live-memory write at SP_in + 8 -> FALSIFIED with witness at 1_048_576 + 8!
+        match backend
+            .check_equivalence_with_options(
+                &module,
+                &reg,
+                &lhs_live_plus8,
+                &rhs_clean,
+                None,
+                &pinned_opts,
+            )
+            .unwrap()
+        {
+            SmtResult::Sat(m) => {
+                let bytes = m
+                    .memory_bytes
+                    .iter()
+                    .find(|(mid, _)| *mid == MemId(0))
+                    .map(|(_, bs)| bs.as_slice())
+                    .unwrap_or(&[]);
+                assert!(
+                    bytes.iter().any(|&(off, _)| off == 1_048_576 + 8),
+                    "{name}: expected live clobber witness at SP_in+8, got {bytes:?}"
+                );
+            }
+            other => panic!("{name}: live write at SP_in+8 must be Sat, got {other:?}"),
+        }
+
+        // Live-memory write at exact boundary SP_in + 0 -> FALSIFIED with witness at 1_048_576!
+        match backend
+            .check_equivalence_with_options(
+                &module,
+                &reg,
+                &lhs_live_plus0,
+                &rhs_clean,
+                None,
+                &pinned_opts,
+            )
+            .unwrap()
+        {
+            SmtResult::Sat(m) => {
+                let bytes = m
+                    .memory_bytes
+                    .iter()
+                    .find(|(mid, _)| *mid == MemId(0))
+                    .map(|(_, bs)| bs.as_slice())
+                    .unwrap_or(&[]);
+                assert!(
+                    bytes.iter().any(|&(off, _)| off == 1_048_576),
+                    "{name}: expected live clobber witness at SP_in+0, got {bytes:?}"
+                );
+            }
+            other => panic!("{name}: live write at SP_in+0 must be Sat, got {other:?}"),
+        }
+    });
+}
+
+#[test]
+fn test_slice_frame_and_stack_refinement_contracts_both_backends() {
+    let module = rustc_wasm_stack_module();
+    let reg = StratumRegistry::new();
+    let sr = StackRefinement::default(); // GlobalId(0), MemId(0), min 4096, pin_initial_sp=true
+
+    // 1. Read-only SliceFrame (len = 0) + StackRefinement:
+    //    - writing below SP_in (and restoring SP) is PROVED
+    //    - leaking SP is FALSIFIED
+    //    - writing at SP_in + 0 is FALSIFIED with exact address in SmtModel.memory_bytes
+    let params1 = [(ValId(0), ValType::I32)];
+    let ro_spill_ok = Region::build(|b| {
+        b.push_let(ValId(10), ValType::I32, Op::GlobalGet(GlobalId(0)));
+        b.push_let(ValId(11), ValType::I32, Op::ConstI32(16));
+        b.push_let(ValId(12), ValType::I32, Op::Bin(BinOp::I32Sub, ValId(10), ValId(11)));
+        b.push_effect(EffectOp::GlobalSet { id: GlobalId(0), val: ValId(12) });
+        b.push_effect(EffectOp::Store {
+            mem: MemId(0),
+            addr: ValId(12),
+            offset: 0,
+            width: MemWidth::B4,
+            val: ValId(0),
+        });
+        b.push_effect(EffectOp::GlobalSet { id: GlobalId(0), val: ValId(10) });
+        b.push_yield(&[ValId(0)]);
+    });
+    let ro_spill_leak = Region::build(|b| {
+        b.push_let(ValId(10), ValType::I32, Op::GlobalGet(GlobalId(0)));
+        b.push_let(ValId(11), ValType::I32, Op::ConstI32(16));
+        b.push_let(ValId(12), ValType::I32, Op::Bin(BinOp::I32Sub, ValId(10), ValId(11)));
+        b.push_effect(EffectOp::GlobalSet { id: GlobalId(0), val: ValId(12) });
+        b.push_effect(EffectOp::Store {
+            mem: MemId(0),
+            addr: ValId(12),
+            offset: 0,
+            width: MemWidth::B4,
+            val: ValId(0),
+        });
+        b.push_yield(&[ValId(0)]);
+    });
+    let ro_clobber_sp0 = Region::build(|b| {
+        b.push_let(ValId(10), ValType::I32, Op::GlobalGet(GlobalId(0)));
+        b.push_let(ValId(11), ValType::I32, Op::ConstI32(0x7f));
+        b.push_effect(EffectOp::Store {
+            mem: MemId(0),
+            addr: ValId(10),
+            offset: 0,
+            width: MemWidth::B1,
+            val: ValId(11),
+        });
+        b.push_yield(&[ValId(0)]);
+    });
+    let ro_frame = SliceFrameSpec {
+        mem: MemId(0),
+        base: SliceBoundExpr::Const(0),
+        len: SliceBoundExpr::Const(0),
+    };
+
+    // 2. Writable slice writer [base, base + len) with Param bounds:
+    //    params: (base: ValId(0), len: ValId(1), val: ValId(2): I64)
+    let params_slice =
+        [(ValId(0), ValType::I32), (ValId(1), ValType::I32), (ValId(2), ValType::I64)];
+    // req: base >=u 1_048_576 + 64 && len == 8 && base <=u 1_048_576 + 32768
+    let req_slice = Region::build(|b| {
+        b.push_let(ValId(10), ValType::I32, Op::ConstI32(1_048_576 + 64));
+        b.push_let(ValId(11), ValType::I32, Op::Bin(BinOp::I32GeU, ValId(0), ValId(10)));
+        b.push_let(ValId(12), ValType::I32, Op::ConstI32(8));
+        b.push_let(ValId(13), ValType::I32, Op::Bin(BinOp::I32Eq, ValId(1), ValId(12)));
+        b.push_let(ValId(14), ValType::I32, Op::ConstI32(1_048_576 + 32768));
+        b.push_let(ValId(15), ValType::I32, Op::Bin(BinOp::I32LeU, ValId(0), ValId(14)));
+        b.push_let(ValId(16), ValType::I32, Op::Bin(BinOp::I32And, ValId(11), ValId(13)));
+        b.push_let(ValId(17), ValType::I32, Op::Bin(BinOp::I32And, ValId(16), ValId(15)));
+        b.push_yield(&[ValId(17)]);
+    });
+    let slice_frame = SliceFrameSpec {
+        mem: MemId(0),
+        base: SliceBoundExpr::Param(ValId(0)),
+        len: SliceBoundExpr::Param(ValId(1)),
+    };
+
+    // Valid writer: spills to [SP-16..SP-8), copies to [base..base+8) via MemoryCopy, restores SP.
+    let writer_ok = Region::build(|b| {
+        b.push_let(ValId(20), ValType::I32, Op::GlobalGet(GlobalId(0)));
+        b.push_let(ValId(21), ValType::I32, Op::ConstI32(16));
+        b.push_let(ValId(22), ValType::I32, Op::Bin(BinOp::I32Sub, ValId(20), ValId(21)));
+        b.push_effect(EffectOp::GlobalSet { id: GlobalId(0), val: ValId(22) });
+        b.push_effect(EffectOp::Store {
+            mem: MemId(0),
+            addr: ValId(22),
+            offset: 0,
+            width: MemWidth::B8,
+            val: ValId(2),
+        });
+        b.push_effect(EffectOp::MemoryCopy {
+            dst_mem: MemId(0),
+            src_mem: MemId(0),
+            dst: ValId(0),
+            src: ValId(22),
+            len: ValId(1),
+        });
+        b.push_effect(EffectOp::GlobalSet { id: GlobalId(0), val: ValId(20) });
+    });
+
+    // Overrun mutant: writes 8 bytes at [base..base+8) AND 1 extra byte at base + 8 (write-only!).
+    let writer_overrun = Region::build(|b| {
+        b.push_effect(EffectOp::Store {
+            mem: MemId(0),
+            addr: ValId(0),
+            offset: 0,
+            width: MemWidth::B8,
+            val: ValId(2),
+        });
+        b.push_let(ValId(20), ValType::I32, Op::ConstI32(0xAA));
+        b.push_effect(EffectOp::Store {
+            mem: MemId(0),
+            addr: ValId(0),
+            offset: 8,
+            width: MemWidth::B1,
+            val: ValId(20),
+        });
+    });
+
+    // Underflow mutant: writes 1 byte at base - 1.
+    let writer_underflow = Region::build(|b| {
+        b.push_let(ValId(20), ValType::I32, Op::ConstI32(1));
+        b.push_let(ValId(21), ValType::I32, Op::Bin(BinOp::I32Sub, ValId(0), ValId(20)));
+        b.push_let(ValId(22), ValType::I32, Op::ConstI32(0xBB));
+        b.push_effect(EffectOp::Store {
+            mem: MemId(0),
+            addr: ValId(21),
+            offset: 0,
+            width: MemWidth::B1,
+            val: ValId(22),
+        });
+    });
+
+    // MemoryGrow mutant: grows MemId(0) by 1 page.
+    let writer_grow = Region::build(|b| {
+        b.push_let(ValId(20), ValType::I32, Op::ConstI32(1));
+        b.push_let(ValId(21), ValType::I32, Op::MemoryGrow { mem: MemId(0), delta: ValId(20) });
+    });
+
+    // 3. 64-bit non-wrapping check: base = 0xFFFF_FFFC, len = 8 -> write at addr 0 MUST be FALSIFIED!
+    let small_mod = mod_with_mems(&[(0, 1, Some(1))]);
+    let write_addr_zero = Region::build(|b| {
+        b.push_let(ValId(10), ValType::I32, Op::ConstI32(0));
+        b.push_let(ValId(11), ValType::I32, Op::ConstI32(0x42));
+        b.push_effect(EffectOp::Store {
+            mem: MemId(0),
+            addr: ValId(10),
+            offset: 0,
+            width: MemWidth::B1,
+            val: ValId(11),
+        });
+    });
+    let wrap_frame = SliceFrameSpec {
+        mem: MemId(0),
+        base: SliceBoundExpr::Const(0xFFFF_FFFC),
+        len: SliceBoundExpr::Const(8),
+    };
+
+    // 4. UF CEGAR + SliceFrame + StackRefinement combined:
+    let mut reg_uf = StratumRegistry::new();
+    let fmix64_body = Region::build(|b| {
+        b.push_let(ValId(1), ValType::I64, Op::ConstI64(33));
+        b.push_let(ValId(2), ValType::I64, Op::Bin(BinOp::I64ShrU, ValId(0), ValId(1)));
+        b.push_let(ValId(3), ValType::I64, Op::Bin(BinOp::I64Xor, ValId(0), ValId(2)));
+        b.push_let(
+            ValId(4),
+            ValType::I64,
+            Op::ConstI64(0xff51_afd7_ed55_8ccd_u64 as i64),
+        );
+        b.push_let(ValId(5), ValType::I64, Op::Bin(BinOp::I64Mul, ValId(3), ValId(4)));
+        b.push_let(ValId(6), ValType::I64, Op::Bin(BinOp::I64ShrU, ValId(5), ValId(1)));
+        b.push_let(ValId(7), ValType::I64, Op::Bin(BinOp::I64Xor, ValId(5), ValId(6)));
+        b.push_let(
+            ValId(8),
+            ValType::I64,
+            Op::ConstI64(0xc4ce_b9fe_1a85_ec53_u64 as i64),
+        );
+        b.push_let(ValId(9), ValType::I64, Op::Bin(BinOp::I64Mul, ValId(7), ValId(8)));
+        b.push_yield(&[ValId(9)]);
+    });
+    reg_uf
+        .register_candidate_op(StratumOp {
+            id: StratumId(88),
+            name: "fmix64_sf".into(),
+            layer: 1,
+            params: vec![(ValId(0), ValType::I64)],
+            results: vec![ValType::I64],
+            body: fmix64_body,
+            docstring: "pure mixer for SliceFrame UF CEGAR test".into(),
+        })
+        .unwrap();
+    let uf_writer_ok = Region::build(|b| {
+        b.push_call(&[(ValId(30), ValType::I64)], CallTarget::Stratum(StratumId(88)), &[ValId(2)]);
+        b.push_call(&[(ValId(31), ValType::I64)], CallTarget::Stratum(StratumId(88)), &[ValId(30)]);
+        b.push_effect(EffectOp::Store {
+            mem: MemId(0),
+            addr: ValId(0),
+            offset: 0,
+            width: MemWidth::B8,
+            val: ValId(31),
+        });
+        b.push_yield(&[ValId(31)]);
+    });
+    let uf_ensures = Region::build(|b| {
+        b.push_call(&[(ValId(30), ValType::I64)], CallTarget::Stratum(StratumId(88)), &[ValId(2)]);
+        b.push_call(&[(ValId(31), ValType::I64)], CallTarget::Stratum(StratumId(88)), &[ValId(30)]);
+        b.push_let(ValId(32), ValType::I32, Op::Bin(BinOp::I64Eq, ValId(3), ValId(31)));
+        b.push_yield(&[ValId(32)]);
+    });
+
+    with_both_backends(|backend, name| {
+        // Read-only + spill ok -> UNSAT
+        let s_ro_ok = ContractSpec::new(&params1, &[ValType::I32], &ro_spill_ok)
+            .with_stack_refinement(sr)
+            .with_slice_frame(ro_frame);
+        assert_eq!(
+            backend.check_contract(&module, &reg, &s_ro_ok).unwrap(),
+            SmtResult::Unsat,
+            "{name}: read-only SliceFrame with balanced stack spill must be UNSAT"
+        );
+
+        // Read-only + SP leak -> SAT
+        let s_ro_leak = ContractSpec::new(&params1, &[ValType::I32], &ro_spill_leak)
+            .with_stack_refinement(sr)
+            .with_slice_frame(ro_frame);
+        assert!(
+            matches!(backend.check_contract(&module, &reg, &s_ro_leak).unwrap(), SmtResult::Sat(_)),
+            "{name}: SP leak in check_contract must be SAT"
+        );
+
+        // Read-only + write at SP_in + 0 -> SAT with 1_048_576 in memory_bytes
+        let s_ro_clobber = ContractSpec::new(&params1, &[ValType::I32], &ro_clobber_sp0)
+            .with_stack_refinement(sr)
+            .with_slice_frame(ro_frame);
+        match backend.check_contract(&module, &reg, &s_ro_clobber).unwrap() {
+            SmtResult::Sat(m) => {
+                let bytes = m
+                    .memory_bytes
+                    .iter()
+                    .find(|(mid, _)| *mid == MemId(0))
+                    .map(|(_, bs)| bs.as_slice())
+                    .unwrap_or(&[]);
+                assert!(
+                    bytes.iter().any(|&(off, _)| off == 1_048_576),
+                    "{name}: read-only clobber at SP_in+0 must extract 1_048_576, got {bytes:?}"
+                );
+            }
+            other => panic!("{name}: read-only clobber at SP_in+0 must be Sat, got {other:?}"),
+        }
+
+        // Valid slice writer (with spill + MemoryCopy) -> UNSAT
+        let s_ok = ContractSpec::new(&params_slice, &[], &writer_ok)
+            .with_requires(&req_slice)
+            .with_stack_refinement(sr)
+            .with_slice_frame(slice_frame);
+        assert_eq!(
+            backend.check_contract(&module, &reg, &s_ok).unwrap(),
+            SmtResult::Unsat,
+            "{name}: in-bounds slice writer with stack spill must be UNSAT"
+        );
+
+        // 1-byte overrun at base + len -> SAT with exact clobbered address in memory_bytes!
+        let s_over = ContractSpec::new(&params_slice, &[], &writer_overrun)
+            .with_requires(&req_slice)
+            .with_stack_refinement(sr)
+            .with_slice_frame(slice_frame);
+        match backend.check_contract(&module, &reg, &s_over).unwrap() {
+            SmtResult::Sat(m) => {
+                let base_val = m
+                    .scalar_values
+                    .iter()
+                    .find(|(id, _)| *id == ValId(0))
+                    .unwrap()
+                    .1
+                    .as_u32()
+                    .unwrap();
+                let bytes = m
+                    .memory_bytes
+                    .iter()
+                    .find(|(mid, _)| *mid == MemId(0))
+                    .map(|(_, bs)| bs.as_slice())
+                    .unwrap_or(&[]);
+                assert!(
+                    bytes.iter().any(|&(off, _)| off == base_val + 8),
+                    "{name}: expected clobber witness at base+8 ({}), got {bytes:?}",
+                    base_val + 8
+                );
+            }
+            other => panic!("{name}: 1-byte slice overrun must be Sat, got {other:?}"),
+        }
+
+        // 1-byte underflow at base - 1 -> SAT with exact clobbered address in memory_bytes!
+        let s_under = ContractSpec::new(&params_slice, &[], &writer_underflow)
+            .with_requires(&req_slice)
+            .with_stack_refinement(sr)
+            .with_slice_frame(slice_frame);
+        match backend.check_contract(&module, &reg, &s_under).unwrap() {
+            SmtResult::Sat(m) => {
+                let base_val = m
+                    .scalar_values
+                    .iter()
+                    .find(|(id, _)| *id == ValId(0))
+                    .unwrap()
+                    .1
+                    .as_u32()
+                    .unwrap();
+                let bytes = m
+                    .memory_bytes
+                    .iter()
+                    .find(|(mid, _)| *mid == MemId(0))
+                    .map(|(_, bs)| bs.as_slice())
+                    .unwrap_or(&[]);
+                assert!(
+                    bytes.iter().any(|&(off, _)| off == base_val - 1),
+                    "{name}: expected clobber witness at base-1 ({}), got {bytes:?}",
+                    base_val - 1
+                );
+            }
+            other => panic!("{name}: 1-byte slice underflow must be Sat, got {other:?}"),
+        }
+
+        // MemoryGrow -> SAT!
+        let s_grow = ContractSpec::new(&params_slice, &[], &writer_grow)
+            .with_requires(&req_slice)
+            .with_stack_refinement(sr)
+            .with_slice_frame(slice_frame);
+        assert!(
+            matches!(backend.check_contract(&module, &reg, &s_grow).unwrap(), SmtResult::Sat(_)),
+            "{name}: MemoryGrow must violate SliceFrame"
+        );
+
+        // 64-bit non-wrapping check: base=0xFFFF_FFFC, len=8, writing addr 0 -> SAT with addr 0!
+        let s_wrap = ContractSpec::new(&[], &[], &write_addr_zero).with_slice_frame(wrap_frame);
+        match backend.check_contract(&small_mod, &reg, &s_wrap).unwrap() {
+            SmtResult::Sat(m) => {
+                let bytes = m
+                    .memory_bytes
+                    .iter()
+                    .find(|(mid, _)| *mid == MemId(0))
+                    .map(|(_, bs)| bs.as_slice())
+                    .unwrap_or(&[]);
+                assert!(
+                    bytes.iter().any(|&(off, _)| off == 0),
+                    "{name}: non-wrapping SliceFrame must catch write at addr 0, got {bytes:?}"
+                );
+            }
+            other => panic!("{name}: 32-bit wraparound write at 0 must be Sat, got {other:?}"),
+        }
+
+        // UF CEGAR + SliceFrame + StackRefinement -> UNSAT!
+        let s_uf = ContractSpec::new(&params_slice, &[ValType::I64], &uf_writer_ok)
+            .with_requires(&req_slice)
+            .with_ensures(&uf_ensures)
+            .with_stack_refinement(sr)
+            .with_slice_frame(slice_frame);
+        assert_eq!(
+            backend.check_contract(&module, &reg_uf, &s_uf).unwrap(),
+            SmtResult::Unsat,
+            "{name}: UF CEGAR + SliceFrame + StackRefinement must prove UNSAT"
+        );
+
+        // Validation errors: bad param type (I64), unknown memory, impossible min_stack_bytes.
+        let bad_param_sf = ContractSpec::new(&params_slice, &[], &writer_ok).with_slice_frame(
+            SliceFrameSpec {
+                mem: MemId(0),
+                base: SliceBoundExpr::Param(ValId(2)), // I64!
+                len: SliceBoundExpr::Const(8),
+            },
+        );
+        assert!(
+            matches!(
+                backend.check_contract(&module, &reg, &bad_param_sf),
+                Err(SieveError::EncodingError(_))
+            ),
+            "{name}: I64 SliceFrame param must return EncodingError"
+        );
+
+        let bad_mem_sf = ContractSpec::new(&params_slice, &[], &writer_ok).with_slice_frame(
+            SliceFrameSpec {
+                mem: MemId(9),
+                base: SliceBoundExpr::Const(0),
+                len: SliceBoundExpr::Const(8),
+            },
+        );
+        assert!(
+            matches!(
+                backend.check_contract(&module, &reg, &bad_mem_sf),
+                Err(SieveError::EncodingError(_))
+            ),
+            "{name}: unknown MemId in SliceFrame must return EncodingError"
+        );
+
+        let impossible_sr = StackRefinement {
+            stack_pointer_global: GlobalId(0),
+            stack_mem: MemId(0),
+            min_stack_bytes: 2 * 65536, // > 1 page max_pages!
+            pin_initial_sp: false,
+        };
+        let mut small_with_sp = small_mod.clone();
+        small_with_sp.globals.push(GlobalDef {
+            id: GlobalId(0),
+            ty: ValType::I32,
+            mutable: true,
+            init: Val::I32(4096),
+        });
+        let bad_sr_spec =
+            ContractSpec::new(&[], &[], &write_addr_zero).with_stack_refinement(impossible_sr);
+        assert!(
+            matches!(
+                backend.check_contract(&small_with_sp, &reg, &bad_sr_spec),
+                Err(SieveError::EncodingError(_))
+            ),
+            "{name}: impossible min_stack_bytes > max_pages must return EncodingError"
+        );
+    });
+}
+
+#[test]
+fn test_static_smt_cliff_estimator() {
+    let mut reg = StratumRegistry::new();
+
+    // 1. Simple straight-line arithmetic & store -> CliffLevel::Low, no warnings.
+    let simple = Region::build(|b| {
+        b.push_let(ValId(1), ValType::I32, Op::ConstI32(16));
+        b.push_let(ValId(2), ValType::I32, Op::Bin(BinOp::I32Add, ValId(0), ValId(1)));
+        b.push_effect(EffectOp::Store {
+            mem: MemId(0),
+            addr: ValId(1),
+            offset: 0,
+            width: MemWidth::B4,
+            val: ValId(2),
+        });
+        b.push_yield(&[ValId(2)]);
+    });
+    let m_simple = estimate_region_cliff(&simple, &reg);
+    assert_eq!(m_simple.level, CliffLevel::Low);
+    assert_eq!(m_simple.nonlinear_ops, 0);
+    assert_eq!(m_simple.conditional_mem_stores, 0);
+    assert_eq!(m_simple.mem_stores, 1);
+    assert!(m_simple.warnings.is_empty());
+
+    // 2. Deep 64-bit nonlinear chain (4 chained i64 muls separated by xors/shifts) -> High!
+    let deep_mul64 = Region::build(|b| {
+        let mut cur = ValId(0);
+        let mut next = 10u32;
+        b.push_let(ValId(1), ValType::I64, Op::ConstI64(33));
+        b.push_let(ValId(2), ValType::I64, Op::ConstI64(0xff51_afd7_ed55_8ccd_u64 as i64));
+        for _ in 0..4 {
+            let shifted = ValId(next);
+            let xored = ValId(next + 1);
+            let muled = ValId(next + 2);
+            next += 3;
+            b.push_let(shifted, ValType::I64, Op::Bin(BinOp::I64ShrU, cur, ValId(1)));
+            b.push_let(xored, ValType::I64, Op::Bin(BinOp::I64Xor, cur, shifted));
+            b.push_let(muled, ValType::I64, Op::Bin(BinOp::I64Mul, xored, ValId(2)));
+            cur = muled;
+        }
+        b.push_yield(&[cur]);
+    });
+    let m_mul = estimate_region_cliff(&deep_mul64, &reg);
+    assert_eq!(m_mul.level, CliffLevel::High);
+    assert_eq!(m_mul.nonlinear64_ops, 4);
+    assert_eq!(m_mul.max_nonlinear64_chain_depth, 4);
+    assert!(
+        m_mul.warnings.iter().any(|w| w.contains("64-bit nonlinear") && w.contains("Stratum")),
+        "expected Stratum extraction warning, got {:?}",
+        m_mul.warnings
+    );
+
+    // 3. Extracting the pure mixer into a Stratum drops the caller back to CliffLevel::Low!
+    reg.register_candidate_op(StratumOp {
+        id: StratumId(91),
+        name: "mix_round".into(),
+        layer: 1,
+        params: vec![(ValId(0), ValType::I64)],
+        results: vec![ValType::I64],
+        body: deep_mul64.clone(),
+        docstring: "pure mixer stratum".into(),
+    })
+    .unwrap();
+    let stratified_caller = Region::build(|b| {
+        b.push_call(&[(ValId(10), ValType::I64)], CallTarget::Stratum(StratumId(91)), &[ValId(0)]);
+        b.push_call(&[(ValId(11), ValType::I64)], CallTarget::Stratum(StratumId(91)), &[ValId(10)]);
+        b.push_yield(&[ValId(11)]);
+    });
+    let m_strat = estimate_region_cliff(&stratified_caller, &reg);
+    assert_eq!(m_strat.level, CliffLevel::Low);
+    assert_eq!(m_strat.stratum_calls, 2);
+    assert_eq!(m_strat.nonlinear64_ops, 0);
+
+    // 4. Conditional memory stores inside IfElse (S3.3 ite-over-mem0 pattern) -> High!
+    let cond_stores = {
+        let mut rb = RegionBuilder::new();
+        let then_id = rb.embed_region_id(&Region::build(|b| {
+            b.push_let(ValId(10), ValType::I32, Op::ConstI32(1));
+            for off in [0u32, 4, 8, 12] {
+                b.push_effect(EffectOp::Store {
+                    mem: MemId(0),
+                    addr: ValId(0),
+                    offset: off,
+                    width: MemWidth::B4,
+                    val: ValId(10),
+                });
+            }
+        }));
+        let else_id = rb.embed_region_id(&Region::build(|_| {}));
+        let if_node = rb.alloc_node(RegionNode::IfElse {
+            cond: ValId(0),
+            then_region: then_id,
+            else_region: else_id,
+            results: gnomon_kernel::Span::EMPTY,
+        });
+        rb.push_subregion_id(&[], if_node);
+        rb.finish()
+    };
+    let m_cond = estimate_region_cliff(&cond_stores, &reg);
+    assert_eq!(m_cond.level, CliffLevel::High);
+    assert_eq!(m_cond.conditional_mem_stores, 4);
+    assert!(
+        m_cond.warnings.iter().any(|w| w.contains("conditional memory stores")),
+        "expected conditional memory stores warning, got {:?}",
+        m_cond.warnings
+    );
+
+    // 5. Unbounded InvariantLoop -> High with has_unbounded_loop == true!
+    let inv_loop = {
+        let mut rb = RegionBuilder::new();
+        let cond_id = rb.embed_region_id(&Region::build(|b| {
+            b.push_let(ValId(2), ValType::I32, Op::ConstI32(0));
+            b.push_yield(&[ValId(2)]);
+        }));
+        let inv_id = rb.embed_region_id(&Region::build(|b| {
+            b.push_let(ValId(2), ValType::I32, Op::ConstI32(1));
+            b.push_yield(&[ValId(2)]);
+        }));
+        let fuel_id = rb.embed_region_id(&Region::build(|b| {
+            b.push_yield(&[ValId(10)]);
+        }));
+        let body_id = rb.embed_region_id(&Region::build(|b| {
+            b.push_yield(&[ValId(10)]);
+        }));
+        let init_vars = rb.alloc_vals(&[ValId(0)]);
+        let state_vars = rb.alloc_vars(&[(ValId(10), ValType::I32)]);
+        let loop_node = rb.alloc_node(RegionNode::InvariantLoop {
+            init_vars,
+            state_vars,
+            cond: cond_id,
+            invariant_pred: inv_id,
+            fuel_measure: fuel_id,
+            body: body_id,
+        });
+        rb.push_subregion_id(&[(ValId(3), ValType::I32)], loop_node);
+        rb.push_yield(&[ValId(3)]);
+        rb.finish()
+    };
+    let m_inv = estimate_region_cliff(&inv_loop, &reg);
+    assert_eq!(m_inv.level, CliffLevel::High);
+    assert!(m_inv.has_unbounded_loop);
+    assert_eq!(m_inv.invariant_loops, 1);
+
+    // 6. Module-level `estimate_smt_cliff` aggregates across functions and prefixes warnings.
+    let module = Module {
+        funcs: vec![
+            FuncDef {
+                id: FuncId(0),
+                name: "simple_fn".into(),
+                export_name: Some("simple_fn".into()),
+                params: vec![(ValId(0), ValType::I32)],
+                results: vec![ValType::I32],
+                body: simple,
+            },
+            FuncDef {
+                id: FuncId(1),
+                name: "hot_mixer".into(),
+                export_name: Some("hot_mixer".into()),
+                params: vec![(ValId(0), ValType::I64)],
+                results: vec![ValType::I64],
+                body: deep_mul64,
+            },
+            FuncDef {
+                id: FuncId(2),
+                name: "branchy_writer".into(),
+                export_name: None,
+                params: vec![(ValId(0), ValType::I32)],
+                results: vec![],
+                body: cond_stores,
+            },
+        ],
+        ..Module::default()
+    };
+    let report = estimate_smt_cliff(&module, &reg);
+    assert_eq!(report.level, CliffLevel::High);
+    assert_eq!(report.functions.len(), 3);
+    assert_eq!(report.functions[0].metrics.level, CliffLevel::Low);
+    assert_eq!(report.functions[1].metrics.level, CliffLevel::High);
+    assert_eq!(report.functions[2].metrics.level, CliffLevel::High);
+    assert_eq!(report.total_nonlinear64_ops, 4);
+    assert_eq!(report.total_conditional_mem_stores, 4);
+    assert!(report.warnings.iter().any(|w| w.starts_with("[fn hot_mixer]")));
+    assert!(report.warnings.iter().any(|w| w.starts_with("[fn branchy_writer]")));
+}
+
+#[test]
+fn test_eqsat_memory_grow_followed_by_store_and_load_no_shadowing() {
+    let module = mod_with_mems(&[(0, 1, Some(4))]);
+    let reg = StratumRegistry::new();
+
+    // Regression for Bug 1 (eqsat.rs): Op::MemoryGrow pre-incremented `heap_seq`, causing
+    // `$hN` shadowing errors on any subsequent heap-mutating effect (Store/MemoryCopy/MemoryFill)
+    // and risking OpaqueHeap ID collisions when interleaved with MemoryCopy/MemoryFill.
+    let region = Region::build(|b| {
+        b.push_let(ValId(1), ValType::I32, Op::ConstI32(1));
+        b.push_let(
+            ValId(2),
+            ValType::I32,
+            Op::MemoryGrow { mem: MemId(0), delta: ValId(1) },
+        );
+        b.push_let(ValId(3), ValType::I32, Op::ConstI32(0));
+        b.push_let(ValId(4), ValType::I32, Op::ConstI32(0x1234_5678));
+        b.push_effect(EffectOp::Store {
+            mem: MemId(0),
+            addr: ValId(3),
+            offset: 0,
+            width: MemWidth::B4,
+            val: ValId(4),
+        });
+        b.push_let(
+            ValId(5),
+            ValType::I32,
+            Op::Load {
+                mem: MemId(0),
+                addr: ValId(3),
+                offset: 0,
+                width: MemWidth::B4,
+                signed: false,
+                result_ty: ValType::I32,
+            },
+        );
+        // Interleave MemoryCopy + MemoryGrow + MemoryFill + Load to ensure every heap_seq site
+        // allocates distinct `$hN` bindings and distinct `OpaqueHeap` IDs.
+        b.push_let(ValId(6), ValType::I32, Op::ConstI32(4));
+        b.push_effect(EffectOp::MemoryCopy {
+            dst_mem: MemId(0),
+            src_mem: MemId(0),
+            dst: ValId(6),
+            src: ValId(3),
+            len: ValId(6),
+        });
+        b.push_let(
+            ValId(7),
+            ValType::I32,
+            Op::MemoryGrow { mem: MemId(0), delta: ValId(1) },
+        );
+        b.push_effect(EffectOp::MemoryFill {
+            mem: MemId(0),
+            dst: ValId(6),
+            val: ValId(1),
+            len: ValId(6),
+        });
+        b.push_let(
+            ValId(8),
+            ValType::I32,
+            Op::Load {
+                mem: MemId(0),
+                addr: ValId(6),
+                offset: 0,
+                width: MemWidth::B4,
+                signed: false,
+                result_ty: ValType::I32,
+            },
+        );
+        b.push_let(ValId(9), ValType::I32, Op::Bin(BinOp::I32Add, ValId(5), ValId(8)));
+        b.push_let(ValId(10), ValType::I32, Op::Bin(BinOp::I32Add, ValId(9), ValId(2)));
+        b.push_let(ValId(11), ValType::I32, Op::Bin(BinOp::I32Add, ValId(10), ValId(7)));
+        b.push_yield(&[ValId(11)]);
+    });
+
+    let simplifier = EgglogSimplifier::new(EqSatConfig::default());
+    let (simplified, _report) = simplifier
+        .simplify_region(&region, &reg)
+        .expect("MemoryGrow followed by Store/Load/MemoryCopy/MemoryFill must not shadow $hN");
+
+    let mut native = BitwuzlaNativeBackend::with_time_limit_ms(5_000);
+    let eq = native
+        .check_equivalence(&module, &reg, &region, &simplified, None)
+        .expect("equivalence check after MemoryGrow eqsat");
+    assert_eq!(eq, SmtResult::Unsat, "simplified MemoryGrow region must remain equivalent");
+
+    // Verify MemoryCopy followed by MemoryGrow does NOT equate their OpaqueHeap states in egglog:
+    // Load(0) after MemoryCopy vs Load(0) after MemoryGrow must NOT collapse across the MemoryGrow
+    // if another effect mutates memory between them; here check Load after Store+MemoryGrow+Store.
+    let distinct_heaps = Region::build(|b| {
+        b.push_let(ValId(1), ValType::I32, Op::ConstI32(0));
+        b.push_let(ValId(2), ValType::I32, Op::ConstI32(4));
+        b.push_effect(EffectOp::MemoryCopy {
+            dst_mem: MemId(0),
+            src_mem: MemId(0),
+            dst: ValId(1),
+            src: ValId(2),
+            len: ValId(2),
+        });
+        b.push_let(
+            ValId(3),
+            ValType::I32,
+            Op::Load {
+                mem: MemId(0),
+                addr: ValId(1),
+                offset: 0,
+                width: MemWidth::B4,
+                signed: false,
+                result_ty: ValType::I32,
+            },
+        );
+        b.push_let(ValId(4), ValType::I32, Op::ConstI32(1));
+        b.push_let(
+            ValId(5),
+            ValType::I32,
+            Op::MemoryGrow { mem: MemId(0), delta: ValId(4) },
+        );
+        b.push_let(
+            ValId(6),
+            ValType::I32,
+            Op::Load {
+                mem: MemId(0),
+                addr: ValId(1),
+                offset: 0,
+                width: MemWidth::B4,
+                signed: false,
+                result_ty: ValType::I32,
+            },
+        );
+        b.push_let(ValId(7), ValType::I32, Op::Bin(BinOp::I32Xor, ValId(3), ValId(6)));
+        b.push_let(ValId(8), ValType::I32, Op::Bin(BinOp::I32Add, ValId(7), ValId(5)));
+        b.push_yield(&[ValId(8)]);
+    });
+    let (simp_distinct, _) = simplifier
+        .simplify_region(&distinct_heaps, &reg)
+        .expect("MemoryCopy followed by MemoryGrow must not shadow or collide");
+    let eq2 = native
+        .check_equivalence(&module, &reg, &distinct_heaps, &simp_distinct, None)
+        .expect("equivalence check for MemoryCopy+MemoryGrow");
+    assert_eq!(eq2, SmtResult::Unsat);
+}
+
+#[test]
+fn test_smt_binary_mutual_recursion_budget_caps_without_hang() {
+    use std::time::Instant;
+
+    // Regression for Bug 2 (smt_ir.rs): binary mutual recursion
+    //   func 0(x): if x != 0 { return func 1(x) + func 1(x) } else { return 0 }
+    //   func 1(x): return func 0(x)
+    // Previously expanded up to 2^32 symbolic call frames while depth < MAX_CALL_DEPTH (64),
+    // hanging indefinitely before Bitwuzla's check_sat() timeout could ever run.
+    let f0_body = {
+        let mut rb = RegionBuilder::new();
+        let then_id = rb.embed_region_id(&Region::build(|b| {
+            b.push_call(&[(ValId(1), ValType::I32)], CallTarget::Func(FuncId(1)), &[ValId(0)]);
+            b.push_call(&[(ValId(2), ValType::I32)], CallTarget::Func(FuncId(1)), &[ValId(0)]);
+            b.push_let(ValId(3), ValType::I32, Op::Bin(BinOp::I32Add, ValId(1), ValId(2)));
+            b.push_yield(&[ValId(3)]);
+        }));
+        let else_id = rb.embed_region_id(&Region::build(|b| {
+            b.push_let(ValId(4), ValType::I32, Op::ConstI32(0));
+            b.push_yield(&[ValId(4)]);
+        }));
+        let res_tys = rb.alloc_tys(&[ValType::I32]);
+        let if_node = rb.alloc_node(RegionNode::IfElse {
+            cond: ValId(0),
+            then_region: then_id,
+            else_region: else_id,
+            results: res_tys,
+        });
+        rb.push_subregion_id(&[(ValId(5), ValType::I32)], if_node);
+        rb.push_yield(&[ValId(5)]);
+        rb.finish()
+    };
+    let f1_body = Region::build(|b| {
+        b.push_call(&[(ValId(1), ValType::I32)], CallTarget::Func(FuncId(0)), &[ValId(0)]);
+        b.push_yield(&[ValId(1)]);
+    });
+
+    let module = Module {
+        funcs: vec![
+            FuncDef {
+                id: FuncId(0),
+                name: "f0".into(),
+                export_name: Some("f0".into()),
+                params: vec![(ValId(0), ValType::I32)],
+                results: vec![ValType::I32],
+                body: f0_body.clone(),
+            },
+            FuncDef {
+                id: FuncId(1),
+                name: "f1".into(),
+                export_name: None,
+                params: vec![(ValId(0), ValType::I32)],
+                results: vec![ValType::I32],
+                body: f1_body,
+            },
+        ],
+        ..Module::default()
+    };
+    let reg = StratumRegistry::new();
+
+    with_both_backends(|backend, name| {
+        let t0 = Instant::now();
+        let res = backend
+            .check_equivalence(&module, &reg, &f0_body, &f0_body, None)
+            .expect("binary mutual recursion equivalence must not error");
+        let elapsed_ms = t0.elapsed().as_millis();
+        assert!(
+            matches!(res, SmtResult::Unknown(ref msg) if msg.contains("budget")),
+            "[{name}] expected Unknown(budget) for binary mutual recursion, got {res:?}"
+        );
+        assert!(
+            elapsed_ms < 200,
+            "[{name}] binary mutual recursion took {elapsed_ms} ms (must be < 200 ms)"
+        );
+
+        // Case A contract check (`check_trap_free: true`): the leftmost spine of `f0(x)` reaches
+        // `MAX_CALL_DEPTH` before the call budget expires, so `x != 0` genuinely traps `OutOfFuel`
+        // without hitting the truncated path — Bitwuzla must still find that real counterexample
+        // cleanly and quickly (< 200 ms).
+        let t1 = Instant::now();
+        let spec_a = ContractSpec {
+            entry: &f0_body,
+            params: &[(ValId(0), ValType::I32)],
+            results: &[ValType::I32],
+            requires: None,
+            requires_params: None,
+            ensures: None,
+            ensures_params: None,
+            invariant: None,
+            check_trap_free: true,
+            use_initial_state: false,
+            stack_refinement: None,
+            slice_frame: None,
+        };
+        let cres_a = backend
+            .check_contract(&module, &reg, &spec_a)
+            .expect("binary mutual recursion contract must not error");
+        let ca_elapsed_ms = t1.elapsed().as_millis();
+        assert!(
+            matches!(cres_a, SmtResult::Sat(_)),
+            "[{name}] expected Sat (real OutOfFuel counterexample for x != 0), got {cres_a:?}"
+        );
+        assert!(
+            ca_elapsed_ms < 200,
+            "[{name}] binary mutual recursion contract A took {ca_elapsed_ms} ms (must be < 200 ms)"
+        );
+    });
+
+    // Case B: trap-free bounded-depth binary mutual recursion (max depth 38 < MAX_CALL_DEPTH 64,
+    // but 2^19 reachable call frames):
+    //   g0(x): if x >u 0 && x <u 20 { g1(x - 1) + g1(x - 1) } else { 0 }
+    //   g1(x): g0(x)
+    // Must soundly return `Ok(SmtResult::Unknown(budget))` on BOTH `check_equivalence` and
+    // `check_contract` in < 200 ms (never `Unsat`, never `Sat`, never hangs).
+    let g0_body = {
+        let mut rb = RegionBuilder::new();
+        rb.push_let(ValId(10), ValType::I32, Op::ConstI32(0));
+        rb.push_let(ValId(11), ValType::I32, Op::ConstI32(20));
+        rb.push_let(ValId(12), ValType::I32, Op::Bin(BinOp::I32GtU, ValId(0), ValId(10)));
+        rb.push_let(ValId(13), ValType::I32, Op::Bin(BinOp::I32LtU, ValId(0), ValId(11)));
+        rb.push_let(ValId(14), ValType::I32, Op::Bin(BinOp::I32And, ValId(12), ValId(13)));
+        let then_id = rb.embed_region_id(&Region::build(|b| {
+            b.push_let(ValId(1), ValType::I32, Op::ConstI32(1));
+            b.push_let(ValId(2), ValType::I32, Op::Bin(BinOp::I32Sub, ValId(0), ValId(1)));
+            b.push_call(&[(ValId(3), ValType::I32)], CallTarget::Func(FuncId(1)), &[ValId(2)]);
+            b.push_call(&[(ValId(4), ValType::I32)], CallTarget::Func(FuncId(1)), &[ValId(2)]);
+            b.push_let(ValId(5), ValType::I32, Op::Bin(BinOp::I32Add, ValId(3), ValId(4)));
+            b.push_yield(&[ValId(5)]);
+        }));
+        let else_id = rb.embed_region_id(&Region::build(|b| {
+            b.push_let(ValId(6), ValType::I32, Op::ConstI32(0));
+            b.push_yield(&[ValId(6)]);
+        }));
+        let res_tys = rb.alloc_tys(&[ValType::I32]);
+        let if_node = rb.alloc_node(RegionNode::IfElse {
+            cond: ValId(14),
+            then_region: then_id,
+            else_region: else_id,
+            results: res_tys,
+        });
+        rb.push_subregion_id(&[(ValId(7), ValType::I32)], if_node);
+        rb.push_yield(&[ValId(7)]);
+        rb.finish()
+    };
+    let g1_body = Region::build(|b| {
+        b.push_call(&[(ValId(1), ValType::I32)], CallTarget::Func(FuncId(0)), &[ValId(0)]);
+        b.push_yield(&[ValId(1)]);
+    });
+    let mod_b = Module {
+        funcs: vec![
+            FuncDef {
+                id: FuncId(0),
+                name: "g0".into(),
+                export_name: Some("g0".into()),
+                params: vec![(ValId(0), ValType::I32)],
+                results: vec![ValType::I32],
+                body: g0_body.clone(),
+            },
+            FuncDef {
+                id: FuncId(1),
+                name: "g1".into(),
+                export_name: None,
+                params: vec![(ValId(0), ValType::I32)],
+                results: vec![ValType::I32],
+                body: g1_body,
+            },
+        ],
+        ..Module::default()
+    };
+
+    with_both_backends(|backend, name| {
+        let t0 = Instant::now();
+        let eq_res = backend
+            .check_equivalence(&mod_b, &reg, &g0_body, &g0_body, None)
+            .expect("bounded-depth binary mutual recursion equivalence must not error");
+        let eq_ms = t0.elapsed().as_millis();
+        assert!(
+            matches!(eq_res, SmtResult::Unknown(ref msg) if msg.contains("budget")),
+            "[{name}] expected Unknown(budget) for g0 equivalence, got {eq_res:?}"
+        );
+        assert!(eq_ms < 200, "[{name}] g0 equivalence took {eq_ms} ms (must be < 200 ms)");
+
+        let t1 = Instant::now();
+        let spec_b = ContractSpec {
+            entry: &g0_body,
+            params: &[(ValId(0), ValType::I32)],
+            results: &[ValType::I32],
+            requires: None,
+            requires_params: None,
+            ensures: None,
+            ensures_params: None,
+            invariant: None,
+            check_trap_free: true,
+            use_initial_state: false,
+            stack_refinement: None,
+            slice_frame: None,
+        };
+        let c_res = backend
+            .check_contract(&mod_b, &reg, &spec_b)
+            .expect("bounded-depth binary mutual recursion contract must not error");
+        let c_ms = t1.elapsed().as_millis();
+        assert!(
+            matches!(c_res, SmtResult::Unknown(ref msg) if msg.contains("budget")),
+            "[{name}] expected Unknown(budget) for g0 contract, got {c_res:?}"
+        );
+        assert!(c_ms < 200, "[{name}] g0 contract took {c_ms} ms (must be < 200 ms)");
+    });
+}
+
+#[test]
+fn test_smt_nested_bounded_loops_respect_shared_step_budget() {
+    use std::time::Instant;
+
+    // 3 nested BoundedLoops of 64 iterations each = 262,144 symbolic iterations,
+    // which stays within each loop's individual MAX_SMT_LOOP_UNROLL (64) cap
+    // but must cleanly trip the shared symbolic encoding step budget.
+    let build_loop_of = |inner: Region, counter_var: ValId, limit_var: ValId, next_var: ValId, cond_var: ValId, one_var: ValId| -> Region {
+        let body = Region::build(|b| {
+            b.push_subregion(&[], &inner);
+            b.push_let(one_var, ValType::I32, Op::ConstI32(1));
+            b.push_let(next_var, ValType::I32, Op::Bin(BinOp::I32Add, counter_var, one_var));
+            b.push_let(cond_var, ValType::I32, Op::Bin(BinOp::I32LtU, next_var, limit_var));
+            b.push_continue(0, Some(cond_var), &[next_var]);
+            b.push_yield(&[]);
+        });
+        Region::build(|b| {
+            b.push_let(ValId(100), ValType::I32, Op::ConstI32(0));
+            let lp = Region::bounded_loop(64, &[ValId(100)], &[(counter_var, ValType::I32)], &body);
+            b.push_subregion(&[], &lp);
+            b.push_yield(&[]);
+        })
+    };
+
+    let leaf = Region::build(|b| {
+        b.push_let(ValId(50), ValType::I32, Op::Bin(BinOp::I32Add, ValId(0), ValId(0)));
+        b.push_yield(&[]);
+    });
+    let inner = build_loop_of(leaf, ValId(10), ValId(0), ValId(11), ValId(12), ValId(13));
+    let mid = build_loop_of(inner, ValId(20), ValId(0), ValId(21), ValId(22), ValId(23));
+    let outer = build_loop_of(mid, ValId(30), ValId(0), ValId(31), ValId(32), ValId(33));
+
+    let module = Module::default();
+    let reg = StratumRegistry::new();
+
+    with_both_backends(|backend, name| {
+        let t0 = Instant::now();
+        let res = backend
+            .check_equivalence(&module, &reg, &outer, &outer, None)
+            .expect("nested bounded loops must not error");
+        let elapsed_ms = t0.elapsed().as_millis();
+        assert!(
+            matches!(res, SmtResult::Unknown(ref msg) if msg.contains("budget")),
+            "[{name}] expected Unknown(budget) for 64^3 nested loops, got {res:?}"
+        );
+        assert!(
+            elapsed_ms < 200,
+            "[{name}] nested bounded loops took {elapsed_ms} ms (must be < 200 ms)"
+        );
+    });
+}
+
+#[test]
+fn test_smt_sequential_ifs_after_load_no_oom_blowup() {
+    use std::time::Instant;
+
+    // Regression test for Bug #3 (wasm-smith attempt=363):
+    // A single `Load` followed by 25 sequential `IfElse` blocks with symbolic conditions
+    // used to triple `MemSym::read_addrs` on every `ExecState::merge_from` (3^25 -> OOM).
+    // Also verifies `Store` + 25 sequential `IfElse` blocks inside a host contract `sim_body`
+    // (where `write_addrs` tracking is active for write-footprint frame checking) completes
+    // in constant memory without 3^k blowup while soundly catching out-of-footprint writes.
+    let build_seq_ifs = |with_store: bool| -> Region {
+        let mut rb = RegionBuilder::new();
+        // ValId(0): address, ValId(1): symbolic condition bitmask.
+        rb.push_let(
+            ValId(2),
+            ValType::I32,
+            Op::Load {
+                mem: MemId(0),
+                addr: ValId(0),
+                offset: 0,
+                width: MemWidth::B4,
+                signed: false,
+                result_ty: ValType::I32,
+            },
+        );
+        if with_store {
+            rb.push_effect(EffectOp::Store {
+                mem: MemId(0),
+                addr: ValId(0),
+                offset: 0,
+                width: MemWidth::B4,
+                val: ValId(2),
+            });
+        }
+        let mut acc = ValId(2);
+        let mut next_val = 10u32;
+        for i in 0..25u32 {
+            let mask_v = ValId(next_val);
+            next_val += 1;
+            let cond_v = ValId(next_val);
+            next_val += 1;
+            let one_v = ValId(next_val);
+            next_val += 1;
+            let t_res = ValId(next_val);
+            next_val += 1;
+            let e_res = ValId(next_val);
+            next_val += 1;
+            let out_v = ValId(next_val);
+            next_val += 1;
+
+            rb.push_let(mask_v, ValType::I32, Op::ConstI32(1i32.wrapping_shl(i)));
+            rb.push_let(cond_v, ValType::I32, Op::Bin(BinOp::I32And, ValId(1), mask_v));
+            let then_id = rb.embed_region_id(&Region::build(|b| {
+                b.push_let(one_v, ValType::I32, Op::ConstI32(1));
+                b.push_let(t_res, ValType::I32, Op::Bin(BinOp::I32Add, acc, one_v));
+                b.push_yield(&[t_res]);
+            }));
+            let else_id = rb.embed_region_id(&Region::build(|b| {
+                b.push_let(e_res, ValType::I32, Op::Copy(acc));
+                b.push_yield(&[e_res]);
+            }));
+            let res_tys = rb.alloc_tys(&[ValType::I32]);
+            let if_node = rb.alloc_node(RegionNode::IfElse {
+                cond: cond_v,
+                then_region: then_id,
+                else_region: else_id,
+                results: res_tys,
+            });
+            rb.push_subregion_id(&[(out_v, ValType::I32)], if_node);
+            acc = out_v;
+        }
+        rb.push_yield(&[acc]);
+        rb.finish()
+    };
+
+    let load_seq_ifs = build_seq_ifs(false);
+    let module = mod_with_mems(&[(0, 1, Some(1))]);
+    let reg = StratumRegistry::new();
+
+    with_both_backends(|backend, name| {
+        let t0 = Instant::now();
+        let res = backend
+            .check_equivalence(&module, &reg, &load_seq_ifs, &load_seq_ifs, None)
+            .expect("25 sequential IfElse blocks after Load must not error");
+        let elapsed_ms = t0.elapsed().as_millis();
+        assert_eq!(
+            res,
+            SmtResult::Unsat,
+            "[{name}] expected Unsat for self-equivalence of 25 sequential IfElses after Load"
+        );
+        assert!(
+            elapsed_ms < 200,
+            "[{name}] 25 sequential IfElses after Load took {elapsed_ms} ms (must be < 200 ms)"
+        );
+    });
+
+    // Also verify `sim_body` write-address tracking has no 3^k blowup across 25 sequential
+    // `IfElse`s after a `Store`, while still enforcing `write_footprints` soundly.
+    let sim_body_ok = build_seq_ifs(true);
+    let always_true = Region::build(|b| {
+        b.push_let(ValId(900), ValType::I32, Op::ConstI32(1));
+        b.push_yield(&[ValId(900)]);
+    });
+    let mut hc_mod = mod_with_mems(&[(0, 1, Some(1))]);
+    hc_mod.host_contracts.push(HostContract {
+        id: HostCallId(0),
+        module_name: "env".into(),
+        field_name: "seq_ifs_sim".into(),
+        params: vec![(ValId(0), ValType::I32), (ValId(1), ValType::I32)],
+        results: vec![(ValId(2), ValType::I32)],
+        precondition: always_true.clone(),
+        postcondition: always_true,
+        read_footprints: vec![],
+        write_footprints: vec![(
+            MemId(0),
+            OffsetRange { base: SliceBound::Arg(0), len: SliceBound::Const(4) },
+        )],
+        sim_body: Some(sim_body_ok),
+    });
+    let caller = Region::build(|b| {
+        b.push_call(
+            &[(ValId(3), ValType::I32)],
+            CallTarget::Host(HostCallId(0)),
+            &[ValId(0), ValId(1)],
+        );
+        b.push_yield(&[ValId(3)]);
+    });
+
+    with_both_backends(|backend, name| {
+        let t0 = Instant::now();
+        let res = backend
+            .check_equivalence(&hc_mod, &reg, &caller, &caller, None)
+            .expect("sim_body with 25 sequential IfElses after Store must not error");
+        let elapsed_ms = t0.elapsed().as_millis();
+        assert_eq!(
+            res,
+            SmtResult::Unsat,
+            "[{name}] expected Unsat for sim_body self-equivalence"
+        );
+        assert!(
+            elapsed_ms < 200,
+            "[{name}] sim_body with 25 sequential IfElses took {elapsed_ms} ms (must be < 200 ms)"
+        );
     });
 }

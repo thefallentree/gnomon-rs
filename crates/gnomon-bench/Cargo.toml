@@ -5,12 +5,16 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+arbitrary = "1.5.0"
 gnomon-kernel.workspace = true
 gnomon-wasm.workspace = true
 gnomon-sieve.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+wasm-smith = "0.263.0"
+wasmparser.workspace = true
+wasmtime.workspace = true
 
 [lints]
 workspace = true

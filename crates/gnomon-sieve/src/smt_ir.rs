@@ -1,6 +1,6 @@
 //! Shared `GnomonIR` -> `QF_ABV` symbolic execution and verification condition encoder.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet};
 use std::rc::Rc;
 
@@ -11,12 +11,70 @@ use gnomon_kernel::{
     validate_read_only_with_registry,
 };
 
-use crate::{ContractSpec, SieveError, SmtModel, SmtResult};
+use crate::{
+    ContractSpec, EquivOptions, SieveError, SliceBoundExpr, SmtModel, SmtResult, StackRefinement,
+};
 
 const MAX_CONST_MEM_OP_BYTES: usize = 1024;
 const MAX_SYM_MEM_OP_BYTES: usize = 64;
-const MAX_SMT_LOOP_UNROLL: u32 = 64;
+pub(crate) const MAX_SMT_LOOP_UNROLL: u32 = 64;
 const MAX_UF_CALLS_PER_STRATUM: usize = 64;
+const MAX_SMT_CALLS: usize = 256;
+const MAX_SMT_STEPS: usize = 20_000;
+const MAX_TRACKED_MEM_ADDRS: usize = 512;
+
+/// Shared total symbolic encoding budget across all control-flow branches, calls, and
+/// loop iterations within a single SMT query.
+///
+/// Backed by `Rc<Cell<_>>` so cloning `ExecState` across `IfElse` branches, host-contract
+/// pre/post checks, and equivalence LHS/RHS evaluations shares one aggregate budget,
+/// preventing exponential call-tree or nested-loop blowup before `check_sat()`.
+#[derive(Clone)]
+struct SymBudget {
+    calls: Rc<Cell<usize>>,
+    steps: Rc<Cell<usize>>,
+    exceeded: Rc<Cell<bool>>,
+}
+
+impl SymBudget {
+    fn new() -> Self {
+        Self {
+            calls: Rc::new(Cell::new(0)),
+            steps: Rc::new(Cell::new(0)),
+            exceeded: Rc::new(Cell::new(false)),
+        }
+    }
+
+    fn is_exceeded(&self) -> bool {
+        self.exceeded.get()
+    }
+
+    fn charge_call(&self) -> bool {
+        if self.exceeded.get() {
+            return false;
+        }
+        let next = self.calls.get().saturating_add(1);
+        self.calls.set(next);
+        if next > MAX_SMT_CALLS {
+            self.exceeded.set(true);
+            return false;
+        }
+        true
+    }
+
+    fn charge_steps(&self, n: usize) -> bool {
+        if self.exceeded.get() {
+            return false;
+        }
+        let next = self.steps.get().saturating_add(n);
+        self.steps.set(next);
+        if next > MAX_SMT_STEPS {
+            self.exceeded.set(true);
+            return false;
+        }
+        true
+    }
+}
 
 /// Shared Ackermann Uninterpreted-Function (UF) congruence table for pure-total Strata.
 ///
@@ -274,8 +332,25 @@ struct MemSym<T> {
     max_pages: u64,
     written: Option<T>,
     touched_by_write_or_grow: bool,
-    read_addrs: Vec<(T, MemWidth)>,
-    write_addrs: Vec<T>,
+    /// Shared per-memory diagnostic read-address log for `extract_model`, capped at
+    /// `MAX_TRACKED_MEM_ADDRS` so branching clones in O(1) with zero merge duplication.
+    read_addrs: Rc<RefCell<Vec<(T, MemWidth)>>>,
+    /// Shared per-memory write-address log populated only while executing a host
+    /// contract's `sim_body` (used for sound `write_footprints` frame checking).
+    write_addrs: Rc<RefCell<Vec<T>>>,
+}
+
+impl<T> MemSym<T> {
+    fn record_read(&self, addr: T, width: MemWidth) {
+        let mut reads = self.read_addrs.borrow_mut();
+        if reads.len() < MAX_TRACKED_MEM_ADDRS {
+            reads.push((addr, width));
+        }
+    }
+
+    fn record_write(&self, addr: T) {
+        self.write_addrs.borrow_mut().push(addr);
+    }
 }
 
 #[derive(Clone)]
@@ -298,6 +373,8 @@ struct ExecState<T> {
     env: BTreeMap<ValId, SymVal<T>>,
     fresh_counter: u32,
     uf_table: Option<Rc<RefCell<UfTable<T>>>>,
+    budget: SymBudget,
+    track_writes: bool,
 }
 
 #[derive(Clone)]
@@ -468,8 +545,8 @@ impl<T: Clone> ExecState<T> {
                     max_pages: limit as u64,
                     written: None,
                     touched_by_write_or_grow: false,
-                    read_addrs: Vec::new(),
-                    write_addrs: Vec::new(),
+                    read_addrs: Rc::new(RefCell::new(Vec::new())),
+                    write_addrs: Rc::new(RefCell::new(Vec::new())),
                 },
             );
         }
@@ -509,7 +586,40 @@ impl<T: Clone> ExecState<T> {
             env: BTreeMap::new(),
             fresh_counter: 0,
             uf_table: None,
+            budget: SymBudget::new(),
+            track_writes: false,
         })
+    }
+
+    fn mark_budget_overflow<B: SmtTarget<Term = T>>(&mut self, b: &mut B) {
+        self.unroll_overflow = self.unroll_overflow.or(b, &self.path_active);
+        self.path_active = SymBool::from_const(b, false);
+    }
+
+    fn charge_call<B: SmtTarget<Term = T>>(&mut self, b: &mut B) -> bool {
+        if matches!(self.path_active.konst, Some(false)) {
+            return false;
+        }
+        if !self.budget.charge_call() {
+            self.mark_budget_overflow(b);
+            return false;
+        }
+        true
+    }
+
+    fn charge_step<B: SmtTarget<Term = T>>(&mut self, b: &mut B) -> bool {
+        self.charge_steps(b, 1)
+    }
+
+    fn charge_steps<B: SmtTarget<Term = T>>(&mut self, b: &mut B, n: usize) -> bool {
+        if matches!(self.path_active.konst, Some(false)) {
+            return false;
+        }
+        if !self.budget.charge_steps(n) {
+            self.mark_budget_overflow(b);
+            return false;
+        }
+        true
     }
 
     fn next_fresh_name(&mut self, tag: &str) -> String {
@@ -614,27 +724,23 @@ impl<T: Clone> ExecState<T> {
                     Some(false) => ew.clone(),
                     None => b.ite(&cond.term, tw, ew),
                 }),
-                (Some(tw), None) => {
-                    let f_arr = b.const_array_bool(false);
-                    Some(b.ite(&cond.term, tw, &f_arr))
-                }
-                (None, Some(ew)) => {
-                    let f_arr = b.const_array_bool(false);
-                    Some(b.ite(&cond.term, &f_arr, ew))
-                }
+                (Some(tw), None) => match cond.konst {
+                    Some(true) => Some(tw.clone()),
+                    Some(false) => None,
+                    None => {
+                        let f_arr = b.const_array_bool(false);
+                        Some(b.ite(&cond.term, tw, &f_arr))
+                    }
+                },
+                (None, Some(ew)) => match cond.konst {
+                    Some(true) => None,
+                    Some(false) => Some(ew.clone()),
+                    None => {
+                        let f_arr = b.const_array_bool(false);
+                        Some(b.ite(&cond.term, &f_arr, ew))
+                    }
+                },
             };
-            for r in &t.read_addrs {
-                mem_acc.read_addrs.push(r.clone());
-            }
-            for r in &e.read_addrs {
-                mem_acc.read_addrs.push(r.clone());
-            }
-            for w in &t.write_addrs {
-                mem_acc.write_addrs.push(w.clone());
-            }
-            for w in &e.write_addrs {
-                mem_acc.write_addrs.push(w.clone());
-            }
         }
 
         for (gid, g_acc) in &mut self.globals {
@@ -666,19 +772,23 @@ fn eval_mem_byte<B: SmtTarget>(
 }
 
 /// Conditionally stores a single byte into `mem_sym` using scalar `BV8`/`Bool` ITEs
-/// inside `array_store` (eliminating nested Array-level ITE chains) and logs `idx32`.
+/// inside `array_store` (eliminating nested Array-level ITE chains) and logs `idx32`
+/// when write tracking is enabled (`sim_body` frame checking).
 fn store_mem_byte_cond<B: SmtTarget>(
     b: &mut B,
     mem_sym: &mut MemSym<B::Term>,
     idx32: &B::Term,
     byte: &B::Term,
     cond: &SymBool<B::Term>,
+    track_writes: bool,
 ) {
     if matches!(cond.konst, Some(false)) {
         return;
     }
     mem_sym.touched_by_write_or_grow = true;
-    mem_sym.write_addrs.push(idx32.clone());
+    if track_writes {
+        mem_sym.record_write(idx32.clone());
+    }
     match cond.konst {
         Some(true) => {
             mem_sym.array = b.array_store(&mem_sym.array, idx32, byte);
@@ -1218,7 +1328,7 @@ fn eval_op<B: SmtTarget>(
                 });
             };
             let mem_sym = state.mems.get_mut(mem).expect("checked");
-            mem_sym.read_addrs.push((ea32.clone(), *width));
+            mem_sym.record_read(ea32.clone(), *width);
             let mut bytes = Vec::with_capacity(w_bytes as usize);
             for i in 0..w_bytes {
                 let off32 = b.bv_const(32, i);
@@ -1332,13 +1442,14 @@ fn eval_effect<B: SmtTarget>(
             if matches!(can_write.konst, Some(false)) {
                 return Ok(());
             }
+            let track_writes = state.track_writes;
             let mem_sym = state.mems.get_mut(mem).expect("checked");
             for i in 0..w_bytes {
                 let lo = (i as u32) * 8;
                 let byte = b.bv_extract(lo + 7, lo, &val_v.term);
                 let off32 = b.bv_const(32, i);
                 let idx = if i == 0 { ea32.clone() } else { b.bv_add(32, &ea32, &off32) };
-                store_mem_byte_cond(b, mem_sym, &idx, &byte, &can_write);
+                store_mem_byte_cond(b, mem_sym, &idx, &byte, &can_write, track_writes);
             }
             Ok(())
         }
@@ -1365,25 +1476,33 @@ fn eval_effect<B: SmtTarget>(
                 if n_usize == 0 {
                     return Ok(());
                 }
+                if !state.charge_steps(b, n_usize) {
+                    return Ok(());
+                }
+                let track_writes = state.track_writes;
                 let mem_sym = state.mems.get_mut(mem).expect("checked");
                 for i in 0..n_usize {
                     let off32 = b.bv_const(32, i as u64);
                     let idx = if i == 0 { ea32.clone() } else { b.bv_add(32, &ea32, &off32) };
-                    store_mem_byte_cond(b, mem_sym, &idx, &byte, &can_write);
+                    store_mem_byte_cond(b, mem_sym, &idx, &byte, &can_write, track_writes);
                 }
             } else {
+                if !state.charge_steps(b, MAX_SYM_MEM_OP_BYTES) {
+                    return Ok(());
+                }
                 let max_t = b.bv_const(32, MAX_SYM_MEM_OP_BYTES as u64);
                 let too_big = b.bv_ugt(32, &len_v.term, &max_t);
                 let over = can_write.and(b, &SymBool::symbolic(too_big));
                 state.unroll_overflow = state.unroll_overflow.or(b, &over);
 
+                let track_writes = state.track_writes;
                 let mem_sym = state.mems.get_mut(mem).expect("checked");
                 for i in 0..MAX_SYM_MEM_OP_BYTES {
                     let i32_t = b.bv_const(32, i as u64);
                     let in_len = SymBool::symbolic(b.bv_ult(32, &i32_t, &len_v.term));
                     let do_i = can_write.and(b, &in_len);
                     let idx = if i == 0 { ea32.clone() } else { b.bv_add(32, &ea32, &i32_t) };
-                    store_mem_byte_cond(b, mem_sym, &idx, &byte, &do_i);
+                    store_mem_byte_cond(b, mem_sym, &idx, &byte, &do_i, track_writes);
                 }
             }
             Ok(())
@@ -1417,19 +1536,26 @@ fn eval_effect<B: SmtTarget>(
                 if n_usize == 0 {
                     return Ok(());
                 }
+                if !state.charge_steps(b, n_usize) {
+                    return Ok(());
+                }
                 let mut bytes = Vec::with_capacity(n_usize);
                 for i in 0..n_usize {
                     let off32 = b.bv_const(32, i as u64);
                     let s_idx = if i == 0 { src_ea32.clone() } else { b.bv_add(32, &src_ea32, &off32) };
                     bytes.push(eval_mem_byte(b, &src_snapshot, &s_idx));
                 }
+                let track_writes = state.track_writes;
                 let dst_sym = state.mems.get_mut(dst_mem).expect("checked");
                 for (i, byte) in bytes.iter().enumerate() {
                     let off32 = b.bv_const(32, i as u64);
                     let d_idx = if i == 0 { dst_ea32.clone() } else { b.bv_add(32, &dst_ea32, &off32) };
-                    store_mem_byte_cond(b, dst_sym, &d_idx, byte, &can_write);
+                    store_mem_byte_cond(b, dst_sym, &d_idx, byte, &can_write, track_writes);
                 }
             } else {
+                if !state.charge_steps(b, MAX_SYM_MEM_OP_BYTES) {
+                    return Ok(());
+                }
                 let max_t = b.bv_const(32, MAX_SYM_MEM_OP_BYTES as u64);
                 let too_big = b.bv_ugt(32, &len_v.term, &max_t);
                 let over = can_write.and(b, &SymBool::symbolic(too_big));
@@ -1441,13 +1567,14 @@ fn eval_effect<B: SmtTarget>(
                     let s_idx = if i == 0 { src_ea32.clone() } else { b.bv_add(32, &src_ea32, &i32_t) };
                     src_bytes.push(eval_mem_byte(b, &src_snapshot, &s_idx));
                 }
+                let track_writes = state.track_writes;
                 let dst_sym = state.mems.get_mut(dst_mem).expect("checked");
                 for (i, byte) in src_bytes.iter().enumerate() {
                     let i32_t = b.bv_const(32, i as u64);
                     let in_len = SymBool::symbolic(b.bv_ult(32, &i32_t, &len_v.term));
                     let do_i = can_write.and(b, &in_len);
                     let d_idx = if i == 0 { dst_ea32.clone() } else { b.bv_add(32, &dst_ea32, &i32_t) };
-                    store_mem_byte_cond(b, dst_sym, &d_idx, byte, &do_i);
+                    store_mem_byte_cond(b, dst_sym, &d_idx, byte, &do_i, track_writes);
                 }
             }
             Ok(())
@@ -1493,6 +1620,12 @@ fn eval_body<B: SmtTarget>(
     args: &[SymVal<B::Term>],
     depth: u32,
 ) -> Result<Vec<SymVal<B::Term>>, SieveError> {
+    if !state.charge_call(b) {
+        return Ok(results
+            .iter()
+            .map(|&ty| SymVal { ty, term: b.bv_const(bits_of(ty), 0), konst: Some(0) })
+            .collect());
+    }
     if depth >= MAX_CALL_DEPTH {
         let t = SymBool::from_const(b, true);
         state.trap_if(b, &t, TrapCode::OutOfFuel);
@@ -1601,6 +1734,14 @@ fn eval_host_call<B: SmtTarget>(
         return Ok(Vec::new());
     }
 
+    if !state.charge_call(b) {
+        return Ok(hc
+            .results
+            .iter()
+            .map(|&(_, ty)| SymVal { ty, term: b.bv_const(bits_of(ty), 0), konst: Some(0) })
+            .collect());
+    }
+
     if !validate_read_only_with_registry(&hc.precondition, registry)
         || !validate_read_only_with_registry(&hc.postcondition, registry)
     {
@@ -1633,6 +1774,8 @@ fn eval_host_call<B: SmtTarget>(
     let mut pre_state = state.clone();
     let pre_flow =
         eval_region_flow(b, module, registry, &mut pre_state, hc.precondition.as_ref(), depth + 1)?;
+    state.unroll_overflow = state.unroll_overflow.or(b, &pre_state.unroll_overflow);
+    let pre_not_over = pre_state.unroll_overflow.not(b);
     let pre_violated = if pre_state.trapped.konst == Some(true)
         || matches!(pre_flow.normal.active.konst, Some(false))
     {
@@ -1646,7 +1789,9 @@ fn eval_host_call<B: SmtTarget>(
         let not_ok = ok_norm.not(b);
         pre_state.trapped.or(b, &not_ok)
     };
-    state.trap_if(b, &pre_violated, TrapCode::HostContractViolation);
+    let pre_violated_clean = pre_violated.and(b, &pre_not_over);
+    state.trap_if(b, &pre_violated_clean, TrapCode::HostContractViolation);
+    state.path_active = state.path_active.and(b, &pre_not_over);
 
     // Check footprint bounds and record write-footprint intervals for frame checking.
     let eval_slice_bound = |b: &mut B, sb: SliceBound| -> Option<SymVal<B::Term>> {
@@ -1692,8 +1837,12 @@ fn eval_host_call<B: SmtTarget>(
     let res_vals = if let Some(sim_body) = &hc.sim_body {
         let before_mems = state.mems.clone();
         let write_starts: BTreeMap<MemId, usize> =
-            before_mems.iter().map(|(&mid, m)| (mid, m.write_addrs.len())).collect();
-        let flow = eval_region_flow(b, module, registry, state, sim_body.as_ref(), depth + 1)?;
+            before_mems.iter().map(|(&mid, m)| (mid, m.write_addrs.borrow().len())).collect();
+        let prev_track_writes = state.track_writes;
+        state.track_writes = true;
+        let flow_res = eval_region_flow(b, module, registry, state, sim_body.as_ref(), depth + 1);
+        state.track_writes = prev_track_writes;
+        let flow = flow_res?;
         for out in flow.breaks.values().chain(flow.continues.values()) {
             state.trap_if(b, &out.active, TrapCode::HostContractViolation);
         }
@@ -1712,7 +1861,8 @@ fn eval_host_call<B: SmtTarget>(
                 frame_bad = frame_bad.or(b, &sz_changed);
 
                 let start = write_starts.get(mid).copied().unwrap_or(0);
-                for idx32 in &after_m.write_addrs[start..] {
+                let writes = after_m.write_addrs.borrow();
+                for idx32 in &writes[start..] {
                     let idx64 = b.bv_zext(32, 32, idx32);
                     let in_mem = b.bv_ult(64, &idx64, &after_m.bytes);
                     let before_b = eval_mem_byte(b, before_m, idx32);
@@ -1736,6 +1886,11 @@ fn eval_host_call<B: SmtTarget>(
                 }
             }
             state.trap_if(b, &frame_bad, TrapCode::HostContractViolation);
+        }
+        if !prev_track_writes {
+            for mem in state.mems.values() {
+                mem.write_addrs.borrow_mut().clear();
+            }
         }
 
         let expected_tys: Vec<ValType> = hc.results.iter().map(|&(_, t)| t).collect();
@@ -1784,6 +1939,8 @@ fn eval_host_call<B: SmtTarget>(
         hc.postcondition.as_ref(),
         depth + 1,
     )?;
+    state.unroll_overflow = state.unroll_overflow.or(b, &post_state.unroll_overflow);
+    let post_not_over = post_state.unroll_overflow.not(b);
     let post_nz = match post_flow.normal.values.first() {
         Some(v) if v.ty == ValType::I32 => state.is_nonzero(b, v),
         _ => SymBool::from_const(b, false),
@@ -1794,12 +1951,14 @@ fn eval_host_call<B: SmtTarget>(
     if hc.sim_body.is_some() {
         let active = state.path_active.clone();
         let not_post_ok = post_ok.not(b);
-        let bad = active.and(b, &not_post_ok);
+        let bad = active.and(b, &not_post_ok).and(b, &post_not_over);
         state.trap_if(b, &bad, TrapCode::HostContractViolation);
+        state.path_active = state.path_active.and(b, &post_not_over);
     } else {
         let not_active = state.path_active.not(b);
-        let cond = not_active.or(b, &post_ok);
+        let cond = not_active.or(b, &post_ok).or(b, &post_state.unroll_overflow);
         b.assert_formula(&cond.term)?;
+        state.path_active = state.path_active.and(b, &post_not_over);
     }
 
     state.env = saved_env;
@@ -1820,6 +1979,9 @@ fn eval_block_stmts_raw<B: SmtTarget>(
 
     for stmt in r.stmts(stmts) {
         if matches!(state.path_active.konst, Some(false)) {
+            break;
+        }
+        if !state.charge_step(b) {
             break;
         }
         match stmt {
@@ -2005,6 +2167,9 @@ fn eval_region_flow<B: SmtTarget>(
             Ok(out)
         }
         RegionNode::IfElse { cond, then_region, else_region, results } => {
+            if !state.charge_step(b) {
+                return Ok(FlowTargets::empty(b));
+            }
             let (Some(then_r), Some(else_r)) = (region.child(then_region), region.child(else_region)) else {
                 let t = SymBool::from_const(b, true);
                 state.trap_if(b, &t, TrapCode::Unreachable);
@@ -2109,6 +2274,10 @@ fn eval_region_flow<B: SmtTarget>(
                     state.env.insert(sid, val.clone());
                 }
                 state.path_active = iter_active.clone();
+                if !state.charge_step(b) {
+                    iter_active = SymBool::from_const(b, false);
+                    break;
+                }
                 let body_flow = match body_r.node {
                     RegionNode::Block(stmts) => {
                         eval_block_stmts_raw(b, module, registry, state, body_r, stmts, depth)?
@@ -2515,7 +2684,7 @@ fn extract_model<B: SmtTarget>(
                 offsets.insert(w_u32);
             }
         }
-        for (addr_term, width) in &entry.mem.read_addrs {
+        for (addr_term, width) in entry.mem.read_addrs.borrow().iter() {
             let addr_u32 = b.get_bv_u64(addr_term, 32)? as u32;
             for i in 0..width.bytes() {
                 if let Some(off) = addr_u32.checked_add(i as u32)
@@ -2540,15 +2709,22 @@ fn extract_model<B: SmtTarget>(
     Ok(SmtModel { scalar_values, global_values, memory_bytes })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn solve_with_overflow_guard<B: SmtTarget>(
     b: &mut B,
     goal_assertion: &B::Term,
     overflow_flag: &SymBool<B::Term>,
+    budget_exceeded: bool,
     param_syms: &[(ValId, SymVal<B::Term>)],
     global_syms: &[(GlobalId, SymVal<B::Term>)],
     mem_extractions: &[MemExtraction<'_, B::Term>],
 ) -> Result<SmtResult, SieveError> {
     if matches!(overflow_flag.konst, Some(false)) {
+        if budget_exceeded {
+            return Ok(SmtResult::Unknown(
+                "symbolic encoding step/call budget exceeded".into(),
+            ));
+        }
         b.assert_formula(goal_assertion)?;
         return match b.check_sat()? {
             RawSat::Unsat => Ok(SmtResult::Unsat),
@@ -2559,34 +2735,42 @@ fn solve_with_overflow_guard<B: SmtTarget>(
         };
     }
 
-    // Phase 1: check for concrete counterexamples within the bounded MemoryCopy/Fill limit.
-    b.push()?;
-    b.assert_formula(goal_assertion)?;
-    let no_over = overflow_flag.not(b);
-    b.assert_formula(&no_over.term)?;
-    let res1 = b.check_sat()?;
-    if res1 == RawSat::Sat {
-        let model = extract_model(b, param_syms, global_syms, mem_extractions)?;
+    // Phase 1: check for concrete counterexamples within the bounded limit.
+    // Skip Phase 1 if overflow is unconditionally true (`!overflow` is trivially false).
+    if !matches!(overflow_flag.konst, Some(true)) {
+        b.push()?;
+        b.assert_formula(goal_assertion)?;
+        let no_over = overflow_flag.not(b);
+        b.assert_formula(&no_over.term)?;
+        let res1 = b.check_sat()?;
+        if res1 == RawSat::Sat {
+            let model = extract_model(b, param_syms, global_syms, mem_extractions)?;
+            b.pop()?;
+            return Ok(SmtResult::Sat(model));
+        }
         b.pop()?;
-        return Ok(SmtResult::Sat(model));
-    }
-    b.pop()?;
 
-    if let RawSat::Unknown(msg) = res1 {
-        return Ok(SmtResult::Unknown(msg));
+        if let RawSat::Unknown(msg) = res1 {
+            return Ok(SmtResult::Unknown(msg));
+        }
     }
 
     // Phase 2: check (under assumptions/preconditions ONLY, without goal_assertion)
-    // whether the bounded unroll limit can actually be exceeded.
+    // whether the bounded unroll or symbolic encoding budget limit can actually be exceeded.
     b.push()?;
     b.assert_formula(&overflow_flag.term)?;
     let res2 = b.check_sat()?;
     b.pop()?;
     match res2 {
         RawSat::Unsat => Ok(SmtResult::Unsat),
-        RawSat::Sat | RawSat::Unknown(_) => Ok(SmtResult::Unknown(
-            "bounded SMT unroll limit exceeded (MemoryCopy/MemoryFill > 64 bytes or BoundedLoop > 64 iters)".into(),
-        )),
+        RawSat::Sat | RawSat::Unknown(_) => {
+            let reason = if budget_exceeded {
+                "symbolic encoding step/call budget exceeded"
+            } else {
+                "bounded SMT unroll limit exceeded (MemoryCopy/MemoryFill > 64 bytes or BoundedLoop > 64 iters)"
+            };
+            Ok(SmtResult::Unknown(reason.into()))
+        }
     }
 }
 
@@ -2609,15 +2793,11 @@ pub(crate) fn run_check_vc<B: SmtTarget>(
     }
 
     let mut overflow = SymBool::from_const(b, false);
-    let mut all_reads: BTreeMap<MemId, Vec<(B::Term, MemWidth)>> = BTreeMap::new();
 
     for assumption in &vc.assumptions {
         let mut a_state = base_state.clone();
         let vals = eval_top_region(b, module, registry, &mut a_state, assumption)?;
         overflow = overflow.or(b, &a_state.unroll_overflow);
-        for (mid, mem) in &a_state.mems {
-            all_reads.entry(*mid).or_default().extend(mem.read_addrs.iter().cloned());
-        }
         let not_trapped = a_state.trapped.not(b);
         let ok = match vals.first() {
             Some(v) if v.ty == ValType::I32 => {
@@ -2637,11 +2817,6 @@ pub(crate) fn run_check_vc<B: SmtTarget>(
     if !matches!(g_state.path_assumptions.konst, Some(true)) {
         b.assert_formula(&g_state.path_assumptions.term)?;
     }
-    for (mid, mem) in &mut g_state.mems {
-        if let Some(extra) = all_reads.remove(mid) {
-            mem.read_addrs.extend(extra);
-        }
-    }
 
     let g_holds = match g_vals.first() {
         Some(v) => {
@@ -2655,7 +2830,7 @@ pub(crate) fn run_check_vc<B: SmtTarget>(
     let mem_extractions: Vec<MemExtraction<'_, B::Term>> = g_state
         .mems
         .iter()
-        .filter(|(_, m)| !m.read_addrs.is_empty())
+        .filter(|(_, m)| !m.read_addrs.borrow().is_empty())
         .map(|(&id, mem)| MemExtraction { id, mem, witness: None })
         .collect();
 
@@ -2663,6 +2838,7 @@ pub(crate) fn run_check_vc<B: SmtTarget>(
         b,
         &violated.term,
         &overflow,
+        g_state.budget.is_exceeded(),
         &param_syms,
         &global_syms,
         &mem_extractions,
@@ -2739,7 +2915,7 @@ fn is_pure_total_region(r: RegionRef<'_>, registry: &StratumRegistry, depth: u32
     }
 }
 
-fn is_pure_total_stratum(sid: StratumId, registry: &StratumRegistry, depth: u32) -> bool {
+pub(crate) fn is_pure_total_stratum(sid: StratumId, registry: &StratumRegistry, depth: u32) -> bool {
     if depth > MAX_CALL_DEPTH {
         return false;
     }
@@ -2824,13 +3000,141 @@ fn collect_pure_total_strata_in_module(
     walk(module, region.as_ref(), registry, out, &mut visited_funcs, 0);
 }
 
-pub(crate) fn run_check_equivalence<B: SmtTarget>(
+struct ActiveStackRefinement<T> {
+    sp_global: GlobalId,
+    stack_mem: MemId,
+    sp_in: SymVal<T>,
+}
+
+/// Applies shadow-stack pre-state constraints to `base_state` before cloning it into
+/// `requires`/`precondition`/`lhs`/`rhs`/`entry`.
+///
+/// Returns `Ok(None)` when `sr.stack_pointer_global` is not defined in `module.globals`
+/// (graceful no-op on modules without a shadow stack).
+fn apply_stack_refinement_pre<B: SmtTarget>(
+    b: &mut B,
+    module: &Module,
+    base_state: &mut ExecState<B::Term>,
+    sr: StackRefinement,
+    use_initial_state: bool,
+) -> Result<Option<ActiveStackRefinement<B::Term>>, SieveError> {
+    let Some(g_def) = module.global(sr.stack_pointer_global) else {
+        return Ok(None);
+    };
+    if g_def.ty != ValType::I32 {
+        return Err(SieveError::EncodingError(format!(
+            "StackRefinement stack_pointer_global {:?} must have type I32, got {:?}",
+            sr.stack_pointer_global, g_def.ty
+        )));
+    }
+    let init_u32 = g_def.init.as_u32().ok_or_else(|| {
+        SieveError::EncodingError(format!(
+            "StackRefinement stack_pointer_global {:?} has non-I32 initializer",
+            sr.stack_pointer_global
+        ))
+    })?;
+
+    let mem_upper_bytes: Option<u64> = module.memories.iter().find(|m| m.id == sr.stack_mem).map(|m| {
+        if use_initial_state {
+            (m.min_pages as u64) * (WASM_PAGE_SIZE as u64)
+        } else {
+            let limit = m.max_pages.unwrap_or(MAX_WASM_PAGES).min(MAX_WASM_PAGES);
+            (limit as u64) * (WASM_PAGE_SIZE as u64)
+        }
+    });
+
+    let pin_init = sr.pin_initial_sp && init_u32 >= sr.min_stack_bytes;
+    let sp_in = if pin_init {
+        if let Some(upper) = mem_upper_bytes
+            && (init_u32 as u64) > upper
+        {
+            return Err(SieveError::EncodingError(format!(
+                "StackRefinement pinned SP_in ({init_u32}) exceeds memory {:?} maximum size ({upper} bytes)",
+                sr.stack_mem
+            )));
+        }
+        let sv = SymVal {
+            ty: ValType::I32,
+            term: b.bv_const(32, init_u32 as u64),
+            konst: Some(init_u32 as u64),
+        };
+        if let Some(g_sym) = base_state.globals.get_mut(&sr.stack_pointer_global) {
+            g_sym.val = sv.clone();
+        }
+        if let Some(mem) = base_state.mems.get(&sr.stack_mem) {
+            let sp64 = b.bv_const(64, init_u32 as u64);
+            let le_mem = b.bv_ule(64, &sp64, &mem.init_bytes);
+            b.assert_formula(&le_mem)?;
+        }
+        sv
+    } else {
+        let g_sym = base_state.globals.get(&sr.stack_pointer_global).expect("global present");
+        let sv = g_sym.val.clone();
+        if let Some(fixed_sp) = sv.konst {
+            let fixed_u32 = fixed_sp as u32;
+            if fixed_u32 < sr.min_stack_bytes || (fixed_u32 & 0xf) != 0 {
+                return Err(SieveError::EncodingError(format!(
+                    "StackRefinement fixed SP_in ({fixed_u32}) violates min_stack_bytes ({}) or 16-byte alignment",
+                    sr.min_stack_bytes
+                )));
+            }
+            if let Some(upper) = mem_upper_bytes
+                && (fixed_u32 as u64) > upper
+            {
+                return Err(SieveError::EncodingError(format!(
+                    "StackRefinement fixed SP_in ({fixed_u32}) exceeds memory {:?} maximum size ({upper} bytes)",
+                    sr.stack_mem
+                )));
+            }
+        } else {
+            let min_aligned = ((sr.min_stack_bytes as u64) + 15) & !15;
+            if min_aligned > u32::MAX as u64 {
+                return Err(SieveError::EncodingError(format!(
+                    "StackRefinement min_stack_bytes ({}) has no 16-byte aligned 32-bit SP_in",
+                    sr.min_stack_bytes
+                )));
+            }
+            if let Some(upper) = mem_upper_bytes
+                && min_aligned > upper
+            {
+                return Err(SieveError::EncodingError(format!(
+                    "StackRefinement min_stack_bytes ({}) has no 16-byte aligned SP_in within memory {:?} maximum size ({upper} bytes)",
+                    sr.min_stack_bytes, sr.stack_mem
+                )));
+            }
+            let min_t = b.bv_const(32, sr.min_stack_bytes as u64);
+            let ge_min = b.bv_uge(32, &sv.term, &min_t);
+            b.assert_formula(&ge_min)?;
+            let mask15 = b.bv_const(32, 0xf);
+            let zero32 = b.bv_const(32, 0);
+            let rem16 = b.bv_and(32, &sv.term, &mask15);
+            let aligned = b.eq(&rem16, &zero32);
+            b.assert_formula(&aligned)?;
+        }
+        if let Some(mem) = base_state.mems.get(&sr.stack_mem) {
+            let sp64 = b.bv_zext(32, 32, &sv.term);
+            let le_mem = b.bv_ule(64, &sp64, &mem.init_bytes);
+            b.assert_formula(&le_mem)?;
+        }
+        sv
+    };
+
+    Ok(Some(ActiveStackRefinement {
+        sp_global: sr.stack_pointer_global,
+        stack_mem: sr.stack_mem,
+        sp_in,
+    }))
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn run_check_equivalence_with_options<B: SmtTarget>(
     b: &mut B,
     module: &Module,
     registry: &StratumRegistry,
     lhs: &Region,
     rhs: &Region,
     precondition: Option<&Region>,
+    opts: &EquivOptions,
     query_prefix: &str,
 ) -> Result<SmtResult, SieveError> {
     // Stage 2a (CEGAR): if LHS and RHS share pure-total Strata, attempt a fast UF congruence
@@ -2852,6 +3156,7 @@ pub(crate) fn run_check_equivalence<B: SmtTarget>(
             lhs,
             rhs,
             precondition,
+            opts,
             &uf_prefix,
             Some(shared_uf),
         );
@@ -2861,7 +3166,17 @@ pub(crate) fn run_check_equivalence<B: SmtTarget>(
         }
     }
 
-    run_check_equivalence_inner(b, module, registry, lhs, rhs, precondition, query_prefix, None)
+    run_check_equivalence_inner(
+        b,
+        module,
+        registry,
+        lhs,
+        rhs,
+        precondition,
+        opts,
+        query_prefix,
+        None,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2872,11 +3187,16 @@ fn run_check_equivalence_inner<B: SmtTarget>(
     lhs: &Region,
     rhs: &Region,
     precondition: Option<&Region>,
+    opts: &EquivOptions,
     query_prefix: &str,
     uf_strata: Option<BTreeSet<StratumId>>,
 ) -> Result<SmtResult, SieveError> {
     let params = infer_equiv_params(module, registry, lhs, rhs, precondition)?;
     let mut base_state = ExecState::from_module(b, module, query_prefix)?;
+    let active_stack = match opts.stack_refinement {
+        Some(sr) => apply_stack_refinement_pre(b, module, &mut base_state, sr, false)?,
+        None => None,
+    };
     let global_syms: Vec<(GlobalId, SymVal<B::Term>)> =
         base_state.globals.iter().map(|(&gid, g)| (gid, g.val.clone())).collect();
     let uf_table = uf_strata.map(|set| UfTable::new(set, query_prefix.to_string()));
@@ -2922,6 +3242,7 @@ fn run_check_equivalence_inner<B: SmtTarget>(
     // Build discrepancy formula:
     // (lhs.trapped != rhs.trapped)
     // || (lhs.trapped && rhs.trapped && lhs.trap_code != rhs.trap_code)
+    // || sp_leak
     // || (!lhs.trapped && !rhs.trapped && (results_differ || globals_differ || mem_sizes_differ || witness_mem_byte_differs))
     let trap_eq = b.eq(&lhs_state.trapped.term, &rhs_state.trapped.term);
     let trap_mismatch = SymBool::symbolic(b.not(&trap_eq));
@@ -2934,6 +3255,27 @@ fn run_check_equivalence_inner<B: SmtTarget>(
     let rhs_not_trapped = rhs_state.trapped.not(b);
     let neither_trapped = lhs_not_trapped.and(b, &rhs_not_trapped);
     let mut non_trap_diff = SymBool::from_const(b, false);
+
+    // Shadow-stack preservation: on every active non-trapping path, BOTH lhs and rhs must
+    // restore `stack_pointer_global` to `SP_in` (even if both leak SP by the exact same delta
+    // or neither touches memory).
+    let mut sp_leak = SymBool::from_const(b, false);
+    if let Some(ref active_sr) = active_stack {
+        if let Some(lhs_sp) = lhs_state.globals.get(&active_sr.sp_global) {
+            let lhs_sp_eq = b.eq(&lhs_sp.val.term, &active_sr.sp_in.term);
+            let lhs_sp_neq = SymBool::symbolic(b.not(&lhs_sp_eq));
+            let lhs_clean = lhs_not_trapped.and(b, &lhs_state.path_active);
+            let lhs_leak = lhs_clean.and(b, &lhs_sp_neq);
+            sp_leak = sp_leak.or(b, &lhs_leak);
+        }
+        if let Some(rhs_sp) = rhs_state.globals.get(&active_sr.sp_global) {
+            let rhs_sp_eq = b.eq(&rhs_sp.val.term, &active_sr.sp_in.term);
+            let rhs_sp_neq = SymBool::symbolic(b.not(&rhs_sp_eq));
+            let rhs_clean = rhs_not_trapped.and(b, &rhs_state.path_active);
+            let rhs_leak = rhs_clean.and(b, &rhs_sp_neq);
+            sp_leak = sp_leak.or(b, &rhs_leak);
+        }
+    }
 
     let lhs_reachable = !matches!(lhs_state.path_active.konst, Some(false))
         && !matches!(lhs_state.trapped.konst, Some(true));
@@ -2979,12 +3321,18 @@ fn run_check_equivalence_inner<B: SmtTarget>(
 
             let witness = b.fresh_bv(&format!("{query_prefix}_witness_mem_{}", mid.0), 32);
             let w64 = b.bv_zext(32, 32, &witness);
-            let in_bounds = SymBool::symbolic(b.bv_ult(64, &w64, &lm.bytes));
+            let mut in_live = SymBool::symbolic(b.bv_ult(64, &w64, &lm.bytes));
+            if let Some(ref active_sr) = active_stack
+                && mid == active_sr.stack_mem
+            {
+                let ge_sp = SymBool::symbolic(b.bv_uge(32, &witness, &active_sr.sp_in.term));
+                in_live = in_live.and(b, &ge_sp);
+            }
             let l_byte = eval_mem_byte(b, lm, &witness);
             let r_byte = eval_mem_byte(b, rm, &witness);
             let eq_byte = b.eq(&l_byte, &r_byte);
             let byte_diff = SymBool::symbolic(b.not(&eq_byte));
-            let mem_diff = in_bounds.and(b, &byte_diff);
+            let mem_diff = in_live.and(b, &byte_diff);
             non_trap_diff = non_trap_diff.or(b, &mem_diff);
             let active_mem_diff = neither_trapped.and(b, &mem_diff);
             mem_witnesses.push(MemExtraction {
@@ -2992,32 +3340,13 @@ fn run_check_equivalence_inner<B: SmtTarget>(
                 mem: lm,
                 witness: Some((witness, active_mem_diff.term)),
             });
-        } else if !lm.read_addrs.is_empty() || !rm.read_addrs.is_empty() {
+        } else if !lm.read_addrs.borrow().is_empty() {
             mem_witnesses.push(MemExtraction { id: mid, mem: lm, witness: None });
         }
     }
 
     let neither_and_diff = neither_trapped.and(b, &non_trap_diff);
-    let diff = trap_mismatch.or(b, &trap_code_diff).or(b, &neither_and_diff);
-
-    // Merge RHS read_addrs into model extraction info cleanly via cloned MemSym snapshots if needed.
-    struct OwnedMemExtraction<T> {
-        id: MemId,
-        mem: MemSym<T>,
-        witness: Option<(T, T)>,
-    }
-    let mut merged_mems: Vec<OwnedMemExtraction<B::Term>> = Vec::new();
-    for entry in mem_witnesses {
-        let mut m = entry.mem.clone();
-        if let Some(rm) = rhs_state.mems.get(&entry.id) {
-            m.read_addrs.extend(rm.read_addrs.iter().cloned());
-        }
-        merged_mems.push(OwnedMemExtraction { id: entry.id, mem: m, witness: entry.witness });
-    }
-    let refs: Vec<MemExtraction<'_, B::Term>> = merged_mems
-        .iter()
-        .map(|o| MemExtraction { id: o.id, mem: &o.mem, witness: o.witness.clone() })
-        .collect();
+    let diff = trap_mismatch.or(b, &trap_code_diff).or(b, &neither_and_diff).or(b, &sp_leak);
 
     if let Some(ref rc) = uf_table {
         let tbl = rc.borrow();
@@ -3027,7 +3356,15 @@ fn run_check_equivalence_inner<B: SmtTarget>(
         tbl.assert_congruence_axioms(b)?;
     }
 
-    solve_with_overflow_guard(b, &diff.term, &overflow, &param_syms, &global_syms, &refs)
+    solve_with_overflow_guard(
+        b,
+        &diff.term,
+        &overflow,
+        rhs_state.budget.is_exceeded(),
+        &param_syms,
+        &global_syms,
+        &mem_witnesses,
+    )
 }
 
 fn validate_contract_spec(contract: &ContractSpec<'_>) -> Result<(), SieveError> {
@@ -3067,6 +3404,27 @@ fn validate_contract_spec(contract: &ContractSpec<'_>) -> Result<(), SieveError>
                 total,
                 contract.results.len()
             )));
+        }
+    }
+    if let Some(sf) = &contract.slice_frame {
+        for (role, expr) in [("base", sf.base), ("len", sf.len)] {
+            if let SliceBoundExpr::Param(vid) = expr {
+                match contract.params.iter().find(|(id, _)| *id == vid) {
+                    Some((_, ValType::I32)) => {}
+                    Some((_, other)) => {
+                        return Err(SieveError::EncodingError(format!(
+                            "SliceFrame {role} param ValId({}) must be I32, got {:?}",
+                            vid.0, other
+                        )));
+                    }
+                    None => {
+                        return Err(SieveError::EncodingError(format!(
+                            "SliceFrame {role} references unknown param ValId({})",
+                            vid.0
+                        )));
+                    }
+                }
+            }
         }
     }
     Ok(())
@@ -3152,6 +3510,24 @@ fn run_check_contract_inner<B: SmtTarget>(
 ) -> Result<SmtResult, SieveError> {
     let mut base_state =
         ExecState::from_module_with_mode(b, module, query_prefix, contract.use_initial_state)?;
+    if let Some(sf) = &contract.slice_frame
+        && !base_state.mems.contains_key(&sf.mem)
+    {
+        return Err(SieveError::EncodingError(format!(
+            "SliceFrame references unknown memory {:?}",
+            sf.mem
+        )));
+    }
+    let active_stack = match contract.stack_refinement {
+        Some(sr) => apply_stack_refinement_pre(
+            b,
+            module,
+            &mut base_state,
+            sr,
+            contract.use_initial_state,
+        )?,
+        None => None,
+    };
     let global_syms: Vec<(GlobalId, SymVal<B::Term>)> =
         base_state.globals.iter().map(|(&gid, g)| (gid, g.val.clone())).collect();
     let uf_table = uf_strata.map(|set| UfTable::new(set, query_prefix.to_string()));
@@ -3166,15 +3542,6 @@ fn run_check_contract_inner<B: SmtTarget>(
     }
 
     let mut overflow = SymBool::from_const(b, false);
-    let mut all_reads: BTreeMap<MemId, Vec<(B::Term, MemWidth)>> = BTreeMap::new();
-    let merge_reads = |state: &ExecState<B::Term>,
-                       dst: &mut BTreeMap<MemId, Vec<(B::Term, MemWidth)>>| {
-        for (mid, mem) in &state.mems {
-            if !mem.read_addrs.is_empty() {
-                dst.entry(*mid).or_default().extend(mem.read_addrs.iter().cloned());
-            }
-        }
-    };
 
     // 1. Pre-state invariant (assumed ONLY for inductive checks, i.e., !use_initial_state).
     if !contract.use_initial_state
@@ -3184,7 +3551,6 @@ fn run_check_contract_inner<B: SmtTarget>(
         inv_pre.env.clear();
         let inv_ok = eval_contract_pred(b, module, registry, &mut inv_pre, inv, "invariant(pre)")?;
         overflow = overflow.or(b, &inv_pre.unroll_overflow);
-        merge_reads(&inv_pre, &mut all_reads);
         // Guard with `unroll_overflow || inv_ok` so Phase 1 (!overflow) strictly enforces `inv_ok`
         // while Phase 2 (overflow) still catches reachable unroll overflow inside `invariant(pre)`.
         let inv_or_over = inv_pre.unroll_overflow.or(b, &inv_ok);
@@ -3203,7 +3569,6 @@ fn run_check_contract_inner<B: SmtTarget>(
         }
         let req_ok = eval_contract_pred(b, module, registry, &mut req_state, req, "requires")?;
         overflow = overflow.or(b, &req_state.unroll_overflow);
-        merge_reads(&req_state, &mut all_reads);
         let req_or_over = req_state.unroll_overflow.or(b, &req_ok);
         let req_cond = req_state.path_assumptions.and(b, &req_or_over);
         b.assert_formula(&req_cond.term)?;
@@ -3236,8 +3601,10 @@ fn run_check_contract_inner<B: SmtTarget>(
             .collect()
     };
 
-    // 4. Evaluate post-state obligations (`invariant(post)` and `ensures`) on clean paths.
+    // 4. Evaluate post-state obligations (`invariant(post)`, `ensures`, `StackRefinement`,
+    //    and `SliceFrame`) on clean paths.
     let mut post_ok = SymBool::from_const(b, true);
+    let mut slice_witness: Option<(MemId, B::Term, B::Term)> = None;
     if entry_reachable {
         if let Some(inv) = contract.invariant {
             let mut inv_post = entry_state.clone();
@@ -3247,13 +3614,9 @@ fn run_check_contract_inner<B: SmtTarget>(
             inv_post.assert_failed = SymBool::from_const(b, false);
             inv_post.path_active = entry_clean.clone();
             inv_post.path_assumptions = SymBool::from_const(b, true);
-            for mem in inv_post.mems.values_mut() {
-                mem.read_addrs.clear();
-            }
             let inv_ok =
                 eval_contract_pred(b, module, registry, &mut inv_post, inv, "invariant(post)")?;
             overflow = overflow.or(b, &inv_post.unroll_overflow);
-            merge_reads(&inv_post, &mut all_reads);
             if !matches!(inv_post.path_assumptions.konst, Some(true)) {
                 b.assert_formula(&inv_post.path_assumptions.term)?;
             }
@@ -3297,16 +3660,82 @@ fn run_check_contract_inner<B: SmtTarget>(
             ens_state.assert_failed = SymBool::from_const(b, false);
             ens_state.path_active = entry_clean.clone();
             ens_state.path_assumptions = SymBool::from_const(b, true);
-            for mem in ens_state.mems.values_mut() {
-                mem.read_addrs.clear();
-            }
             let ens_ok = eval_contract_pred(b, module, registry, &mut ens_state, ens, "ensures")?;
             overflow = overflow.or(b, &ens_state.unroll_overflow);
-            merge_reads(&ens_state, &mut all_reads);
             if !matches!(ens_state.path_assumptions.konst, Some(true)) {
                 b.assert_formula(&ens_state.path_assumptions.term)?;
             }
             post_ok = post_ok.and(b, &ens_ok);
+        }
+
+        // Shadow-stack preservation: on every clean path, `entry_sp_out == SP_in`.
+        if let Some(ref active_sr) = active_stack
+            && let Some(sp_out) = entry_state.globals.get(&active_sr.sp_global)
+        {
+            let sp_eq = b.eq(&sp_out.val.term, &active_sr.sp_in.term);
+            let sp_preserved = SymBool::symbolic(sp_eq);
+            post_ok = post_ok.and(b, &sp_preserved);
+        }
+
+        // Intra-memory `SliceFrame`: no memory growth and every untouched live byte `w`
+        // outside the 64-bit non-wrapping interval `[base, base + len)` is bit-for-bit preserved.
+        if let Some(sf) = &contract.slice_frame {
+            let mem_post = entry_state.mems.get(&sf.mem).expect("validated");
+            if mem_post.touched_by_write_or_grow {
+                let resolve_bound =
+                    |b: &mut B, expr: SliceBoundExpr| -> Result<B::Term, SieveError> {
+                        match expr {
+                            SliceBoundExpr::Const(c) => Ok(b.bv_const(32, c as u64)),
+                            SliceBoundExpr::Param(vid) => param_syms
+                                .iter()
+                                .find(|(id, _)| *id == vid)
+                                .map(|(_, sv)| sv.term.clone())
+                                .ok_or_else(|| {
+                                    SieveError::EncodingError(format!(
+                                        "SliceFrame references unknown param ValId({})",
+                                        vid.0
+                                    ))
+                                }),
+                        }
+                    };
+                let base32 = resolve_bound(b, sf.base)?;
+                let len32 = resolve_bound(b, sf.len)?;
+                let w = b.fresh_bv(&format!("{query_prefix}_slice_w_mem_{}", sf.mem.0), 32);
+                let w64 = b.bv_zext(32, 32, &w);
+                let b64 = b.bv_zext(32, 32, &base32);
+                let l64 = b.bv_zext(32, 32, &len32);
+                let end64 = b.bv_add(64, &b64, &l64);
+
+                let ge_base = b.bv_uge(64, &w64, &b64);
+                let lt_end = b.bv_ult(64, &w64, &end64);
+                let in_allowed = b.and(&ge_base, &lt_end);
+                let outside_allowed = SymBool::symbolic(b.not(&in_allowed));
+
+                let in_init_mem = SymBool::symbolic(b.bv_ult(64, &w64, &mem_post.init_bytes));
+                let in_live = if let Some(ref active_sr) = active_stack
+                    && active_sr.stack_mem == sf.mem
+                {
+                    let ge_sp = SymBool::symbolic(b.bv_uge(32, &w, &active_sr.sp_in.term));
+                    in_init_mem.and(b, &ge_sp)
+                } else {
+                    in_init_mem
+                };
+                let untouched = in_live.and(b, &outside_allowed);
+
+                let pre_byte = b.array_select(&mem_post.init_array, &w);
+                let post_byte = eval_mem_byte(b, mem_post, &w);
+                let byte_eq = b.eq(&pre_byte, &post_byte);
+                let byte_changed = SymBool::symbolic(b.not(&byte_eq));
+                let clobbered = untouched.and(b, &byte_changed);
+
+                let size_unchanged = SymBool::symbolic(b.eq(&mem_post.bytes, &mem_post.init_bytes));
+                let no_clobber = clobbered.not(b);
+                let slice_ok = size_unchanged.and(b, &no_clobber);
+                post_ok = post_ok.and(b, &slice_ok);
+
+                let active_clobber = entry_clean.and(b, &clobbered);
+                slice_witness = Some((sf.mem, w, active_clobber.term));
+            }
         }
     }
 
@@ -3320,16 +3749,20 @@ fn run_check_contract_inner<B: SmtTarget>(
     };
     let violated = holds.not(b);
 
-    for (mid, mem) in &mut entry_state.mems {
-        if let Some(extra) = all_reads.remove(mid) {
-            mem.read_addrs.extend(extra);
-        }
-    }
     let mem_extractions: Vec<MemExtraction<'_, B::Term>> = entry_state
         .mems
         .iter()
-        .filter(|(_, m)| !m.read_addrs.is_empty())
-        .map(|(&id, mem)| MemExtraction { id, mem, witness: None })
+        .filter_map(|(&id, mem)| {
+            let witness = slice_witness
+                .as_ref()
+                .filter(|(wid, _, _)| *wid == id)
+                .map(|(_, w_term, cond_term)| (w_term.clone(), cond_term.clone()));
+            if witness.is_some() || !mem.read_addrs.borrow().is_empty() {
+                Some(MemExtraction { id, mem, witness })
+            } else {
+                None
+            }
+        })
         .collect();
 
     if let Some(ref rc) = uf_table {
@@ -3344,6 +3777,7 @@ fn run_check_contract_inner<B: SmtTarget>(
         b,
         &violated.term,
         &overflow,
+        entry_state.budget.is_exceeded(),
         &param_syms,
         &global_syms,
         &mem_extractions,

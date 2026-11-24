@@ -3,8 +3,10 @@
 use bitwuzla::{Bitwuzla, Kind, Opt, Options, SatResult, Sort, Term, TermManager};
 use gnomon_kernel::{Module, Region, StratumRegistry, VcObligation};
 
-use crate::smt_ir::{RawSat, SmtTarget, run_check_contract, run_check_equivalence, run_check_vc};
-use crate::{ContractSpec, SieveError, SmtBackend, SmtResult};
+use crate::smt_ir::{
+    RawSat, SmtTarget, run_check_contract, run_check_equivalence_with_options, run_check_vc,
+};
+use crate::{ContractSpec, EquivOptions, SieveError, SmtBackend, SmtResult};
 
 /// Native in-process Bitwuzla `QF_ABV` solver backend.
 #[derive(Clone, Debug, Default)]
@@ -59,16 +61,26 @@ impl SmtBackend for BitwuzlaNativeBackend {
         run_check_vc(&mut session, module, registry, vc, &prefix)
     }
 
-    fn check_equivalence(
+    fn check_equivalence_with_options(
         &mut self,
         module: &Module,
         registry: &StratumRegistry,
         lhs: &Region,
         rhs: &Region,
         precondition: Option<&Region>,
+        opts: &EquivOptions,
     ) -> Result<SmtResult, SieveError> {
         let (mut session, prefix) = self.new_session()?;
-        run_check_equivalence(&mut session, module, registry, lhs, rhs, precondition, &prefix)
+        run_check_equivalence_with_options(
+            &mut session,
+            module,
+            registry,
+            lhs,
+            rhs,
+            precondition,
+            opts,
+            &prefix,
+        )
     }
 
     fn check_contract(

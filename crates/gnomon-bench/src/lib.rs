@@ -4,6 +4,7 @@
 
 pub mod corpus;
 pub mod phase1;
+pub mod wasm_smith;
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -14,6 +15,11 @@ pub use corpus::{
 pub use phase1::{
     CaseGateReport, Phase1Report, run_phase1_gate, run_phase1_gate_with_config,
     verify_counterexample_in_kernel,
+};
+pub use wasm_smith::{
+    DEFAULT_BASE_SEED, LatencyStats, WasmSmithFailure, WasmSmithGateConfig, WasmSmithGateReport,
+    generate_wasm_for_attempt, gnomon_wasm_smith_config, run_wasm_smith_gate,
+    scan_wasm_smith_gate,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

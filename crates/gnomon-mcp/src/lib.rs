@@ -11,8 +11,8 @@ pub mod rust_bridge;
 pub use engine::{
     CheckContractOutput, CheckContractRequest, CheckGoalOutput, ContractCounterexampleJson,
     ContractMemoryBytesJson, ContractOpResult, ContractPred, CounterexampleJson, DefineOpOutput,
-    EngineSnapshot, FuncSummary, GnomonEngine, LiftCheckOutput, MemoryDiffEntry, ProveLawOutput,
-    RunTraceOutput,
+    EngineSnapshot, FuncSummary, GnomonEngine, LiftCheckOutput, MemoryDiffEntry, PreparedGoal,
+    ProveLawOutput, RunTraceOutput, parse_slice_frame_spec, prepare_goal_artifacts,
 };
 pub use ir_codec::{
     InputType, IrBinOp, IrCallTarget, IrDocument, IrEffectOp, IrFuncDef, IrGlobalDef,
@@ -22,7 +22,7 @@ pub use ir_codec::{
     load_artifact_from_mcp_arg, load_artifact_from_mcp_arg_with_registry, read_input_bytes,
     resolve_input_type,
 };
-pub use mcp_server::GnomonMcpServer;
+pub use mcp_server::{GnomonMcpServer, SliceFrameParam};
 pub use rust_bridge::{
     bind_stratum_imports, compile_rust_to_wasm, compile_rust_to_wasm_with_registry,
     generate_strata_rs, looks_like_rust_source, lower_module_strata, module_has_stratum_calls,

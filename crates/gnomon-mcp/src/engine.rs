@@ -4,15 +4,16 @@ use std::path::Path;
 use std::time::Instant;
 
 use gnomon_kernel::{
-    BinOp, FuncDef, FuncId, HeapState, Law, LawKind, LawList, MemId, MemWidth, MemoryDef, Module,
-    Op, Region, RegionBuilder, RegionNode, RegionRef, Stmt, Stratum, StratumId, StratumOp,
-    StratumRegistry, TrapCode, UnOp, Val, ValId, ValType, eval_func, eval_region,
-    split_invariant_loop, validate_read_only_with_registry,
+    BinOp, CallTarget, FuncDef, FuncId, HeapState, HostCallId, Law, LawKind, LawList, MemId,
+    MemWidth, MemoryDef, Module, Op, Region, RegionBuilder, RegionNode, RegionRef, Stmt, Stratum,
+    StratumId, StratumOp, StratumRegistry, TrapCode, UnOp, Val, ValId, ValType, eval_func,
+    eval_region, split_invariant_loop, validate_read_only_with_registry,
 };
 use gnomon_sieve::{
-    BitwuzlaNativeBackend, ConsolidationConfig, ConsolidationReport, ContractSpec,
-    EgglogSimplifier, EqSatConfig, SmtBackend, SmtModel, SmtResult, consolidate_registry,
-    eqsat::count_region_nodes, render_autodoc,
+    BitwuzlaNativeBackend, CliffReport, ConsolidationConfig, ConsolidationReport, ContractSpec,
+    EgglogSimplifier, EqSatConfig, EquivOptions, FuncCliffReport, SliceBoundExpr, SliceFrameSpec,
+    SmtBackend, SmtModel, SmtResult, StackRefinement, consolidate_registry,
+    eqsat::count_region_nodes, estimate_region_cliff, estimate_smt_cliff, render_autodoc,
 };
 use gnomon_wasm::{ExecOutcome, FuzzConfig, FuzzOutcome, emit_wasm, fuzz_equivalence};
 use serde::{Deserialize, Serialize};
@@ -26,7 +27,7 @@ use crate::ir_codec::{
 };
 use crate::rust_bridge::{
     bind_stratum_imports, generate_strata_rs, lower_module_strata, module_has_stratum_calls,
-    module_has_stratum_imports, normalize_nested_returns_for_stratum,
+    module_has_stratum_imports, normalize_nested_returns_for_stratum, rewrite_region_call_targets,
 };
 
 /// Persistent JSON snapshot for CLI `--state` / MCP session durability.
@@ -249,6 +250,8 @@ impl GnomonEngine {
                         read_only: validate_read_only_with_registry(&f.body, &self.registry),
                     })
                     .collect();
+                let cliff_report = estimate_smt_cliff(&module, &self.registry);
+                let cliff_warnings = cliff_report.warnings.clone();
                 let ir_doc = if include_ir {
                     Some(IrDocument::from_module(&module))
                 } else {
@@ -267,12 +270,35 @@ impl GnomonEngine {
                     functions,
                     roundtrip_wasm_valid: Some(roundtrip_ok),
                     diagnostics,
+                    cliff_report: Some(cliff_report),
+                    cliff_warnings,
                     ir: ir_doc,
                 })
             }
             LoadedArtifact::Region { params, results, region } => {
                 let ssa_nodes = count_region_nodes(&region);
                 let ro = validate_read_only_with_registry(&region, &self.registry);
+                let region_metrics = estimate_region_cliff(&region, &self.registry);
+                let cliff_warnings = region_metrics.warnings.clone();
+                let cliff_report = CliffReport {
+                    level: region_metrics.level,
+                    total_ssa_nodes: region_metrics.ssa_nodes,
+                    total_nonlinear_ops: region_metrics.nonlinear_ops,
+                    total_nonlinear64_ops: region_metrics.nonlinear64_ops,
+                    max_nonlinear_chain_depth: region_metrics.max_nonlinear_chain_depth,
+                    max_nonlinear64_chain_depth: region_metrics.max_nonlinear64_chain_depth,
+                    total_mem_stores: region_metrics.mem_stores,
+                    total_conditional_mem_stores: region_metrics.conditional_mem_stores,
+                    max_loop_depth: region_metrics.max_loop_depth,
+                    has_unbounded_loop: region_metrics.has_unbounded_loop,
+                    functions: vec![FuncCliffReport {
+                        func_id: 0,
+                        name: "<region>".into(),
+                        export_name: None,
+                        metrics: region_metrics,
+                    }],
+                    warnings: cliff_warnings.clone(),
+                };
                 let ir_doc = if include_ir {
                     Some(IrDocument::from_region(&params, &results, &region))
                 } else {
@@ -314,6 +340,8 @@ impl GnomonEngine {
                     functions: vec![func_summary],
                     roundtrip_wasm_valid: None,
                     diagnostics: vec![format!("region loaded ({ssa_nodes} SSA nodes, read_only={ro})")],
+                    cliff_report: Some(cliff_report),
+                    cliff_warnings,
                     ir: ir_doc,
                 })
             }
@@ -632,11 +660,55 @@ impl GnomonEngine {
         precondition: Option<Region>,
         loop_postcondition: Option<Region>,
         timeout_ms: u64,
+        ignore_dead_stack: bool,
+    ) -> Result<CheckGoalOutput, GnomonError> {
+        self.check_goal_with_module(
+            None,
+            candidate,
+            spec,
+            params,
+            precondition,
+            loop_postcondition,
+            timeout_ms,
+            ignore_dead_stack,
+        )
+    }
+
+    /// Runs `check_goal` using an explicit module context (preserving `memories`, `globals`,
+    /// helper `funcs`, and `host_contracts` from `.wasm`/`.rs` inputs without requiring `--state`),
+    /// falling back to `self.active_module` when `context_module` is `None`.
+    ///
+    /// Note: `check_goal` routes directly to `egglog` + `Bitwuzla` (`check_equivalence_with_options`)
+    /// without Stage-1 raw-memory Wasmtime fuzzing so `--ignore-dead-stack` never suffers false
+    /// falsifications on dead shadow-stack bytes `[0 .. SP_in)`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn check_goal_with_module(
+        &mut self,
+        context_module: Option<Module>,
+        candidate: Region,
+        spec: Region,
+        params: Vec<IrTypedVar>,
+        precondition: Option<Region>,
+        loop_postcondition: Option<Region>,
+        timeout_ms: u64,
+        ignore_dead_stack: bool,
     ) -> Result<CheckGoalOutput, GnomonError> {
         let start = Instant::now();
         let k_params: Vec<(ValId, ValType)> =
             params.iter().map(|v| (ValId(v.id), v.ty.into())).collect();
-        let module = self.module_for_regions(&candidate, &spec, LawKind::Algebraic);
+        let mut module = match context_module {
+            Some(m) => m,
+            None => self.active_module.clone().unwrap_or_default(),
+        };
+        let mut mem_regions: Vec<&Region> = vec![&candidate, &spec];
+        if let Some(ref pre) = precondition {
+            mem_regions.push(pre);
+        }
+        if let Some(ref post) = loop_postcondition {
+            mem_regions.push(post);
+        }
+        ensure_memories_for_regions(&mut module, &self.registry, &mem_regions);
+
         let eqsat = EgglogSimplifier::new(EqSatConfig {
             max_iters: 5,
             max_nodes: 5_000,
@@ -645,6 +717,8 @@ impl GnomonEngine {
 
         // Case A: InvariantLoop VC splitting via frozen gnomon-kernel TCB!
         if matches!(candidate.root, RegionNode::InvariantLoop { .. }) {
+            let cliff_warnings =
+                collect_region_cliff_warnings(&[("candidate", &candidate)], &self.registry);
             let post = loop_postcondition.unwrap_or_else(|| spec.clone());
             let vcs = split_invariant_loop(k_params.clone(), precondition.clone(), &candidate, post)
                 .map_err(|e| GnomonError::Kernel(format!("VC splitter rejected loop: {e:?}")))?;
@@ -674,6 +748,7 @@ impl GnomonEngine {
                             nodes_before: count_region_nodes(&candidate),
                             nodes_after: count_region_nodes(&candidate),
                             vc_results: vc_statuses,
+                            cliff_warnings,
                             elapsed_ms: start.elapsed().as_secs_f64() * 1000.0,
                             counterexample: Some(CounterexampleJson {
                                 inputs: model
@@ -694,6 +769,7 @@ impl GnomonEngine {
                             nodes_before: count_region_nodes(&candidate),
                             nodes_after: count_region_nodes(&candidate),
                             vc_results: vc_statuses,
+                            cliff_warnings,
                             elapsed_ms: start.elapsed().as_secs_f64() * 1000.0,
                             counterexample: None,
                             detail: format!("InvariantLoop VC '{label}' unknown: {r}"),
@@ -709,6 +785,7 @@ impl GnomonEngine {
                 nodes_before: count_region_nodes(&candidate),
                 nodes_after: count_region_nodes(&candidate),
                 vc_results: vc_statuses,
+                cliff_warnings,
                 elapsed_ms: start.elapsed().as_secs_f64() * 1000.0,
                 counterexample: None,
                 detail: "all 3 InvariantLoop VCs (init, preservation, exit) proved".into(),
@@ -728,11 +805,25 @@ impl GnomonEngine {
 
         let nodes_before = rep_cand.nodes_before + rep_spec.nodes_before;
         let nodes_after = rep_cand.nodes_after + rep_spec.nodes_after;
+        let cliff_warnings = collect_region_cliff_warnings(
+            &[("candidate", &simp_cand), ("spec", &simp_spec)],
+            &self.registry,
+        );
 
         let mut backend = BitwuzlaNativeBackend::with_time_limit_ms(timeout_ms.max(100));
         let pre_ref = precondition.as_ref().filter(|p| **p != Region::empty());
+        let equiv_opts = EquivOptions {
+            stack_refinement: ignore_dead_stack.then(StackRefinement::default),
+        };
         let smt_res = backend
-            .check_equivalence(&module, &self.registry, &simp_cand, &simp_spec, pre_ref)
+            .check_equivalence_with_options(
+                &module,
+                &self.registry,
+                &simp_cand,
+                &simp_spec,
+                pre_ref,
+                &equiv_opts,
+            )
             .map_err(|e| GnomonError::Sieve(e.to_string()))?;
 
         match smt_res {
@@ -744,9 +835,15 @@ impl GnomonEngine {
                     nodes_before,
                     nodes_after,
                     vc_results: Vec::new(),
+                    cliff_warnings,
                     elapsed_ms: start.elapsed().as_secs_f64() * 1000.0,
                     counterexample: None,
-                    detail: "goal proved equivalent by egglog + Bitwuzla QF_ABV".into(),
+                    detail: if ignore_dead_stack {
+                        "goal proved equivalent (shadow-stack refined) by egglog + Bitwuzla QF_ABV"
+                            .into()
+                    } else {
+                        "goal proved equivalent by egglog + Bitwuzla QF_ABV".into()
+                    },
                 })
             }
             SmtResult::Sat(model) => {
@@ -764,6 +861,7 @@ impl GnomonEngine {
                     nodes_before,
                     nodes_after,
                     vc_results: Vec::new(),
+                    cliff_warnings,
                     elapsed_ms: start.elapsed().as_secs_f64() * 1000.0,
                     counterexample: Some(cex),
                     detail: "goal falsified by Bitwuzla QF_ABV".into(),
@@ -775,6 +873,7 @@ impl GnomonEngine {
                 nodes_before,
                 nodes_after,
                 vc_results: Vec::new(),
+                cliff_warnings,
                 elapsed_ms: start.elapsed().as_secs_f64() * 1000.0,
                 counterexample: None,
                 detail: format!("Bitwuzla returned unknown: {reason}"),
@@ -929,6 +1028,8 @@ impl GnomonEngine {
                     )
                 }
             };
+            let cliff_warnings =
+                collect_region_cliff_warnings(&[(&entry_name, &body)], &self.registry);
             let op_res = self.run_single_contract(
                 &module,
                 &entry_name,
@@ -940,6 +1041,8 @@ impl GnomonEngine {
                 resolved_inv.as_ref(),
                 req.use_initial_state,
                 req.check_trap_free,
+                req.ignore_dead_stack,
+                req.slice_frame,
                 req.timeout_ms,
                 "single",
             )?;
@@ -949,6 +1052,7 @@ impl GnomonEngine {
                 entry: Some(op_res.entry),
                 use_initial_state: req.use_initial_state,
                 check_trap_free: req.check_trap_free,
+                cliff_warnings,
                 elapsed_ms: start.elapsed().as_secs_f64() * 1000.0,
                 counterexample: op_res.counterexample,
                 op_results: Vec::new(),
@@ -982,6 +1086,16 @@ impl GnomonEngine {
             op_funcs.push(f);
         }
 
+        let mut cliff_targets: Vec<(&str, &Region)> =
+            Vec::with_capacity(op_funcs.len() + usize::from(init_func.is_some()));
+        if let Some(ref init_f) = init_func {
+            cliff_targets.push((&init_f.name, &init_f.body));
+        }
+        for op_f in &op_funcs {
+            cliff_targets.push((&op_f.name, &op_f.body));
+        }
+        let cliff_warnings = collect_region_cliff_warnings(&cliff_targets, &self.registry);
+
         let mut op_results = Vec::with_capacity(op_funcs.len() + usize::from(init_func.is_some()));
 
         // Base case: verify `init` from concrete initial state (`I(post_init)`).
@@ -997,6 +1111,8 @@ impl GnomonEngine {
                 resolved_inv.as_ref(),
                 true,
                 req.check_trap_free,
+                req.ignore_dead_stack,
+                req.slice_frame,
                 req.timeout_ms,
                 "init",
             )?;
@@ -1016,6 +1132,8 @@ impl GnomonEngine {
                 resolved_inv.as_ref(),
                 false,
                 req.check_trap_free,
+                req.ignore_dead_stack,
+                req.slice_frame,
                 req.timeout_ms,
                 "op",
             )?;
@@ -1073,6 +1191,7 @@ impl GnomonEngine {
             entry: None,
             use_initial_state: req.init.is_some(),
             check_trap_free: req.check_trap_free,
+            cliff_warnings,
             elapsed_ms: start.elapsed().as_secs_f64() * 1000.0,
             counterexample: first_cex,
             op_results,
@@ -1093,6 +1212,8 @@ impl GnomonEngine {
         invariant: Option<&ResolvedPred>,
         use_initial_state: bool,
         check_trap_free: bool,
+        ignore_dead_stack: bool,
+        slice_frame: Option<SliceFrameSpec>,
         timeout_ms: u64,
         role: &str,
     ) -> Result<ContractOpResult, GnomonError> {
@@ -1100,6 +1221,12 @@ impl GnomonEngine {
         let mut spec = ContractSpec::new(params, results, body)
             .with_check_trap_free(check_trap_free)
             .with_initial_state(use_initial_state);
+        if ignore_dead_stack {
+            spec = spec.with_stack_refinement(StackRefinement::default());
+        }
+        if let Some(sf) = slice_frame {
+            spec = spec.with_slice_frame(sf);
+        }
         if let Some(r) = requires {
             spec.requires = Some(&r.region);
             spec.requires_params = r.params.as_deref();
@@ -1295,6 +1422,10 @@ pub struct LiftCheckOutput {
     pub functions: Vec<FuncSummary>,
     pub roundtrip_wasm_valid: Option<bool>,
     pub diagnostics: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cliff_report: Option<CliffReport>,
+    #[serde(default)]
+    pub cliff_warnings: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ir: Option<IrDocument>,
 }
@@ -1354,6 +1485,8 @@ pub struct CheckGoalOutput {
     pub nodes_before: usize,
     pub nodes_after: usize,
     pub vc_results: Vec<String>,
+    #[serde(default)]
+    pub cliff_warnings: Vec<String>,
     pub elapsed_ms: f64,
     pub counterexample: Option<CounterexampleJson>,
     pub detail: String,
@@ -1392,6 +1525,11 @@ pub struct CheckContractRequest {
     pub use_initial_state: bool,
     /// Require trap-freedom on assumption-satisfying paths (default `true`).
     pub check_trap_free: bool,
+    /// Enable shadow-stack refinement (`StackRefinement::default()`): pins/constrains `SP_in`,
+    /// proves `SP_out == SP_in`, and ignores dead stack bytes strictly below `SP_in`.
+    pub ignore_dead_stack: bool,
+    /// Optional intra-memory write-frame restriction (`SliceFrameSpec`).
+    pub slice_frame: Option<SliceFrameSpec>,
     /// Bitwuzla per-check timeout budget in milliseconds (default `5_000`, clamped to `>= 100`).
     pub timeout_ms: u64,
 }
@@ -1408,6 +1546,8 @@ impl Default for CheckContractRequest {
             invariant: None,
             use_initial_state: false,
             check_trap_free: true,
+            ignore_dead_stack: false,
+            slice_frame: None,
             timeout_ms: 5_000,
         }
     }
@@ -1450,6 +1590,8 @@ pub struct CheckContractOutput {
     pub entry: Option<String>,
     pub use_initial_state: bool,
     pub check_trap_free: bool,
+    #[serde(default)]
+    pub cliff_warnings: Vec<String>,
     pub elapsed_ms: f64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub counterexample: Option<ContractCounterexampleJson>,
@@ -1732,6 +1874,11 @@ fn model_to_counterexample(
         globals: Vec::new(),
         fuel_remaining: 100_000,
     });
+    for &(gid, val) in &model.global_values {
+        if let Some(g) = heap.globals.get_mut(gid.0 as usize) {
+            *g = val;
+        }
+    }
     for (mem_id, bytes) in &model.memory_bytes {
         if let Some(mem) = heap.memories.get_mut(mem_id.0 as usize) {
             for &(off, b) in bytes {
@@ -2074,4 +2221,342 @@ fn max_mem_id_in_region(region: &Region) -> Option<u16> {
         mx
     }
     walk(region.as_ref())
+}
+
+// ===========================================================================
+// Static SMT-Cliff Helper, Goal Module Merger, and `--slice-frame` Parser
+// ===========================================================================
+
+fn collect_region_cliff_warnings(
+    regions: &[(&str, &Region)],
+    registry: &StratumRegistry,
+) -> Vec<String> {
+    let mut out = Vec::new();
+    for &(label, reg) in regions {
+        let metrics = estimate_region_cliff(reg, registry);
+        for w in metrics.warnings {
+            out.push(format!("[{label}] {w}"));
+        }
+    }
+    dedup_preserve_order(&mut out);
+    out
+}
+
+/// Prepared regions and merged module context for `GnomonEngine::check_goal_with_module`.
+#[derive(Clone, Debug)]
+pub struct PreparedGoal {
+    pub context_module: Option<Module>,
+    pub candidate_params: Vec<(ValId, ValType)>,
+    pub candidate: Region,
+    pub spec: Region,
+    pub precondition: Option<Region>,
+    pub loop_postcondition: Option<Region>,
+}
+
+fn remap_region_ids(
+    region: &Region,
+    func_offset: u32,
+    host_offset: u32,
+) -> Result<Region, GnomonError> {
+    if func_offset == 0 && host_offset == 0 {
+        return Ok(region.clone());
+    }
+    rewrite_region_call_targets(region, &mut |target| match target {
+        CallTarget::Func(fid) => Ok(CallTarget::Func(FuncId(fid.0 + func_offset))),
+        CallTarget::Host(hid) => Ok(CallTarget::Host(HostCallId(hid.0 + host_offset))),
+        CallTarget::Stratum(sid) => Ok(CallTarget::Stratum(sid)),
+    })
+}
+
+struct GoalModuleMerger {
+    merged: Option<Module>,
+    sources: Vec<(Module, u32, u32)>,
+}
+
+impl GoalModuleMerger {
+    fn new() -> Self {
+        Self { merged: None, sources: Vec::new() }
+    }
+
+    fn merge_module(&mut self, module: Module) -> Result<(u32, u32), GnomonError> {
+        for (prev, f_off, h_off) in &self.sources {
+            if *prev == module {
+                return Ok((*f_off, *h_off));
+            }
+        }
+        if self.merged.is_none() {
+            self.merged = Some(module.clone());
+            self.sources.push((module, 0, 0));
+            return Ok((0, 0));
+        }
+
+        let base = self.merged.as_mut().expect("checked is_some");
+        for mem in &module.memories {
+            if let Some(existing) = base.memories.iter_mut().find(|m| m.id == mem.id) {
+                let new_min = existing.min_pages.max(mem.min_pages);
+                existing.min_pages = new_min;
+                existing.max_pages = match (existing.max_pages, mem.max_pages) {
+                    (Some(a), Some(b)) => Some(a.max(b).max(new_min)),
+                    _ => None,
+                };
+            } else {
+                base.memories.push(mem.clone());
+            }
+        }
+        for g in &module.globals {
+            if !base.globals.iter().any(|bg| bg.id == g.id) {
+                base.globals.push(g.clone());
+            }
+        }
+
+        let func_off = base.funcs.iter().map(|f| f.id.0 + 1).max().unwrap_or(0);
+        let host_off = base.host_contracts.iter().map(|h| h.id.0 + 1).max().unwrap_or(0);
+
+        for hc in &module.host_contracts {
+            let mut remapped = hc.clone();
+            remapped.id = HostCallId(hc.id.0 + host_off);
+            remapped.precondition = remap_region_ids(&hc.precondition, func_off, host_off)?;
+            remapped.postcondition = remap_region_ids(&hc.postcondition, func_off, host_off)?;
+            if let Some(ref sim) = hc.sim_body {
+                remapped.sim_body = Some(remap_region_ids(sim, func_off, host_off)?);
+            }
+            base.host_contracts.push(remapped);
+        }
+        for f in &module.funcs {
+            let mut remapped = f.clone();
+            remapped.id = FuncId(f.id.0 + func_off);
+            remapped.body = remap_region_ids(&f.body, func_off, host_off)?;
+            base.funcs.push(remapped);
+        }
+
+        self.sources.push((module, func_off, host_off));
+        Ok((func_off, host_off))
+    }
+
+    fn extract(
+        &mut self,
+        artifact: LoadedArtifact,
+        entry: Option<&str>,
+    ) -> Result<(Vec<(ValId, ValType)>, Region), GnomonError> {
+        match artifact {
+            LoadedArtifact::Module(m) => {
+                let func = find_entry_func(&m, entry)?;
+                let params = func.params.clone();
+                let body = func.body.clone();
+                let (func_off, host_off) = self.merge_module(m)?;
+                let remapped_body = remap_region_ids(&body, func_off, host_off)?;
+                Ok((params, remapped_body))
+            }
+            LoadedArtifact::Region { params, results: _, region } => Ok((params, region)),
+        }
+    }
+}
+
+/// Extracts candidate, spec, precondition, and postcondition regions from loaded artifacts
+/// while preserving and merging full `Module` contexts (memories, globals, helper funcs,
+/// host contracts) with collision-free `FuncId`/`HostCallId` remapping across distinct modules.
+pub fn prepare_goal_artifacts(
+    cand_art: LoadedArtifact,
+    cand_entry: Option<&str>,
+    spec_art: LoadedArtifact,
+    spec_entry: Option<&str>,
+    pre_art: Option<(LoadedArtifact, Option<&str>)>,
+    post_art: Option<(LoadedArtifact, Option<&str>)>,
+) -> Result<PreparedGoal, GnomonError> {
+    let mut merger = GoalModuleMerger::new();
+    let (candidate_params, candidate) = merger.extract(cand_art, cand_entry)?;
+    let (_, spec) = merger.extract(spec_art, spec_entry)?;
+    let precondition = match pre_art {
+        Some((art, entry)) => Some(merger.extract(art, entry)?.1),
+        None => None,
+    };
+    let loop_postcondition = match post_art {
+        Some((art, entry)) => Some(merger.extract(art, entry)?.1),
+        None => None,
+    };
+    Ok(PreparedGoal {
+        context_module: merger.merged,
+        candidate_params,
+        candidate,
+        spec,
+        precondition,
+        loop_postcondition,
+    })
+}
+
+fn parse_u32_lit(raw: &str, full_spec: &str, field: &str) -> Result<u32, GnomonError> {
+    let s = raw.trim();
+    let parsed = if let Some(hex) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+        u32::from_str_radix(hex, 16)
+    } else {
+        s.parse::<u32>()
+    };
+    parsed.map_err(|_| {
+        GnomonError::InvalidInput(format!(
+            "invalid --slice-frame '{full_spec}': invalid u32 '{s}' for {field}"
+        ))
+    })
+}
+
+fn parse_slice_bound_expr(
+    raw: &str,
+    full_spec: &str,
+    field: &str,
+) -> Result<SliceBoundExpr, GnomonError> {
+    let s = raw.trim();
+    if let Some(rest) = s.strip_prefix("param:") {
+        let idx = parse_u32_lit(rest, full_spec, &format!("{field} param index"))?;
+        return Ok(SliceBoundExpr::Param(ValId(idx)));
+    }
+    if let Some(rest) = s.strip_prefix("const:") {
+        let val = parse_u32_lit(rest, full_spec, &format!("{field} const value"))?;
+        return Ok(SliceBoundExpr::Const(val));
+    }
+    let val = parse_u32_lit(s, full_spec, field)?;
+    Ok(SliceBoundExpr::Const(val))
+}
+
+/// Parses a CLI `--slice-frame <SPEC>` string into a `gnomon_sieve::SliceFrameSpec`.
+///
+/// Supported forms:
+/// - `readonly` (shorthand for `mem=0,base=0,len=0`)
+/// - `base=<param:N|U32>,len=<param:N|U32>` with optional `mem=<M>` (e.g. `base=param:2,len=32`,
+///   `mem=0,base=param:0,len=param:1`, `mem=1,readonly`)
+/// - `param:<BASE_IDX>:<LEN>` or `param:<BASE_IDX>:param:<LEN_IDX>` (shorthand on `mem=0`, e.g. `param:2:32`)
+pub fn parse_slice_frame_spec(raw: &str) -> Result<SliceFrameSpec, GnomonError> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(GnomonError::InvalidInput(
+            "invalid --slice-frame '': expected 'readonly', 'base=<param:N|U32>,len=<param:N|U32>' (optional 'mem=M'), or 'param:<N>:<LEN>'"
+                .into(),
+        ));
+    }
+
+    let lower = trimmed.to_ascii_lowercase();
+    if lower == "readonly" || lower == "read-only" || lower == "read_only" {
+        return Ok(SliceFrameSpec {
+            mem: MemId(0),
+            base: SliceBoundExpr::Const(0),
+            len: SliceBoundExpr::Const(0),
+        });
+    }
+
+    // Shorthand form: `param:<base_idx>:<len>` or `param:<base_idx>:param:<len_idx>`
+    if !trimmed.contains('=') && !trimmed.contains(',') {
+        let parts: Vec<&str> = trimmed.split(':').collect();
+        if parts.len() == 3 && parts[0] == "param" {
+            let base_idx = parse_u32_lit(parts[1], trimmed, "base param index")?;
+            let len_val = parse_u32_lit(parts[2], trimmed, "len")?;
+            return Ok(SliceFrameSpec {
+                mem: MemId(0),
+                base: SliceBoundExpr::Param(ValId(base_idx)),
+                len: SliceBoundExpr::Const(len_val),
+            });
+        }
+        if parts.len() == 4 && parts[0] == "param" && parts[2] == "param" {
+            let base_idx = parse_u32_lit(parts[1], trimmed, "base param index")?;
+            let len_idx = parse_u32_lit(parts[3], trimmed, "len param index")?;
+            return Ok(SliceFrameSpec {
+                mem: MemId(0),
+                base: SliceBoundExpr::Param(ValId(base_idx)),
+                len: SliceBoundExpr::Param(ValId(len_idx)),
+            });
+        }
+        return Err(GnomonError::InvalidInput(format!(
+            "invalid --slice-frame '{trimmed}': expected 'readonly', 'base=<param:N|U32>,len=<param:N|U32>' (optional 'mem=M'), or 'param:<N>:<LEN>'"
+        )));
+    }
+
+    // Key-value comma-separated form: `mem=0,base=param:2,len=32` or `mem=1,readonly`
+    let mut mem: Option<u16> = None;
+    let mut base: Option<SliceBoundExpr> = None;
+    let mut len: Option<SliceBoundExpr> = None;
+    let mut readonly = false;
+
+    for token in trimmed.split(',') {
+        let tok = token.trim();
+        if tok.is_empty() {
+            return Err(GnomonError::InvalidInput(format!(
+                "invalid --slice-frame '{trimmed}': empty comma-separated segment"
+            )));
+        }
+        let tok_lower = tok.to_ascii_lowercase();
+        if tok_lower == "readonly" || tok_lower == "read-only" || tok_lower == "read_only" {
+            if readonly {
+                return Err(GnomonError::InvalidInput(format!(
+                    "invalid --slice-frame '{trimmed}': duplicate 'readonly'"
+                )));
+            }
+            readonly = true;
+            continue;
+        }
+        let Some((k, v)) = tok.split_once('=') else {
+            return Err(GnomonError::InvalidInput(format!(
+                "invalid --slice-frame '{trimmed}': expected 'key=value' or 'readonly', got '{tok}'"
+            )));
+        };
+        match k.trim() {
+            "mem" => {
+                if mem.is_some() {
+                    return Err(GnomonError::InvalidInput(format!(
+                        "invalid --slice-frame '{trimmed}': duplicate key 'mem'"
+                    )));
+                }
+                let m = v.trim().parse::<u16>().map_err(|_| {
+                    GnomonError::InvalidInput(format!(
+                        "invalid --slice-frame '{trimmed}': invalid u16 mem id '{}'",
+                        v.trim()
+                    ))
+                })?;
+                mem = Some(m);
+            }
+            "base" => {
+                if base.is_some() {
+                    return Err(GnomonError::InvalidInput(format!(
+                        "invalid --slice-frame '{trimmed}': duplicate key 'base'"
+                    )));
+                }
+                base = Some(parse_slice_bound_expr(v, trimmed, "base")?);
+            }
+            "len" => {
+                if len.is_some() {
+                    return Err(GnomonError::InvalidInput(format!(
+                        "invalid --slice-frame '{trimmed}': duplicate key 'len'"
+                    )));
+                }
+                len = Some(parse_slice_bound_expr(v, trimmed, "len")?);
+            }
+            other => {
+                return Err(GnomonError::InvalidInput(format!(
+                    "invalid --slice-frame '{trimmed}': unknown key '{other}' (expected 'mem', 'base', 'len', or 'readonly')"
+                )));
+            }
+        }
+    }
+
+    let mem_id = MemId(mem.unwrap_or(0));
+    if readonly {
+        if base.is_some() || len.is_some() {
+            return Err(GnomonError::InvalidInput(format!(
+                "invalid --slice-frame '{trimmed}': cannot combine 'readonly' with explicit 'base' or 'len'"
+            )));
+        }
+        return Ok(SliceFrameSpec {
+            mem: mem_id,
+            base: SliceBoundExpr::Const(0),
+            len: SliceBoundExpr::Const(0),
+        });
+    }
+
+    let base = base.ok_or_else(|| {
+        GnomonError::InvalidInput(format!(
+            "invalid --slice-frame '{trimmed}': missing required 'base=...' (or use 'readonly')"
+        ))
+    })?;
+    let len = len.ok_or_else(|| {
+        GnomonError::InvalidInput(format!(
+            "invalid --slice-frame '{trimmed}': missing required 'len=...' (or use 'readonly')"
+        ))
+    })?;
+    Ok(SliceFrameSpec { mem: mem_id, base, len })
 }

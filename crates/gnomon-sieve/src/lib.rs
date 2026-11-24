@@ -7,12 +7,17 @@ use gnomon_kernel::{
     FuncDef, GlobalId, MemId, Module, Region, StratumRegistry, Val, ValId, ValType, VcObligation,
 };
 
+pub mod cliff;
 pub mod consolidate;
 pub mod eqsat;
 pub mod smt_bitwuzla;
 mod smt_ir;
 pub mod smt_pipe;
 
+pub use cliff::{
+    CliffLevel, CliffReport, FuncCliffReport, RegionCliffMetrics, estimate_region_cliff,
+    estimate_smt_cliff,
+};
 pub use consolidate::{
     ConsolidationConfig, ConsolidationReport, DiscoveredAbstraction, LawRedundancyReport,
     OpMdlReport, consolidate_registry, discover_candidate_inventions, encode_region_as_stitch_expr,
@@ -69,6 +74,69 @@ pub struct EqSatReport {
     pub nodes_after: usize,
 }
 
+/// Shadow-stack refinement configuration for Wasm modules compiled with a downward-growing
+/// shadow stack pointer (such as `rustc --target wasm32-unknown-unknown`'s `GlobalId(0)`).
+///
+/// When enabled:
+/// - `SP_in` is constrained either by pinning to `stack_pointer_global`'s `I32` initializer
+///   (when `pin_initial_sp == true` and `init >= min_stack_bytes`) or symbolically via
+///   `min_stack_bytes <=u SP_in`, `zext64(SP_in) <=u mem.init_bytes`, and `(SP_in & 0xf) == 0`.
+/// - Every active non-trapping execution MUST preserve the stack pointer (`SP_out == SP_in`);
+///   any stack-pointer leak is immediately falsified.
+/// - Dead scratch bytes strictly below `SP_in` (`[0 .. SP_in)`) in `stack_mem` are excluded
+///   from final memory equivalence and `SliceFrame` preservation checks, while EVERY live byte
+///   at `w >=u SP_in` is checked bit-for-bit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StackRefinement {
+    pub stack_pointer_global: GlobalId,
+    pub stack_mem: MemId,
+    pub min_stack_bytes: u32,
+    pub pin_initial_sp: bool,
+}
+
+impl Default for StackRefinement {
+    fn default() -> Self {
+        Self {
+            stack_pointer_global: GlobalId(0),
+            stack_mem: MemId(0),
+            min_stack_bytes: 4096,
+            pin_initial_sp: true,
+        }
+    }
+}
+
+/// Optional refinement settings for `SmtBackend::check_equivalence_with_options`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct EquivOptions {
+    pub stack_refinement: Option<StackRefinement>,
+}
+
+/// Bound expression for an intra-memory `SliceFrameSpec`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SliceBoundExpr {
+    /// Reads the 32-bit unsigned bound from an `I32` contract entry parameter.
+    Param(ValId),
+    /// Constant 32-bit unsigned byte offset or length.
+    Const(u32),
+}
+
+/// Intra-memory write-frame specification for `SmtBackend::check_contract`.
+///
+/// Asserts that on every active non-trapping path:
+/// - `mem` does not grow (`mem_post.bytes == mem_pre.init_bytes`), and
+/// - every untouched live byte `w` (satisfying `(w as u64) < mem_pre.init_bytes`,
+///   `w >=u SP_in` when `stack_refinement` targets `mem`, and `w` outside the
+///   64-bit non-wrapping interval `[base, base + len)`) satisfies `mem_post[w] == mem_pre[w]`.
+///
+/// Setting `len = SliceBoundExpr::Const(0)` proves the function is strictly read-only on
+/// all live memory.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SliceFrameSpec {
+    pub mem: MemId,
+    pub base: SliceBoundExpr,
+    pub len: SliceBoundExpr,
+}
+
 /// Specification of an application function/region contract verified by `SmtBackend::check_contract`.
 ///
 /// ## Pre-state semantics
@@ -114,6 +182,8 @@ pub struct ContractSpec<'a> {
     pub invariant: Option<&'a Region>,
     pub check_trap_free: bool,
     pub use_initial_state: bool,
+    pub stack_refinement: Option<StackRefinement>,
+    pub slice_frame: Option<SliceFrameSpec>,
 }
 
 impl<'a> ContractSpec<'a> {
@@ -135,6 +205,8 @@ impl<'a> ContractSpec<'a> {
             invariant: None,
             check_trap_free: true,
             use_initial_state: false,
+            stack_refinement: None,
+            slice_frame: None,
         }
     }
 
@@ -185,6 +257,16 @@ impl<'a> ContractSpec<'a> {
         self.use_initial_state = use_initial_state;
         self
     }
+
+    pub fn with_stack_refinement(mut self, stack_refinement: StackRefinement) -> Self {
+        self.stack_refinement = Some(stack_refinement);
+        self
+    }
+
+    pub fn with_slice_frame(mut self, slice_frame: SliceFrameSpec) -> Self {
+        self.slice_frame = Some(slice_frame);
+        self
+    }
 }
 
 /// Abstract SMT backend encoding loop-free `GnomonIR` obligations into `QF_ABV`.
@@ -203,6 +285,25 @@ pub trait SmtBackend {
         lhs: &Region,
         rhs: &Region,
         precondition: Option<&Region>,
+    ) -> Result<SmtResult, SieveError> {
+        self.check_equivalence_with_options(
+            module,
+            registry,
+            lhs,
+            rhs,
+            precondition,
+            &EquivOptions::default(),
+        )
+    }
+
+    fn check_equivalence_with_options(
+        &mut self,
+        module: &Module,
+        registry: &StratumRegistry,
+        lhs: &Region,
+        rhs: &Region,
+        precondition: Option<&Region>,
+        opts: &EquivOptions,
     ) -> Result<SmtResult, SieveError>;
 
     fn check_contract(

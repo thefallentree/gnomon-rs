@@ -242,9 +242,10 @@ impl EgglogSimplifier {
                 Stmt::Let { dst, ty, op } => {
                     if let Op::MemoryGrow { mem, delta } = op {
                         let delta_expr = lookup_egg(&val_env, delta, ValType::I32);
+                        let heap_id = heap_seq;
                         heap_seq += 1;
-                        let new_h = format!("$h{heap_seq}");
-                        program.push_str(&format!("(let {new_h} (OpaqueHeap {heap_seq}))\n"));
+                        let new_h = format!("$h{heap_id}");
+                        program.push_str(&format!("(let {new_h} (OpaqueHeap {heap_id}))\n"));
                         heap_sym = new_h;
                         val_env.insert(dst, (ty, format!("(Var {} {})", dst.0, ty_tag(ty))));
                         child_types.insert(dst, ty);
@@ -303,9 +304,10 @@ impl EgglogSimplifier {
                         let dst_e = lookup_egg(&val_env, dst, ValType::I32);
                         let src_e = lookup_egg(&val_env, src, ValType::I32);
                         let len_e = lookup_egg(&val_env, len, ValType::I32);
-                        let new_h = format!("$h{heap_seq}");
+                        let heap_id = heap_seq;
                         heap_seq += 1;
-                        program.push_str(&format!("(let {new_h} (OpaqueHeap {heap_seq}))\n"));
+                        let new_h = format!("$h{heap_id}");
+                        program.push_str(&format!("(let {new_h} (OpaqueHeap {heap_id}))\n"));
                         heap_sym = new_h;
                         plans.push(StmtPlan::Effect(
                             eff,
@@ -320,9 +322,10 @@ impl EgglogSimplifier {
                         let dst_e = lookup_egg(&val_env, dst, ValType::I32);
                         let val_e = lookup_egg(&val_env, val, ValType::I32);
                         let len_e = lookup_egg(&val_env, len, ValType::I32);
-                        let new_h = format!("$h{heap_seq}");
+                        let heap_id = heap_seq;
                         heap_seq += 1;
-                        program.push_str(&format!("(let {new_h} (OpaqueHeap {heap_seq}))\n"));
+                        let new_h = format!("$h{heap_id}");
+                        program.push_str(&format!("(let {new_h} (OpaqueHeap {heap_id}))\n"));
                         heap_sym = new_h;
                         plans.push(StmtPlan::Effect(
                             eff,
@@ -400,9 +403,10 @@ impl EgglogSimplifier {
                             continue;
                         }
                     } else {
-                        let new_h = format!("$h{heap_seq}");
+                        let heap_id = heap_seq;
                         heap_seq += 1;
-                        program.push_str(&format!("(let {new_h} (OpaqueHeap {heap_seq}))\n"));
+                        let new_h = format!("$h{heap_id}");
+                        program.push_str(&format!("(let {new_h} (OpaqueHeap {heap_id}))\n"));
                         heap_sym = new_h;
                         global_epoch += 1;
                     }
@@ -438,9 +442,10 @@ impl EgglogSimplifier {
                             })
                             .collect();
                     if !validate_read_only_with_registry(&sub_simplified, registry) {
-                        let new_h = format!("$h{heap_seq}");
+                        let heap_id = heap_seq;
                         heap_seq += 1;
-                        program.push_str(&format!("(let {new_h} (OpaqueHeap {heap_seq}))\n"));
+                        let new_h = format!("$h{heap_id}");
+                        program.push_str(&format!("(let {new_h} (OpaqueHeap {heap_id}))\n"));
                         heap_sym = new_h;
                         global_epoch += 1;
                     }

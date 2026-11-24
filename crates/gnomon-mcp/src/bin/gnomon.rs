@@ -7,7 +7,8 @@ use std::process::ExitCode;
 use clap::{Parser, Subcommand, ValueEnum};
 use gnomon_mcp::{
     CheckContractRequest, ContractPred, GnomonEngine, GnomonError, GnomonMcpServer, InputType,
-    IrDocument, IrLawKind, IrTypedVar, IrVal, IrValType, LoadedArtifact, read_input_bytes,
+    IrDocument, IrLawKind, IrTypedVar, IrVal, IrValType, LoadedArtifact, parse_slice_frame_spec,
+    prepare_goal_artifacts, read_input_bytes,
 };
 use gnomon_sieve::ConsolidationConfig;
 use gnomon_wasm::emit_wasm;
@@ -179,11 +180,14 @@ enum Commands {
         /// Timeout budget in milliseconds.
         #[arg(long, default_value_t = 5_000)]
         timeout_ms: u64,
+        /// Ignore dead shadow-stack bytes below SP_in (`Global(0)`) while proving SP preservation and exact live-memory equivalence.
+        #[arg(long)]
+        ignore_dead_stack: bool,
     },
 
     /// Verify pre/post contracts, trap-freedom, inline assume/assert, or inductive multi-op invariant suites.
     CheckContract {
-        /// Path to a .wasm or .ir module/region, or '-' / omitted to read stdin (or active --state module).
+        /// Path to a .wasm, .rs, or .ir module/region, or '-' / omitted to read stdin (or active --state module).
         input: Option<String>,
         /// Single-op mode: entry function name inside the module (defaults to func 0).
         #[arg(long)]
@@ -194,13 +198,13 @@ enum Commands {
         /// Inductive suite mode: optional initializer function name checked from initial state (I(post_init)).
         #[arg(long)]
         init: Option<String>,
-        /// Precondition function name in module or path to external .wasm/.ir predicate (single-op mode).
+        /// Precondition function name in module or path to external .wasm/.rs/.ir predicate (single-op mode).
         #[arg(long)]
         requires: Option<String>,
-        /// Postcondition function name in module or path to external .wasm/.ir predicate (single-op mode).
+        /// Postcondition function name in module or path to external .wasm/.rs/.ir predicate (single-op mode).
         #[arg(long)]
         ensures: Option<String>,
-        /// State invariant function name (0-arg () -> i32) in module or path to external .wasm/.ir predicate.
+        /// State invariant function name (0-arg () -> i32) in module or path to external .wasm/.rs/.ir predicate.
         #[arg(long)]
         invariant: Option<String>,
         /// Single-op mode: start from concrete initial state (GlobalDef::init + zeroed min_pages + init_data) and do NOT assume invariant on pre-state.
@@ -209,6 +213,12 @@ enum Commands {
         /// Allow traps on assumption-satisfying paths (checks partial correctness only).
         #[arg(long)]
         allow_traps: bool,
+        /// Ignore dead shadow-stack bytes below SP_in (`Global(0)`) while proving SP preservation.
+        #[arg(long)]
+        ignore_dead_stack: bool,
+        /// Intra-memory write-frame restriction: `readonly` (zero live writes), `base=<param:N|U32>,len=<param:N|U32>` (optional `mem=M`), or `param:<N>:<LEN>` (e.g. `base=param:2,len=32`, `mem=0,base=param:0,len=param:1`, `param:2:32`).
+        #[arg(long, value_name = "SPEC")]
+        slice_frame: Option<String>,
         /// Bitwuzla per-check timeout budget in milliseconds.
         #[arg(long, default_value_t = 5_000)]
         timeout_ms: u64,
@@ -521,42 +531,71 @@ fn run(cli: Cli) -> Result<bool, GnomonError> {
             post_entry,
             params,
             timeout_ms,
+            ignore_dead_stack,
         } => {
             let mut eng = match &cli.state {
                 Some(p) => GnomonEngine::load_state_file(p)?,
                 None => GnomonEngine::new(),
             };
             let (_, cand_art) = load_cli_artifact(&eng, Some(candidate.as_str()), input_type)?;
-            let (_, cand_params, _, cand_reg) = cand_art.into_region(candidate_entry.as_deref())?;
-            let (_, spec_art) = load_cli_artifact(&eng, Some(spec.as_str()), input_type)?;
-            let (_, _, _, spec_reg) = spec_art.into_region(spec_entry.as_deref())?;
-            let pre_reg = match pre {
-                Some(p) => Some(
-                    load_cli_artifact(&eng, Some(p.as_str()), input_type)?
-                        .1
-                        .into_region(pre_entry.as_deref())?
-                        .3,
-                ),
+            let spec_art = if spec != "-" && spec == candidate {
+                cand_art.clone()
+            } else {
+                load_cli_artifact(&eng, Some(spec.as_str()), input_type)?.1
+            };
+            let pre_art = match pre {
+                Some(p) => {
+                    let art = if p != "-" && p == candidate {
+                        cand_art.clone()
+                    } else if p != "-" && p == spec {
+                        spec_art.clone()
+                    } else {
+                        load_cli_artifact(&eng, Some(p.as_str()), input_type)?.1
+                    };
+                    Some((art, pre_entry))
+                }
                 None => None,
             };
-            let post_reg = match post {
-                Some(p) => Some(
-                    load_cli_artifact(&eng, Some(p.as_str()), input_type)?
-                        .1
-                        .into_region(post_entry.as_deref())?
-                        .3,
-                ),
+            let post_art = match post {
+                Some(p) => {
+                    let art = if p != "-" && p == candidate {
+                        cand_art.clone()
+                    } else if p != "-" && p == spec {
+                        spec_art.clone()
+                    } else {
+                        load_cli_artifact(&eng, Some(p.as_str()), input_type)?.1
+                    };
+                    Some((art, post_entry))
+                }
                 None => None,
             };
+            let prepared = prepare_goal_artifacts(
+                cand_art,
+                candidate_entry.as_deref(),
+                spec_art,
+                spec_entry.as_deref(),
+                pre_art.as_ref().map(|(a, e)| (a.clone(), e.as_deref())),
+                post_art.as_ref().map(|(a, e)| (a.clone(), e.as_deref())),
+            )?;
             let k_params: Vec<IrTypedVar> = match params {
                 Some(s) => serde_json::from_str(&s)
                     .map_err(|e| GnomonError::InvalidInput(format!("invalid --params JSON: {e}")))?,
-                None => cand_params
+                None => prepared
+                    .candidate_params
                     .into_iter()
                     .map(|(vid, ty)| IrTypedVar { id: vid.0, ty: ty.into() })
                     .collect(),
             };
-            let out = eng.check_goal(cand_reg, spec_reg, k_params, pre_reg, post_reg, timeout_ms)?;
+            let out = eng.check_goal_with_module(
+                prepared.context_module,
+                prepared.candidate,
+                prepared.spec,
+                k_params,
+                prepared.precondition,
+                prepared.loop_postcondition,
+                timeout_ms,
+                ignore_dead_stack,
+            )?;
             if let Some(ref p) = cli.state {
                 eng.save_state_file(p)?;
             }
@@ -577,12 +616,18 @@ fn run(cli: Cli) -> Result<bool, GnomonError> {
             invariant,
             init_state,
             allow_traps,
+            ignore_dead_stack,
+            slice_frame,
             timeout_ms,
         } => {
             let eng = match &cli.state {
                 Some(p) => GnomonEngine::load_state_file(p)?,
                 None => GnomonEngine::new(),
             };
+            let parsed_slice_frame = slice_frame
+                .as_deref()
+                .map(parse_slice_frame_spec)
+                .transpose()?;
             let art_override = match input.as_deref() {
                 Some(p) => Some(load_cli_artifact(&eng, Some(p), input_type)?.1),
                 None => {
@@ -629,6 +674,8 @@ fn run(cli: Cli) -> Result<bool, GnomonError> {
                 invariant: inv_pred,
                 use_initial_state: init_state,
                 check_trap_free: !allow_traps,
+                ignore_dead_stack,
+                slice_frame: parsed_slice_frame,
                 timeout_ms,
             })?;
             println!(
