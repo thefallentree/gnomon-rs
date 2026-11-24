@@ -1,25 +1,56 @@
 # Project Gnomon (`gnomon-rs`)
 
-**Gnomon** is a 100% Safe Rust (`#![forbid(unsafe_code)]`) formal verification, equivalence-checking, and recursive abstraction-discovery engine targeting deterministic **WebAssembly (`wasm32`)**, exposed via both a standalone CLI (`gnomon`) and a single stdio **MCP server** (`gnomon mcp`).
+**Gnomon** is a 100% Safe Rust (`#![forbid(unsafe_code)]`) formal verification, equivalence-checking, native hardware performance-profiling, and recursive abstraction-discovery engine targeting strict `#![no_std]` Rust & deterministic **WebAssembly (`wasm32`, `i32`/`i64`/`f32`/`f64`/`v128`)**, exposed via both a standalone CLI (`gnomon`) and a single stdio **MCP server** (`gnomon mcp`, 8 atomic tools).
 
-Instead of feeding monolithic programs directly into bit-blasting SMT solvers (where nonlinear arithmetic and multi-memory updates hit exponential timeouts), Gnomon lets AI agents and engineers build **layered, machine-proved abstractions ("Strata")** that bundle:
-1. A typed, acyclic **op** (`Layer k >= 1`) over lower-layer ops, and
-2. At least one **machine-proved algebraic or `MemoryFrame` law** admitted by a tiny `#![no_std]` Kani-verified Trusted Computing Base (`gnomon-kernel`).
+Instead of feeding monolithic programs directly into bit-blasting SMT solvers (where nonlinear arithmetic, floating-point SIMD, and multi-memory updates hit exponential timeouts), Gnomon lets AI agents and engineers build **layered, machine-proved abstractions ("Strata")** that bundle:
+1. A typed, acyclic **op** (`Layer k >= 1`) authored in strict `#![no_std]` Rust (`-t rust`) over lower-layer ops, and
+2. At least one **machine-proved algebraic or `MemoryFrame` law** admitted by a tiny `#![no_std]` Kani-verified Trusted Computing Base (`gnomon-kernel`, **15/15 Kani proofs green**).
 
-During verification, `egglog` v3.0 cancels high-level Strata laws and Ackermann **Uninterpreted Function (UF) CEGAR** discharges surviving pure-total nonlinear Strata *before* residual `QF_ABV` constraints reach `Bitwuzla`.
+During verification, `egglog` v3.0 cancels high-level Strata laws and Ackermann **Uninterpreted Function (UF) CEGAR** discharges surviving pure-total nonlinear Strata *before* residual `QF_ABVFP` constraints reach `Bitwuzla`. Native x86-64 (`skylake`) and ARM64 (`neoverse-v2`) lowering + `llvm-mca` (`gnomon profile`) closes the loop on verified systems performance optimization.
 
 ---
 
-## Proof 1 Benchmark Highlight (`proof1_cliff`, 10 s cap)
+## Measured Verification & Benchmark Highlights
 
-Measured on real 64-bit MurmurHash3 `fmix64` nonlinear chains and dual-memory packet-ring pipelines (3-layer Strata stack built & proved from scratch in `25.7 ms`):
+### 1. Core TCB v2 & Differential Soundness Gates
+- **TCB v2 (`gnomon-kernel`):** `#![no_std]`, `#![forbid(unsafe_code)]`, 24-byte `IrSlot`, 0 runtime deps, 0 stubs, **15/15 Kani proofs green** (`0` failures, `11m54.38s`, `-j 1`, `ulimit -v 4194304`).
+- **3-Way Differential Fuzzer (`gnomon-wasm` vs `wasmtime 51`):** **27,768** 3-way bit-exact checks (including **13,896** IEEE-754 FP & `v128` SIMD corner cases), **0** mismatches.
+- **`wasm-smith` Differential & Blowup Gate (`wasm_smith_fuzz --count 1000`):** **1,000/1,000** random modules lifted & round-tripped, **4,785** differential checks across `1,916` functions, **0** mismatches, `egglog` p99 `129.256 ms` (`0` blowups), **3** real `gnomon-sieve` bugs caught & fixed.
+- **Full Workspace Suite:** **103** release tests across 5 crates (`gnomon-kernel`: 14, `gnomon-wasm`: 14, `gnomon-sieve`: 34, `gnomon-bench`: 9, `gnomon-mcp`: 32), `0` clippy warnings (`-D warnings`).
 
-| Benchmark | Flat Bitwuzla (Layer-0) | Gnomon (Strata + `egglog` + UF CEGAR) | Speedup |
-| --- | --- | --- | ---: |
-| `fmix64` round-trip (`N = 1, 2, 4`) | `TIMEOUT (>10,000 ms)` | **`PROVED` (`22.5 – 31.7 ms`)** | **>316x – >445x** |
-| Surviving `fmix64^N` + `(x+y)(x-y) == x²-y²` (`N = 1..8`) | `TIMEOUT (>10,000 ms)` | **`PROVED` (`24.8 – 32.3 ms`)** | **>354x – >404x** |
-| Dual-memory `MemId(1)` hoist across `N = 8` `MemId(0)` `fmix64` writes | `TIMEOUT (>10,000 ms)` | **`PROVED` (`505.4 ms`)** | **>20x** |
-| Soundness control (1-bit bug injected at `N = 8`) | — | **`FALSIFIED` (`13.27 ms`, Wasmtime Stage-1)** | — |
+### 2. Proof 2 — Compute-Matched 3-Arm Ablation on `Gnomon-T2T` OMS (`proof2_oms_ablation`, `3,000 ms/task` cap)
+Zero-trust Rung 1–2 training promoted 12 raw OMS Strata (13 laws UNSAT-verified in `1,934.9 ms`); `stitch_core` + `egglog` consolidation kept **11 Strata (11 laws)** and pruned 1 scratch Stratum (`331.4 ms`, **0** unsound admissions). Evaluated on 10 held-out Rung 3–4 OMS cliff tasks + 2 soundness-control mutants under an identical `3,000 ms/task` Bitwuzla cap:
+
+| Metric | Arm A (Flat Layer-0) | Arm B (Modular Helpers) | Arm C (Full Gnomon Strata + `egglog` + UF CEGAR) | Exit Gate |
+| --- | :---: | :---: | :---: | :---: |
+| **Held-Out Cliff Tasks Solved** | `2 / 10` (`8` timeouts) | `2 / 10` (`8` timeouts) | **`10 / 10` (`0` timeouts — `5.0×` Arms A & B)** | `>= 2.0×` **PASS** |
+| **Median SMT Speedup** | `1.0×` | `1.0×` | **`99.5×` vs A / `103.4×` vs B** (`27.0 – 515.8 ms`) | `>= 5.0×` **PASS** |
+| **Cross-Rung Reuse Rate** | `0%` | `0%` | **`100.0%` (`10/10`) Strata / `70.0%` (`7/10`) R1–2 `egglog` laws** | `>= 30.0%` **PASS** |
+| **Soundness Mutants (`M01`, `M02`)** | `2 / 2 FALSIFIED` | `2 / 2 FALSIFIED` | **`2 / 2 FALSIFIED` (`0` false `PROVED`, `0` unsound)** | `0` unsound **PASS** |
+
+*(Proof 1 baseline `proof1_cliff`, 10 s cap: Flat Bitwuzla timed out on `8/10` nonlinear/dual-memory tasks while Gnomon proved `10/10` in `22.5 – 505.4 ms`, `>20× – >445×`, and falsified a 1-bit `N=8` bug in `13.27 ms`.)*
+
+### 3. E2E Verified OMS (`Gnomon-T2T`, 15 Strata `S1.1–S4.2`) + Verified Native x64 & ARM64 Optimization (`S4.3`)
+All **27** strict `#![no_std]` Rust OMS files (**15** Strata `S1.1–S4.2` + `S4.3` perf pairs + **11** separate `*_buggy.rs` mutant files; `S1.1`/`S1.2`/`S1.4` embed mutants inline) compile cleanly with `-D warnings` and round-trip lift via [`examples/oms_strata/build.sh`](examples/oms_strata/build.sh). Layer-4 E2E pipelines (`S4.1` Inbound ExecReport + `S4.2` Tick-to-Trade & OUCH Wire Out) achieved **24/24** exact verdicts (**17/17 `PROVED`**, **7/7 mutants `FALSIFIED`**). All 6 hot-path optimization pairs in [`examples/oms_strata/s4_3_perf_opt_pairs.rs`](examples/oms_strata/s4_3_perf_opt_pairs.rs) are proved bit-exact (**8/8 `PROVED`**) and profiled live via `gnomon profile --targets x64,arm64 --bench`:
+
+| Pair (`ref -> opt`) | x64 (`skylake`) Key Delta & Cyc / RTh Speedup | ARM64 (`neoverse-v2`) Key Delta & Cyc / RTh Speedup | Host x64 `ns/op` |
+| --- | --- | --- | --- |
+| **1. Barrett Fastmod** (`oms_bucket`) | **div `1->0`** · **1.48×** cyc / **2.50×** RTh | **udiv `1->0`** · **6.24×** cyc / **6.50×** RTh | `18.72 -> 15.42` (**1.21×**) |
+| **2. SWAR FIX Digits** (`oms_fix_digits`) | **br `7->0`**, inst `40->13` · **3.02×** cyc / **3.00×** RTh | **br `7->0`**, inst `47->10` · **1.31×** cyc / **4.59×** RTh | `6.64 -> 8.31` *(rand early-exit)* |
+| **3. Hash Unroll** (`12x_spill -> 4x`) | **spills `19->0`**, stack `56B->0B` · **1.14×** cyc / **1.15×** RTh | **0 spills** (31 GPRs) · **1.02×** cyc / **1.02×** RTh | `39.02 -> 41.25` (`2x`: `36.80`) |
+| **4. Branchless Risk FSM** (`oms_risk_fsm`) | **br `23->0`**, inst `128->91` · **1.66×** cyc / **1.52×** RTh | **br `45->0`**, inst `136->73` · **2.21×** cyc / **2.54×** RTh | `14.31 -> 24.03` *(rand `s>7`)* |
+| **5. Zero-Copy OUCH 48B** (`oms_ouch_pack`) | **stack `56B->0B`**, spills `1->0` · **2.20×** cyc | **stack `64B->0B`** · **1.53×** cyc | `10.30 -> 10.91` *(rand invalid)* |
+| **6. 4-Lane VWAP SIMD** (`oms_vwap`) | **br `7->1`**, `mulps`/`addps` · **1.23×** cyc / **1.20×** RTh | **br `6->1`**, **NEON `0->14`** · **1.45×** cyc / **1.70×** RTh | `9.99 -> 3.24` (**3.09×**) |
+
+### 4. Horizontal Generalization — 4 Non-Trading Vertical Packs (`examples/vertical_packs/`)
+Verified and profiled on the **100% unmodified** `gnomon` engine (**0** engine changes, `8/8` round-trip lift valid, **24/24** live verdicts: **16/16 `PROVED`**, **8/8 buggy mutants `FALSIFIED`**):
+
+| Vertical Pack | Domain & Verified Properties | Live Verdicts | `gnomon profile` (`x64` / `arm64`) |
+| --- | --- | :---: | --- |
+| **`ai_q8_0_quant`** | AI Inference `Q8_0` 4-lane `f32x4` block quantizer (`QF_ABVFP`, no `0*Inf=NaN`, exact `nearest` rounding) | `3 PROVED` / `2 FALSIFIED` | x64 **2.61×** cyc (`-20` insns) · ARM64 **1.57×** cyc, **NEON `13->33`**, br `2->0` |
+| **`db_parquet_varint_slice`** | Columnar DB zero-copy `&[u8]` LEB128 varint + ZigZag (`--ignore-dead-stack`, `SliceFrame readonly`, branchless equiv) | `6 PROVED` / `2 FALSIFIED` | x64 **br `4->0`**, `1.10×` RTh · ARM64 **br `3->0`**, **1.50×** cyc |
+| **`net_wireguard_replay`** | Networking RFC 6479 / WireGuard 64-bit sliding anti-replay window (inductive invariant, large-jump reset, branchless equiv) | `4 PROVED` / `2 FALSIFIED` | x64 **br `2->0`**, `0` spills · ARM64 `0` br (`csel`), `0` spills |
+| **`cloud_quota_saga`** | Cloud Distributed Quota Saga (`reserve`/`commit`/`cancel_reserve` inductive conservation, zero double-release/commit) | `3 PROVED` / `2 FALSIFIED` | Inductive stateful FSM (`globals=0`) |
 
 ---
 
@@ -37,25 +68,35 @@ cargo build --release -p gnomon-mcp --bin gnomon
 ```
 
 ### CLI Usage (`target/release/gnomon`)
-Every input subcommand accepts files or **stdin** (`-` or omitted) and `-t / --type <auto|wasm|ir>`:
+Every input subcommand accepts files or **stdin** (`-` or omitted) and `-t / --type <auto|wasm|ir|rust>`:
 
 ```bash
 # Inspect .ir JSON wire format
 gnomon schema
 
-# Lift .wasm or .ir from disk or stdin
+# Lift strict no_std Rust, .wasm, or .ir (with static SMT-cliff diagnostics)
+gnomon lift -t rust examples/oms_strata/s1_1_notional_collar.rs
 gnomon lift -t wasm --emit-ir module.wasm
-cat module.wasm | gnomon lift -t wasm
-cat region.ir   | gnomon lift -t ir
 
 # Deterministic concrete execution (outputs, trap, fuel, sparse memory diff)
 gnomon trace -t wasm module.wasm --inputs '[{"ty":"i32","val":42},{"ty":"i32","val":6}]'
 
-# Layered Strata synthesis & verification loop
-gnomon --state state.json -t ir define-op --name wrap_inc --layer 1 wrap_inc.ir
-gnomon --state state.json -t ir prove-law --op wrap_inc --name mask_idem --lhs lhs.ir --rhs rhs.ir
-gnomon --state state.json -t ir check-goal --candidate cand.ir --spec spec.ir
+# Verify pre/post contracts, inline assume/assert, SliceFrame isolation, or inductive FSM suites
+gnomon check-contract -t rust --entry checked_notional --requires req_notional --ensures ens_notional \
+  examples/oms_strata/s1_1_notional_collar.rs
+gnomon check-contract -t rust --init init_empty \
+  --ops submit_new,on_ack,request_cancel,request_replace,on_fill,on_cancel_ack,on_replace_ack,on_reject \
+  --invariant inv_child_fsm examples/oms_strata/s3_1_child_fsm.rs
+
+# Layered Strata synthesis, equivalence checking (--ignore-dead-stack), Rust bindings, & consolidation
+gnomon --state state.json -t rust define-op --name order_id_mix --layer 1 examples/oms_strata/s1_3_order_id_mix.rs
+gnomon --state state.json emit-rust -o strata.rs
+gnomon --state state.json -t rust check-goal --candidate opt.rs --spec ref.rs --ignore-dead-stack
 gnomon --state state.json consolidate
+
+# Native x86-64 (skylake) & ARM64 (neoverse-v2) performance oracle + host microbench
+gnomon profile examples/oms_strata/s4_3_perf_opt_pairs.rs \
+  --entry oms_bucket_ref --opt-entry oms_bucket_opt --targets x64,arm64 --bench
 ```
 
 Exit codes: `0` = Success / `PROVED` / `OK`, `1` = `FALSIFIED` / `TRAP` / `UNKNOWN`, `2` = CLI / parse / TCB admission error.
@@ -72,23 +113,28 @@ Registered in `~/.gemini/config/mcp_config.json`:
   }
 }
 ```
-Exposes 6 atomic tools over stdio (`rmcp` + `tokio`): `gnomon_lift_check`, `gnomon_run_trace`, `gnomon_define_op`, `gnomon_prove_law`, `gnomon_check_goal`, `gnomon_consolidate`.
+Exposes **8 atomic tools** over stdio (`rmcp` + `tokio`): `gnomon_lift_check`, `gnomon_run_trace`, `gnomon_define_op`, `gnomon_prove_law`, `gnomon_check_goal`, `gnomon_check_contract`, `gnomon_consolidate`, `gnomon_profile`.
 
 ---
 
-## Verification Commands
+## Verification & Benchmark Commands
 
 ```bash
-# Workspace lints & release tests (47 tests across 5 crates — never set ulimit -v on Wasmtime tests!)
+# Workspace lints & release tests (103 tests across 5 crates — never set ulimit -v on Wasmtime tests!)
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace --release
 
-# Phase 1 Gate (30+30 real no_std Wasm corpus) & Proof 1 Solver-Cliff Benchmark
+# Build & round-trip lift all 27 OMS Strata fixtures (S1.1-S4.3 + all buggy mutants)
+./examples/oms_strata/build.sh
+
+# Benchmarks & Fuzz Gates
 cargo run --release -p gnomon-bench --bin phase1_gate
 cargo run --release -p gnomon-bench --bin proof1_cliff
+cargo run --release -p gnomon-bench --bin wasm_smith_fuzz -- --count 1000
+cargo run --release -p gnomon-bench --bin proof2_oms_ablation
 
-# All 12 Kani TCB proof harnesses (guarded with 4 GiB virtual cap, -j 1)
-(ulimit -v 4194304; timeout 600 cargo kani -p gnomon-kernel -j 1)
+# All 15 Kani TCB v2 proof harnesses (guarded with 4 GiB virtual cap, -j 1)
+(ulimit -v 4194304; timeout 900 cargo kani -p gnomon-kernel -j 1)
 ```
 
-See [ARCHITECTURE.md](./ARCHITECTURE.md), [AGENTS.md](./AGENTS.md), and [ROADMAP.md](./ROADMAP.md) for architecture details, agent engineering rules, and upcoming plans (IEEE-754 floating point, multi-memory extensions, register spilling, SIMD/GPU).
+See [ARCHITECTURE.md](./ARCHITECTURE.md), [ROADMAP.md](./ROADMAP.md), [AGENTS.md](./AGENTS.md), [examples/oms_strata/README.md](./examples/oms_strata/README.md), and [examples/vertical_packs/README.md](./examples/vertical_packs/README.md) for architecture details, complete measured tables, and reproduction scripts.

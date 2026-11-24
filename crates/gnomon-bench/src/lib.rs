@@ -4,6 +4,7 @@
 
 pub mod corpus;
 pub mod phase1;
+pub mod proof2;
 pub mod wasm_smith;
 
 use serde::{Deserialize, Serialize};
@@ -15,6 +16,11 @@ pub use corpus::{
 pub use phase1::{
     CaseGateReport, Phase1Report, run_phase1_gate, run_phase1_gate_with_config,
     verify_counterexample_in_kernel,
+};
+pub use proof2::{
+    ArmRunResult, ArmVerdict, DEFAULT_PROOF2_TIME_CAP_MS, ProfilePairSummary, Proof2Config,
+    Proof2Report, Proof2Scorecard, Proof2TaskOutcome, TrainingSummary, run_proof2_ablation,
+    run_s4_3_profile_summary,
 };
 pub use wasm_smith::{
     DEFAULT_BASE_SEED, LatencyStats, WasmSmithFailure, WasmSmithGateConfig, WasmSmithGateReport,
