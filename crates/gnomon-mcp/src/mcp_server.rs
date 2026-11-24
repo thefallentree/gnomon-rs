@@ -1,4 +1,4 @@
-//! Single MCP server (`rmcp` + `tokio` stdio) exposing all 7 atomic Gnomon tools.
+//! Single MCP server (`rmcp` + `tokio` stdio) exposing all 8 atomic Gnomon tools.
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -14,8 +14,9 @@ use serde::{Deserialize, Serialize};
 use crate::GnomonError;
 use crate::engine::{CheckContractRequest, ContractPred, GnomonEngine, prepare_goal_artifacts};
 use crate::ir_codec::{InputType, IrLawKind, IrTypedVar, IrVal, IrValType, LoadedArtifact};
+use crate::profiler::{DEFAULT_ARM64_CPU, DEFAULT_X64_CPU, ProfileArch, ProfileRequest};
 
-/// Single stateful Gnomon MCP Server serving all 7 verification & abstraction tools.
+/// Single stateful Gnomon MCP Server serving all 8 verification, abstraction & profiling tools.
 #[derive(Clone)]
 pub struct GnomonMcpServer {
     engine: Arc<Mutex<GnomonEngine>>,
@@ -384,6 +385,32 @@ pub struct CheckContractParams {
     /// Bitwuzla per-check timeout budget in milliseconds (default `5000`).
     #[serde(default = "default_timeout_ms")]
     pub timeout_ms: u64,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ProfileParams {
+    /// Inline strict `#![no_std]` Rust source for the primary/reference function.
+    pub content: Option<String>,
+    /// Optional local file path to a `.rs` file for the primary/reference function.
+    pub path: Option<String>,
+    /// Target function symbol name inside primary/reference source (auto-detected if omitted).
+    pub entry: Option<String>,
+    /// Optional inline strict `#![no_std]` Rust source for comparison (`opt`) function.
+    pub compare_content: Option<String>,
+    /// Optional local file path to a `.rs` file for comparison (`opt`) function.
+    pub compare_path: Option<String>,
+    /// Optional entry function symbol name for comparison (`opt`) function (compares within primary source when `compare_content`/`compare_path` are omitted).
+    pub opt_entry: Option<String>,
+    /// Target architectures: `["x64", "arm64"]` (defaults to both).
+    #[serde(default)]
+    pub targets: Vec<ProfileArch>,
+    /// x86-64 target CPU (default `"skylake"`).
+    pub x64_cpu: Option<String>,
+    /// ARM64 target CPU (default `"neoverse-v2"`).
+    pub arm64_cpu: Option<String>,
+    /// Run opt-in 1,000,000-iteration native host x86-64 microbenchmark (`host_ns_per_op`).
+    #[serde(default)]
+    pub bench: bool,
 }
 
 fn load_mcp_contract_pred(
@@ -762,6 +789,38 @@ impl GnomonMcpServer {
             .await?;
         json_ok(&out)
     }
+
+    #[tool(
+        name = "gnomon_profile",
+        description = "Profile strict #![no_std] Rust on native x86-64 (skylake) and ARM64 (neoverse-v2) via rustc/llc assembly lowering + llvm-mca cycle/IPC/RThroughput analysis + static hardware metrics (instructions, branches, div/idiv/udiv/sdiv, SIMD, stack frame, register spills/reloads), with optional ref-vs-opt speedup comparison and opt-in host microbenchmarking."
+    )]
+    async fn gnomon_profile(
+        &self,
+        Parameters(p): Parameters<ProfileParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let out = self
+            .with_engine(false, move |eng| {
+                let req = ProfileRequest {
+                    content: p.content,
+                    path: p.path,
+                    entry: p.entry,
+                    compare_content: p.compare_content,
+                    compare_path: p.compare_path,
+                    opt_entry: p.opt_entry,
+                    targets: if p.targets.is_empty() {
+                        vec![ProfileArch::X64, ProfileArch::Arm64]
+                    } else {
+                        p.targets
+                    },
+                    x64_cpu: p.x64_cpu.unwrap_or_else(|| DEFAULT_X64_CPU.to_string()),
+                    arm64_cpu: p.arm64_cpu.unwrap_or_else(|| DEFAULT_ARM64_CPU.to_string()),
+                    bench: p.bench,
+                };
+                eng.profile(&req)
+            })
+            .await?;
+        json_ok(&out)
+    }
 }
 
 #[tool_handler(router = self.tool_router)]
@@ -776,7 +835,8 @@ impl ServerHandler for GnomonMcpServer {
                  (4) gnomon_prove_law to prove algebraic or unconditional MemoryFrame laws (Wasmtime -> Bitwuzla QF_ABV -> kernel TCB), \
                  (5) gnomon_check_goal to verify equivalence via egglog + Ackermann UF CEGAR + Bitwuzla (supports ignore_dead_stack for shadow-stack refinement and 3-way InvariantLoop VC splits), \
                  (6) gnomon_consolidate to prune low-MDL ops (stitch_core) and redundant laws (<=3 egglog steps) into a compact AutoDoc, \
-                 (7) gnomon_check_contract to verify pre/post contracts, trap-freedom, intra-memory slice_frame write-frame bounds (including readonly), shadow-stack ignore_dead_stack, inline gnomon_assume/gnomon_assert harnesses, and multi-op inductive state-invariant suites (init + ops + invariant).",
+                 (7) gnomon_check_contract to verify pre/post contracts, trap-freedom, intra-memory slice_frame write-frame bounds (including readonly), shadow-stack ignore_dead_stack, inline gnomon_assume/gnomon_assert harnesses, and multi-op inductive state-invariant suites (init + ops + invariant), \
+                 (8) gnomon_profile to lower strict #![no_std] Rust to native x86-64 & ARM64 assembly, measure llvm-mca cycles/IPC/RThroughput and static hardware metrics (div, branches, SIMD, stack frame, register spills/reloads), compare ref vs opt speedups, and optionally run host microbenchmarks.",
             );
         info.server_info = Implementation::new("gnomon", env!("CARGO_PKG_VERSION"));
         info

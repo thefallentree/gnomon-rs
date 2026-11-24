@@ -6,8 +6,9 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand, ValueEnum};
 use gnomon_mcp::{
-    CheckContractRequest, ContractPred, GnomonEngine, GnomonError, GnomonMcpServer, InputType,
-    IrDocument, IrLawKind, IrTypedVar, IrVal, IrValType, LoadedArtifact, parse_slice_frame_spec,
+    CheckContractRequest, ContractPred, DEFAULT_ARM64_CPU, DEFAULT_X64_CPU, GnomonEngine,
+    GnomonError, GnomonMcpServer, InputType, IrDocument, IrLawKind, IrTypedVar, IrVal, IrValType,
+    LoadedArtifact, ProfileRequest, parse_slice_frame_spec, parse_targets_csv,
     prepare_goal_artifacts, read_input_bytes,
 };
 use gnomon_sieve::ConsolidationConfig;
@@ -247,6 +248,33 @@ enum Commands {
         /// Exclude unpromoted candidate ops (emit only promoted Strata).
         #[arg(long)]
         promoted_only: bool,
+    },
+
+    /// Profile strict `#![no_std]` Rust on native x86-64 and/or ARM64 (rustc + llc + llvm-mca + optional host bench).
+    Profile {
+        /// Path to a `.rs` source file (or '-' to read Rust source from stdin).
+        input: String,
+        /// Target entry function symbol inside INPUT (defaults to first exported extern "C" fn).
+        #[arg(long)]
+        entry: Option<String>,
+        /// Optional optimized comparison `.rs` file for side-by-side ref-vs-opt deltas & speedups.
+        #[arg(long)]
+        compare: Option<String>,
+        /// Optional entry function symbol for `--compare` (or inside INPUT when `--compare` is omitted).
+        #[arg(long = "opt-entry")]
+        opt_entry: Option<String>,
+        /// Comma-separated target architectures: `x64`, `arm64` (default: `x64,arm64`).
+        #[arg(long, default_value = "x64,arm64")]
+        targets: String,
+        /// x86-64 target CPU for rustc/llc/llvm-mca (default: `skylake`).
+        #[arg(long = "x64-cpu", default_value = DEFAULT_X64_CPU)]
+        x64_cpu: String,
+        /// ARM64 target CPU for llc/llvm-mca (default: `neoverse-v2`).
+        #[arg(long = "arm64-cpu", default_value = DEFAULT_ARM64_CPU)]
+        arm64_cpu: String,
+        /// Run opt-in 1,000,000-iteration native host x86-64 microbenchmark (`host_ns_per_op`).
+        #[arg(long)]
+        bench: bool,
     },
 
     /// Start the single Gnomon MCP server over stdio (rmcp + tokio).
@@ -748,6 +776,63 @@ fn run(cli: Cli) -> Result<bool, GnomonError> {
                     print!("{code}");
                 }
             }
+            Ok(true)
+        }
+        Commands::Profile {
+            input,
+            entry,
+            compare,
+            opt_entry,
+            targets,
+            x64_cpu,
+            arm64_cpu,
+            bench,
+        } => {
+            let eng = match &cli.state {
+                Some(p) => GnomonEngine::load_state_file(p)?,
+                None => GnomonEngine::new(),
+            };
+            let parsed_targets = parse_targets_csv(&targets)?;
+            let (content, path) = if input == "-" {
+                let (bytes, _) = read_input_bytes(Some("-"))?;
+                let src = String::from_utf8(bytes).map_err(|e| {
+                    GnomonError::InvalidInput(format!("stdin Rust source is not valid UTF-8: {e}"))
+                })?;
+                (Some(src), None)
+            } else {
+                (None, Some(input))
+            };
+            let (compare_content, compare_path) = match compare {
+                Some(c) if c == "-" => {
+                    let (bytes, _) = read_input_bytes(Some("-"))?;
+                    let src = String::from_utf8(bytes).map_err(|e| {
+                        GnomonError::InvalidInput(format!(
+                            "stdin compare Rust source is not valid UTF-8: {e}"
+                        ))
+                    })?;
+                    (Some(src), None)
+                }
+                Some(c) => (None, Some(c)),
+                None => (None, None),
+            };
+            let req = ProfileRequest {
+                content,
+                path,
+                entry,
+                compare_content,
+                compare_path,
+                opt_entry,
+                targets: parsed_targets,
+                x64_cpu,
+                arm64_cpu,
+                bench,
+            };
+            let out = eng.profile(&req)?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&out)
+                    .map_err(|e| GnomonError::Internal(e.to_string()))?
+            );
             Ok(true)
         }
     }

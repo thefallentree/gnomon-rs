@@ -1396,6 +1396,21 @@ impl GnomonEngine {
         }
         m
     }
+
+    // -----------------------------------------------------------------------
+    // Tool 8: gnomon_profile (native x86-64 & ARM64 assembly + llvm-mca + host bench)
+    // -----------------------------------------------------------------------
+    pub fn profile(
+        &self,
+        req: &crate::profiler::ProfileRequest,
+    ) -> Result<crate::profiler::ProfileOutput, GnomonError> {
+        let reg = if self.registry.promoted().is_empty() && self.registry.candidates().is_empty() {
+            None
+        } else {
+            Some(&self.registry)
+        };
+        crate::profiler::profile_rust(req, reg)
+    }
 }
 
 // ===========================================================================

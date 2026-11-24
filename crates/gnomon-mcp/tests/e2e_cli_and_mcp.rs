@@ -567,7 +567,7 @@ fn test_mcp_e2e_stdio_jsonrpc_all_7_tools() {
     .unwrap();
     stdin.flush().unwrap();
 
-    // 3. tools/list -> must expose all 7 exact Gnomon tools
+    // 3. tools/list -> must expose all 8 exact Gnomon tools
     let list_resp = send_recv(
         &mut stdin,
         &mut reader,
@@ -578,7 +578,7 @@ fn test_mcp_e2e_stdio_jsonrpc_all_7_tools() {
     for expected in MCP_TOOL_NAMES {
         assert!(names.contains(&expected), "missing MCP tool '{expected}' in {names:?}");
     }
-    assert_eq!(names.len(), 7);
+    assert_eq!(names.len(), 8);
 
     let call_tool = |stdin: &mut std::process::ChildStdin,
                      reader: &mut BufReader<std::process::ChildStdout>,
