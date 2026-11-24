@@ -1,14 +1,16 @@
-//! Native Bitwuzla `QF_ABV` backend using the `bitwuzla` (0.11.0) C/Rust API.
+//! Native Bitwuzla `QF_ABVFP` backend using the `bitwuzla` (0.11.0) C/Rust API.
 
-use bitwuzla::{Bitwuzla, Kind, Opt, Options, SatResult, Sort, Term, TermManager};
+use std::collections::HashMap;
+
+use bitwuzla::{Bitwuzla, Kind, Opt, Options, RoundingMode, SatResult, Sort, Term, TermManager};
 use gnomon_kernel::{Module, Region, StratumRegistry, VcObligation};
 
 use crate::smt_ir::{
-    RawSat, SmtTarget, run_check_contract, run_check_equivalence_with_options, run_check_vc,
+    FpRm, RawSat, SmtTarget, run_check_contract, run_check_equivalence_with_options, run_check_vc,
 };
 use crate::{ContractSpec, EquivOptions, SieveError, SmtBackend, SmtResult};
 
-/// Native in-process Bitwuzla `QF_ABV` solver backend.
+/// Native in-process Bitwuzla `QF_ABVFP` solver backend.
 #[derive(Clone, Debug, Default)]
 pub struct BitwuzlaNativeBackend {
     query_count: u64,
@@ -40,11 +42,33 @@ impl BitwuzlaNativeBackend {
         let bv8 = tm.mk_bv_sort(8);
         let bv32 = tm.mk_bv_sort(32);
         let bv64 = tm.mk_bv_sort(64);
+        let bv128 = tm.mk_bv_sort(128);
         let bool_sort = tm.mk_bool_sort();
         let mem_sort = tm.mk_array_sort(&bv32, &bv8);
         let written_sort = tm.mk_array_sort(&bv32, &bool_sort);
+        let rm_rne = tm.mk_rm_value(RoundingMode::Rne);
+        let rm_rtp = tm.mk_rm_value(RoundingMode::Rtp);
+        let rm_rtn = tm.mk_rm_value(RoundingMode::Rtn);
+        let rm_rtz = tm.mk_rm_value(RoundingMode::Rtz);
         Ok((
-            NativeSession { tm, solver, bv8, bv32, bv64, mem_sort, written_sort },
+            NativeSession {
+                tm,
+                solver,
+                prefix: format!("nq{qid}"),
+                fp_bv_counter: 0,
+                fp_bv_cache: HashMap::new(),
+                fp_bv_cache_stack: Vec::new(),
+                bv8,
+                bv32,
+                bv64,
+                bv128,
+                mem_sort,
+                written_sort,
+                rm_rne,
+                rm_rtp,
+                rm_rtn,
+                rm_rtz,
+            },
             format!("nq{qid}"),
         ))
     }
@@ -97,11 +121,20 @@ impl SmtBackend for BitwuzlaNativeBackend {
 struct NativeSession {
     tm: TermManager,
     solver: Bitwuzla,
+    prefix: String,
+    fp_bv_counter: u64,
+    fp_bv_cache: HashMap<(Term, u64), Term>,
+    fp_bv_cache_stack: Vec<HashMap<(Term, u64), Term>>,
     bv8: Sort,
     bv32: Sort,
     bv64: Sort,
+    bv128: Sort,
     mem_sort: Sort,
     written_sort: Sort,
+    rm_rne: Term,
+    rm_rtp: Term,
+    rm_rtn: Term,
+    rm_rtz: Term,
 }
 
 impl NativeSession {
@@ -110,7 +143,17 @@ impl NativeSession {
             8 => self.bv8.clone(),
             32 => self.bv32.clone(),
             64 => self.bv64.clone(),
+            128 => self.bv128.clone(),
             other => self.tm.mk_bv_sort(other as u64),
+        }
+    }
+
+    fn rm_term(&self, rm: FpRm) -> &Term {
+        match rm {
+            FpRm::Rne => &self.rm_rne,
+            FpRm::Rtp => &self.rm_rtp,
+            FpRm::Rtn => &self.rm_rtn,
+            FpRm::Rtz => &self.rm_rtz,
         }
     }
 }
@@ -118,17 +161,34 @@ impl NativeSession {
 impl SmtTarget for NativeSession {
     type Term = Term;
 
+    fn cmp_term(&self, a: &Term, b: &Term) -> std::cmp::Ordering {
+        a.id().cmp(&b.id())
+    }
+
     fn bool_const(&mut self, v: bool) -> Term {
         if v { self.tm.mk_true() } else { self.tm.mk_false() }
     }
 
     fn bv_const(&mut self, bits: u8, v: u64) -> Term {
+        if bits > 64 {
+            return self.bv_const_u128(bits, v as u128);
+        }
         let sort = self.bv_sort(bits);
         let masked = match bits {
             64 => v,
             n => v & ((1u64 << n) - 1),
         };
         self.tm.mk_bv_value_u64(&sort, masked)
+    }
+
+    fn bv_const_u128(&mut self, bits: u8, v: u128) -> Term {
+        if bits <= 64 {
+            return self.bv_const(bits, v as u64);
+        }
+        let hi_bits = bits - 64;
+        let hi = self.bv_const(hi_bits, (v >> 64) as u64);
+        let lo = self.bv_const(64, v as u64);
+        self.bv_concat(hi_bits, 64, &hi, &lo)
     }
 
     fn const_array_bool(&mut self, v: bool) -> Term {
@@ -286,17 +346,155 @@ impl SmtTarget for NativeSession {
         self.tm.mk_term(Kind::BvConcat, &[hi, lo], &[])
     }
 
+    fn bv_not(&mut self, _bits: u8, a: &Term) -> Term {
+        self.tm.mk_term(Kind::BvNot, &[a], &[])
+    }
+
+    fn bv_neg(&mut self, _bits: u8, a: &Term) -> Term {
+        self.tm.mk_term(Kind::BvNeg, &[a], &[])
+    }
+
+    fn bv_to_fp(&mut self, eb: u8, sb: u8, bv: &Term) -> Term {
+        self.tm.mk_term(Kind::FpToFpFromBv, &[bv], &[eb as u64, sb as u64])
+    }
+
+    fn fp_to_bv_canon(
+        &mut self,
+        eb: u8,
+        sb: u8,
+        canon_nan_bv: u64,
+        fp: &Term,
+    ) -> Result<Term, SieveError> {
+        let key = (fp.clone(), canon_nan_bv);
+        if let Some(existing) = self.fp_bv_cache.get(&key) {
+            return Ok(existing.clone());
+        }
+        let id = self.fp_bv_counter;
+        self.fp_bv_counter += 1;
+        let bits = eb + sb;
+        let name = format!("{}_fpbv_{id}", self.prefix);
+        let bv = self.fresh_bv(&name, bits);
+        let is_nan = self.fp_is_nan(fp);
+        let nan_c = self.bv_const(bits, canon_nan_bv);
+        let eq_nan = self.eq(&bv, &nan_c);
+        let fp_of_bv = self.bv_to_fp(eb, sb, &bv);
+        let eq_fp = self.eq(&fp_of_bv, fp);
+        let constraint = self.ite(&is_nan, &eq_nan, &eq_fp);
+        self.assert_formula(&constraint)?;
+        self.fp_bv_cache.insert(key, bv.clone());
+        Ok(bv)
+    }
+
+    fn fp_add(&mut self, _eb: u8, _sb: u8, rm: FpRm, a: &Term, b: &Term) -> Term {
+        let rm_t = self.rm_term(rm);
+        self.tm.mk_term(Kind::FpAdd, &[rm_t, a, b], &[])
+    }
+
+    fn fp_sub(&mut self, _eb: u8, _sb: u8, rm: FpRm, a: &Term, b: &Term) -> Term {
+        let rm_t = self.rm_term(rm);
+        self.tm.mk_term(Kind::FpSub, &[rm_t, a, b], &[])
+    }
+
+    fn fp_mul(&mut self, _eb: u8, _sb: u8, rm: FpRm, a: &Term, b: &Term) -> Term {
+        let rm_t = self.rm_term(rm);
+        self.tm.mk_term(Kind::FpMul, &[rm_t, a, b], &[])
+    }
+
+    fn fp_div(&mut self, _eb: u8, _sb: u8, rm: FpRm, a: &Term, b: &Term) -> Term {
+        let rm_t = self.rm_term(rm);
+        self.tm.mk_term(Kind::FpDiv, &[rm_t, a, b], &[])
+    }
+
+    fn fp_sqrt(&mut self, _eb: u8, _sb: u8, rm: FpRm, a: &Term) -> Term {
+        let rm_t = self.rm_term(rm);
+        self.tm.mk_term(Kind::FpSqrt, &[rm_t, a], &[])
+    }
+
+    fn fp_rti(&mut self, _eb: u8, _sb: u8, rm: FpRm, a: &Term) -> Term {
+        let rm_t = self.rm_term(rm);
+        self.tm.mk_term(Kind::FpRti, &[rm_t, a], &[])
+    }
+
+    fn fp_eq(&mut self, a: &Term, b: &Term) -> Term {
+        self.tm.mk_term(Kind::FpEqual, &[a, b], &[])
+    }
+
+    fn fp_lt(&mut self, a: &Term, b: &Term) -> Term {
+        self.tm.mk_term(Kind::FpLt, &[a, b], &[])
+    }
+
+    fn fp_le(&mut self, a: &Term, b: &Term) -> Term {
+        self.tm.mk_term(Kind::FpLeq, &[a, b], &[])
+    }
+
+    fn fp_gt(&mut self, a: &Term, b: &Term) -> Term {
+        self.tm.mk_term(Kind::FpGt, &[a, b], &[])
+    }
+
+    fn fp_ge(&mut self, a: &Term, b: &Term) -> Term {
+        self.tm.mk_term(Kind::FpGeq, &[a, b], &[])
+    }
+
+    fn fp_is_nan(&mut self, a: &Term) -> Term {
+        self.tm.mk_term(Kind::FpIsNan, &[a], &[])
+    }
+
+    fn fp_is_zero(&mut self, a: &Term) -> Term {
+        self.tm.mk_term(Kind::FpIsZero, &[a], &[])
+    }
+
+    fn fp_is_neg(&mut self, a: &Term) -> Term {
+        self.tm.mk_term(Kind::FpIsNeg, &[a], &[])
+    }
+
+    fn fp_is_pos(&mut self, a: &Term) -> Term {
+        self.tm.mk_term(Kind::FpIsPos, &[a], &[])
+    }
+
+    fn fp_is_inf(&mut self, a: &Term) -> Term {
+        self.tm.mk_term(Kind::FpIsInf, &[a], &[])
+    }
+
+    fn fp_from_sbv(&mut self, eb: u8, sb: u8, rm: FpRm, bv: &Term) -> Term {
+        let rm_t = self.rm_term(rm);
+        self.tm.mk_term(Kind::FpToFpFromSbv, &[rm_t, bv], &[eb as u64, sb as u64])
+    }
+
+    fn fp_from_ubv(&mut self, eb: u8, sb: u8, rm: FpRm, bv: &Term) -> Term {
+        let rm_t = self.rm_term(rm);
+        self.tm.mk_term(Kind::FpToFpFromUbv, &[rm_t, bv], &[eb as u64, sb as u64])
+    }
+
+    fn fp_to_sbv(&mut self, bits: u8, rm: FpRm, fp: &Term) -> Term {
+        let rm_t = self.rm_term(rm);
+        self.tm.mk_term(Kind::FpToSbv, &[rm_t, fp], &[bits as u64])
+    }
+
+    fn fp_to_ubv(&mut self, bits: u8, rm: FpRm, fp: &Term) -> Term {
+        let rm_t = self.rm_term(rm);
+        self.tm.mk_term(Kind::FpToUbv, &[rm_t, fp], &[bits as u64])
+    }
+
+    fn fp_to_fp(&mut self, eb: u8, sb: u8, rm: FpRm, fp: &Term) -> Term {
+        let rm_t = self.rm_term(rm);
+        self.tm.mk_term(Kind::FpToFpFromFp, &[rm_t, fp], &[eb as u64, sb as u64])
+    }
+
     fn assert_formula(&mut self, cond: &Term) -> Result<(), SieveError> {
         self.solver.assert_formula(cond);
         Ok(())
     }
 
     fn push(&mut self) -> Result<(), SieveError> {
+        self.fp_bv_cache_stack.push(self.fp_bv_cache.clone());
         self.solver.push(1);
         Ok(())
     }
 
     fn pop(&mut self) -> Result<(), SieveError> {
+        if let Some(prev) = self.fp_bv_cache_stack.pop() {
+            self.fp_bv_cache = prev;
+        }
         self.solver.pop(1);
         Ok(())
     }
@@ -315,6 +513,13 @@ impl SmtTarget for NativeSession {
         let hex = val.value_str(16);
         u64::from_str_radix(&hex, 16)
             .map_err(|e| SieveError::SolverError(format!("failed to parse BV hex '{hex}': {e}")))
+    }
+
+    fn get_bv_u128(&mut self, term: &Term, _bits: u8) -> Result<u128, SieveError> {
+        let val = self.solver.get_value(term);
+        let hex = val.value_str(16);
+        u128::from_str_radix(&hex, 16)
+            .map_err(|e| SieveError::SolverError(format!("failed to parse BV128 hex '{hex}': {e}")))
     }
 
     fn get_bool(&mut self, term: &Term) -> Result<bool, SieveError> {

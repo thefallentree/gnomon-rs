@@ -8,7 +8,8 @@
 
 use alloc::{string::String, vec, vec::Vec};
 
-use crate::eval::{HeapState, MemoryState, eval_binop, eval_region};
+use crate::eval::{HeapState, MemoryState, eval_binop, eval_region, eval_unop};
+use crate::fp::{F32_CANON_NAN, f32_is_nan};
 use crate::ir::*;
 use crate::registry::{Law, LawKind, LawList, RegistryError, Stratum, StratumOp, StratumRegistry};
 use crate::vc::{
@@ -207,6 +208,7 @@ fn proof_memory_ea_overflow_traps() {
     let val = match ty {
         ValType::I32 => Val::I32(kani::any()),
         ValType::I64 => Val::I64(kani::any()),
+        _ => unreachable!(),
     };
 
     let expected_oob = (addr as u64) + (offset as u64) + width.bytes() > (mem.bytes.len() as u64);
@@ -627,4 +629,204 @@ fn proof_vc_induction_bounded_soundness() {
         unreachable!()
     };
     assert!(vals.len() == 1 && vals[0] == Val::I32(0));
+}
+
+// ---------------------------------------------------------------------------
+// 4. TCB v2: Deterministic IEEE-754 f32/f64, v128 SIMD, MemWidth::B16 & IrSlot v2
+// ---------------------------------------------------------------------------
+
+#[kani::proof]
+fn kani_fp_semantics_deterministic() {
+    let a: u32 = kani::any();
+    let b: u32 = kani::any();
+    let va = Val::F32(a);
+    let vb = Val::F32(b);
+
+    // 1. Bitwise sign ops: trap-free, deterministic, preserve NaN payloads verbatim.
+    let abs1 = eval_unop(UnOp::F32Abs, va);
+    let abs2 = eval_unop(UnOp::F32Abs, va);
+    assert!(abs1 == abs2 && abs1 == Ok(Val::F32(a & 0x7fff_ffff)));
+
+    let neg1 = eval_unop(UnOp::F32Neg, va);
+    let neg2 = eval_unop(UnOp::F32Neg, va);
+    assert!(neg1 == neg2 && neg1 == Ok(Val::F32(a ^ 0x8000_0000)));
+
+    let cs1 = eval_binop(BinOp::F32Copysign, va, vb);
+    let cs2 = eval_binop(BinOp::F32Copysign, va, vb);
+    assert!(cs1 == cs2 && cs1 == Ok(Val::F32((a & 0x7fff_ffff) | (b & 0x8000_0000))));
+
+    // 2. Min / Max: trap-free, deterministic, canonical NaN on any NaN, -0.0 < +0.0.
+    let min1 = eval_binop(BinOp::F32Min, va, vb);
+    let min2 = eval_binop(BinOp::F32Min, va, vb);
+    let max1 = eval_binop(BinOp::F32Max, va, vb);
+    let max2 = eval_binop(BinOp::F32Max, va, vb);
+    assert!(min1 == min2 && max1 == max2);
+    let Ok(Val::F32(min_b)) = min1 else { unreachable!() };
+    let Ok(Val::F32(max_b)) = max1 else { unreachable!() };
+    if f32_is_nan(a) || f32_is_nan(b) {
+        assert!(min_b == F32_CANON_NAN && max_b == F32_CANON_NAN);
+    } else if ((a | b) & 0x7fff_ffff) == 0 {
+        assert!(min_b == (a | b) && max_b == (a & b));
+    }
+
+    // 3. Rounding ops: trap-free, deterministic, canonical NaN on NaN.
+    let r_kind: u8 = kani::any();
+    kani::assume(r_kind < 4);
+    let rop = match r_kind {
+        0 => UnOp::F32Ceil,
+        1 => UnOp::F32Floor,
+        2 => UnOp::F32Trunc,
+        _ => UnOp::F32Nearest,
+    };
+    let r1 = eval_unop(rop, va);
+    let r2 = eval_unop(rop, va);
+    assert!(r1 == r2);
+    let Ok(Val::F32(rb)) = r1 else { unreachable!() };
+    if f32_is_nan(a) {
+        assert!(rb == F32_CANON_NAN);
+    }
+
+    // 4. Saturating truncations: 100% trap-free, deterministic, NaN -> 0.
+    let ts_s1 = eval_unop(UnOp::I32TruncSatF32S, va);
+    let ts_s2 = eval_unop(UnOp::I32TruncSatF32S, va);
+    let ts_u1 = eval_unop(UnOp::I32TruncSatF32U, va);
+    let ts_u2 = eval_unop(UnOp::I32TruncSatF32U, va);
+    assert!(ts_s1 == ts_s2 && ts_s1.is_ok());
+    assert!(ts_u1 == ts_u2 && ts_u1.is_ok());
+    if f32_is_nan(a) {
+        assert!(ts_s1 == Ok(Val::I32(0)) && ts_u1 == Ok(Val::I32(0)));
+    }
+}
+
+#[kani::proof]
+#[kani::unwind(20)]
+fn kani_v128_lane_and_mem16() {
+    let v: u128 = kani::any();
+    let other: u128 = kani::any();
+    let mask: u128 = kani::any();
+
+    // 1. Replace-lane + extract-lane round-trip for symbolic LaneKind and lane index.
+    let kind_idx: u8 = kani::any();
+    kani::assume(kind_idx < 6);
+    let (kind, scalar_ty, scalar_val) = match kind_idx {
+        0 => (LaneKind::I8x16U, ValType::I32, Val::I32((kani::any::<u8>()) as i32)),
+        1 => (LaneKind::I16x8U, ValType::I32, Val::I32((kani::any::<u16>()) as i32)),
+        2 => (LaneKind::I32x4, ValType::I32, Val::I32(kani::any())),
+        3 => (LaneKind::I64x2, ValType::I64, Val::I64(kani::any())),
+        4 => (LaneKind::F32x4, ValType::F32, Val::F32(kani::any())),
+        _ => (LaneKind::F64x2, ValType::F64, Val::F64(kani::any())),
+    };
+    let lane: u8 = kani::any();
+    kani::assume(lane < kind.num_lanes());
+
+    let reg = Region::build(|b| {
+        b.push_let(ValId(4), ValType::V128, Op::SimdReplaceLane { kind, lane, vec: ValId(0), val: ValId(3) });
+        b.push_let(ValId(5), scalar_ty, Op::SimdExtractLane { kind, lane, vec: ValId(4) });
+        b.push_let(ValId(6), ValType::V128, Op::SimdBitselect { a: ValId(0), b: ValId(1), mask: ValId(2) });
+        b.push_yield(&[ValId(5), ValId(6)]);
+    });
+    let Ok((out, _)) = eval_region(
+        &EMPTY_MODULE,
+        &EMPTY_REG,
+        &reg,
+        &[
+            (ValId(0), Val::V128(v)),
+            (ValId(1), Val::V128(other)),
+            (ValId(2), Val::V128(mask)),
+            (ValId(3), scalar_val),
+        ],
+        empty_heap(32),
+    ) else {
+        kani::assert(false, "valid v128 lane/bitselect region must succeed");
+        unreachable!()
+    };
+    assert!(out.len() == 2);
+    assert!(out[0] == scalar_val);
+    assert!(out[1] == Val::V128((v & mask) | (other & !mask)));
+
+    // 2. MemWidth::B16 store/load exact round-trip and EA overflow trapping.
+    let len: usize = kani::any();
+    kani::assume(len <= 18);
+    let mut mem = MemoryState { id: MemId(0), bytes: vec![0u8; len], max_pages: Some(1) };
+    let addr: u32 = kani::any();
+    let offset: u32 = kani::any();
+    let expected_oob = (addr as u64) + (offset as u64) + 16 > (len as u64);
+
+    let st = mem.store(addr, offset, MemWidth::B16, Val::V128(v));
+    let ld = mem.load(addr, offset, MemWidth::B16, false, ValType::V128);
+    if expected_oob {
+        assert!(st == Err(TrapCode::OutOfBoundsMem) && ld == Err(TrapCode::OutOfBoundsMem));
+    } else {
+        assert!(st == Ok(()) && ld == Ok(Val::V128(v)));
+    }
+}
+
+#[kani::proof]
+#[kani::unwind(18)]
+fn kani_ir_slot_v2_roundtrip() {
+    assert!(core::mem::size_of::<IrSlot>() == 24);
+    assert!(!core::mem::needs_drop::<IrSlot>());
+
+    // Dense u8 round-trip for UnOp and BinOp.
+    let u_raw: u8 = kani::any();
+    if u_raw < UnOp::COUNT {
+        let Some(u) = UnOp::from_u8(u_raw) else { unreachable!() };
+        assert!(u.to_u8() == u_raw);
+    } else {
+        assert!(UnOp::from_u8(u_raw).is_none());
+    }
+    let b_raw: u8 = kani::any();
+    if b_raw < BinOp::COUNT {
+        let Some(b) = BinOp::from_u8(b_raw) else { unreachable!() };
+        assert!(b.to_u8() == b_raw);
+    } else {
+        assert!(BinOp::from_u8(b_raw).is_none());
+    }
+
+    // Lossless pool encoding for all new v2 Op variants including aux-backed SimdShuffle.
+    let f32_bits: u32 = kani::any();
+    let f64_bits: u64 = kani::any();
+    let v128_bits: u128 = kani::any();
+    let kind_raw: u8 = kani::any();
+    kani::assume(kind_raw < 8);
+    let Some(kind) = LaneKind::from_u8(kind_raw) else { unreachable!() };
+    let lane: u8 = kani::any();
+    let lanes: [u8; 16] = kani::any();
+
+    let op0 = Op::ConstF32(f32_bits);
+    let op1 = Op::ConstF64(f64_bits);
+    let op2 = Op::ConstV128(v128_bits);
+    let op3 = Op::SimdExtractLane { kind, lane, vec: ValId(2) };
+    let op4 = Op::SimdReplaceLane { kind, lane, vec: ValId(2), val: ValId(3) };
+    let op5 = Op::SimdBitselect { a: ValId(2), b: ValId(4), mask: ValId(2) };
+    let op6 = Op::SimdShuffle { lhs: ValId(2), rhs: ValId(4), lanes };
+
+    let reg = Region::build(|b| {
+        b.push_let(ValId(0), ValType::F32, op0);
+        b.push_let(ValId(1), ValType::F64, op1);
+        b.push_let(ValId(2), ValType::V128, op2);
+        b.push_let(ValId(3), kind.scalar_ty(), op3);
+        b.push_let(ValId(4), ValType::V128, op4);
+        b.push_let(ValId(5), ValType::V128, op5);
+        b.push_let(ValId(6), ValType::V128, op6);
+    });
+    let RegionNode::Block(span) = reg.root else { unreachable!() };
+    assert!(span.len == 7);
+    assert!(reg.try_stmt(span, 0) == Some(Stmt::Let { dst: ValId(0), ty: ValType::F32, op: op0 }));
+    assert!(reg.try_stmt(span, 1) == Some(Stmt::Let { dst: ValId(1), ty: ValType::F64, op: op1 }));
+    assert!(reg.try_stmt(span, 2) == Some(Stmt::Let { dst: ValId(2), ty: ValType::V128, op: op2 }));
+    assert!(reg.try_stmt(span, 3) == Some(Stmt::Let { dst: ValId(3), ty: kind.scalar_ty(), op: op3 }));
+    assert!(reg.try_stmt(span, 4) == Some(Stmt::Let { dst: ValId(4), ty: ValType::V128, op: op4 }));
+    assert!(reg.try_stmt(span, 5) == Some(Stmt::Let { dst: ValId(5), ty: ValType::V128, op: op5 }));
+    assert!(reg.try_stmt(span, 6) == Some(Stmt::Let { dst: ValId(6), ty: ValType::V128, op: op6 }));
+
+    // Verify shift preservation when embedding SimdShuffle inside another Region.
+    let single = Region::single_stmt(Stmt::Let { dst: ValId(9), ty: ValType::V128, op: op6 });
+    let wrapped = Region::if_else(ValId(0), &single, &Region::empty(), &[]);
+    let RegionNode::IfElse { then_region, .. } = wrapped.root else { unreachable!() };
+    let Some(RegionNode::Block(t_span)) = wrapped.try_node(then_region) else { unreachable!() };
+    assert!(
+        wrapped.try_stmt(t_span, 0)
+            == Some(Stmt::Let { dst: ValId(9), ty: ValType::V128, op: op6 })
+    );
 }

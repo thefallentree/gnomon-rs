@@ -4,13 +4,14 @@
 use std::collections::HashMap;
 
 use gnomon_kernel::{
-    BinOp, CallTarget, EffectOp, FuncDef, FuncId, GlobalId, HostCallId, MemId, MemWidth, Module,
-    Op, RegionNode, RegionRef, Span, Stmt, UnOp, Val, ValId, ValType,
+    BinOp, CallTarget, EffectOp, FuncDef, FuncId, GlobalId, HostCallId, LaneKind, MemId, MemWidth,
+    Module, Op, RegionNode, RegionRef, Span, Stmt, UnOp, Val, ValId, ValType,
 };
 use wasm_encoder::{
     BlockType, CodeSection, ConstExpr, DataSection, EntityType, ExportKind, ExportSection,
-    Function, FunctionSection, GlobalSection, GlobalType, ImportSection, InstructionSink, MemArg,
-    MemArgTarget, MemorySection, MemoryType, Module as WasmModule, TypeSection, ValType as WValType,
+    Function, FunctionSection, GlobalSection, GlobalType, Ieee32, Ieee64, ImportSection,
+    InstructionSink, MemArg, MemArgTarget, MemorySection, MemoryType, Module as WasmModule,
+    TypeSection, ValType as WValType,
 };
 use wasmparser::{Validator, WasmFeatures};
 
@@ -144,6 +145,9 @@ pub fn emit_wasm(module: &Module) -> Result<Vec<u8>, WasmError> {
             let init = match g.init {
                 Val::I32(v) => ConstExpr::i32_const(v),
                 Val::I64(v) => ConstExpr::i64_const(v),
+                Val::F32(b) => ConstExpr::f32_const(Ieee32::new(b)),
+                Val::F64(b) => ConstExpr::f64_const(Ieee64::new(b)),
+                Val::V128(b) => ConstExpr::v128_const(b as i128),
             };
             globs_sec.global(
                 GlobalType {
@@ -251,6 +255,9 @@ fn to_wval_type(ty: ValType) -> WValType {
     match ty {
         ValType::I32 => WValType::I32,
         ValType::I64 => WValType::I64,
+        ValType::F32 => WValType::F32,
+        ValType::F64 => WValType::F64,
+        ValType::V128 => WValType::V128,
     }
 }
 
@@ -852,6 +859,7 @@ fn memarg(mem_idx: u32, offset: u32, width: MemWidth) -> MemArg {
         MemWidth::B2 => 1,
         MemWidth::B4 => 2,
         MemWidth::B8 => 3,
+        MemWidth::B16 => 4,
     };
     MemArg {
         offset: u64::from(offset),
@@ -880,6 +888,15 @@ fn emit_op(
         }
         Op::ConstI64(v) => {
             sink.i64_const(*v);
+        }
+        Op::ConstF32(bits) => {
+            sink.f32_const(Ieee32::new(*bits));
+        }
+        Op::ConstF64(bits) => {
+            sink.f64_const(Ieee64::new(*bits));
+        }
+        Op::ConstV128(bits) => {
+            sink.v128_const(*bits as i128);
         }
         Op::Copy(id) => {
             let (l, _) = locals.get(*id)?;
@@ -910,6 +927,7 @@ fn emit_op(
             let (al, _) = locals.get(*a)?;
             sink.local_get(al);
             match unop {
+                // Integer unary (0..=15)
                 UnOp::I32Eqz => sink.i32_eqz(),
                 UnOp::I64Eqz => sink.i64_eqz(),
                 UnOp::I32Clz => sink.i32_clz(),
@@ -926,6 +944,96 @@ fn emit_op(
                 UnOp::I64Extend8S => sink.i64_extend8_s(),
                 UnOp::I64Extend16S => sink.i64_extend16_s(),
                 UnOp::I64Extend32S => sink.i64_extend32_s(),
+                // Scalar FP unary (16..=29)
+                UnOp::F32Abs => sink.f32_abs(),
+                UnOp::F32Neg => sink.f32_neg(),
+                UnOp::F32Ceil => sink.f32_ceil(),
+                UnOp::F32Floor => sink.f32_floor(),
+                UnOp::F32Trunc => sink.f32_trunc(),
+                UnOp::F32Nearest => sink.f32_nearest(),
+                UnOp::F32Sqrt => sink.f32_sqrt(),
+                UnOp::F64Abs => sink.f64_abs(),
+                UnOp::F64Neg => sink.f64_neg(),
+                UnOp::F64Ceil => sink.f64_ceil(),
+                UnOp::F64Floor => sink.f64_floor(),
+                UnOp::F64Trunc => sink.f64_trunc(),
+                UnOp::F64Nearest => sink.f64_nearest(),
+                UnOp::F64Sqrt => sink.f64_sqrt(),
+                // Trapping float-to-int truncations (30..=37)
+                UnOp::I32TruncF32S => sink.i32_trunc_f32_s(),
+                UnOp::I32TruncF32U => sink.i32_trunc_f32_u(),
+                UnOp::I32TruncF64S => sink.i32_trunc_f64_s(),
+                UnOp::I32TruncF64U => sink.i32_trunc_f64_u(),
+                UnOp::I64TruncF32S => sink.i64_trunc_f32_s(),
+                UnOp::I64TruncF32U => sink.i64_trunc_f32_u(),
+                UnOp::I64TruncF64S => sink.i64_trunc_f64_s(),
+                UnOp::I64TruncF64U => sink.i64_trunc_f64_u(),
+                // Saturating float-to-int truncations (38..=45)
+                UnOp::I32TruncSatF32S => sink.i32_trunc_sat_f32_s(),
+                UnOp::I32TruncSatF32U => sink.i32_trunc_sat_f32_u(),
+                UnOp::I32TruncSatF64S => sink.i32_trunc_sat_f64_s(),
+                UnOp::I32TruncSatF64U => sink.i32_trunc_sat_f64_u(),
+                UnOp::I64TruncSatF32S => sink.i64_trunc_sat_f32_s(),
+                UnOp::I64TruncSatF32U => sink.i64_trunc_sat_f32_u(),
+                UnOp::I64TruncSatF64S => sink.i64_trunc_sat_f64_s(),
+                UnOp::I64TruncSatF64U => sink.i64_trunc_sat_f64_u(),
+                // Int-to-float conversions (46..=53)
+                UnOp::F32ConvertI32S => sink.f32_convert_i32_s(),
+                UnOp::F32ConvertI32U => sink.f32_convert_i32_u(),
+                UnOp::F32ConvertI64S => sink.f32_convert_i64_s(),
+                UnOp::F32ConvertI64U => sink.f32_convert_i64_u(),
+                UnOp::F64ConvertI32S => sink.f64_convert_i32_s(),
+                UnOp::F64ConvertI32U => sink.f64_convert_i32_u(),
+                UnOp::F64ConvertI64S => sink.f64_convert_i64_s(),
+                UnOp::F64ConvertI64U => sink.f64_convert_i64_u(),
+                // Demote / Promote / Reinterpret (54..=59)
+                UnOp::F32DemoteF64 => sink.f32_demote_f64(),
+                UnOp::F64PromoteF32 => sink.f64_promote_f32(),
+                UnOp::I32ReinterpretF32 => sink.i32_reinterpret_f32(),
+                UnOp::I64ReinterpretF64 => sink.i64_reinterpret_f64(),
+                UnOp::F32ReinterpretI32 => sink.f32_reinterpret_i32(),
+                UnOp::F64ReinterpretI64 => sink.f64_reinterpret_i64(),
+                // v128 unary / splat / bitmask / lane-convert / extend (60..=99)
+                UnOp::V128Not => sink.v128_not(),
+                UnOp::V128AnyTrue => sink.v128_any_true(),
+                UnOp::I8x16Splat => sink.i8x16_splat(),
+                UnOp::I16x8Splat => sink.i16x8_splat(),
+                UnOp::I32x4Splat => sink.i32x4_splat(),
+                UnOp::I64x2Splat => sink.i64x2_splat(),
+                UnOp::F32x4Splat => sink.f32x4_splat(),
+                UnOp::F64x2Splat => sink.f64x2_splat(),
+                UnOp::I8x16Bitmask => sink.i8x16_bitmask(),
+                UnOp::I16x8Bitmask => sink.i16x8_bitmask(),
+                UnOp::I32x4Bitmask => sink.i32x4_bitmask(),
+                UnOp::I64x2Bitmask => sink.i64x2_bitmask(),
+                UnOp::I32x4AllTrue => sink.i32x4_all_true(),
+                UnOp::I64x2AllTrue => sink.i64x2_all_true(),
+                UnOp::I32x4Abs => sink.i32x4_abs(),
+                UnOp::I32x4Neg => sink.i32x4_neg(),
+                UnOp::I64x2Abs => sink.i64x2_abs(),
+                UnOp::I64x2Neg => sink.i64x2_neg(),
+                UnOp::F32x4Abs => sink.f32x4_abs(),
+                UnOp::F32x4Neg => sink.f32x4_neg(),
+                UnOp::F32x4Sqrt => sink.f32x4_sqrt(),
+                UnOp::F32x4Ceil => sink.f32x4_ceil(),
+                UnOp::F32x4Floor => sink.f32x4_floor(),
+                UnOp::F32x4Trunc => sink.f32x4_trunc(),
+                UnOp::F32x4Nearest => sink.f32x4_nearest(),
+                UnOp::F64x2Abs => sink.f64x2_abs(),
+                UnOp::F64x2Neg => sink.f64x2_neg(),
+                UnOp::F64x2Sqrt => sink.f64x2_sqrt(),
+                UnOp::F64x2Ceil => sink.f64x2_ceil(),
+                UnOp::F64x2Floor => sink.f64x2_floor(),
+                UnOp::F64x2Trunc => sink.f64x2_trunc(),
+                UnOp::F64x2Nearest => sink.f64x2_nearest(),
+                UnOp::I32x4TruncSatF32x4S => sink.i32x4_trunc_sat_f32x4_s(),
+                UnOp::I32x4TruncSatF32x4U => sink.i32x4_trunc_sat_f32x4_u(),
+                UnOp::F32x4ConvertI32x4S => sink.f32x4_convert_i32x4_s(),
+                UnOp::F32x4ConvertI32x4U => sink.f32x4_convert_i32x4_u(),
+                UnOp::I64x2ExtendLowI32x4S => sink.i64x2_extend_low_i32x4_s(),
+                UnOp::I64x2ExtendLowI32x4U => sink.i64x2_extend_low_i32x4_u(),
+                UnOp::I64x2ExtendHighI32x4S => sink.i64x2_extend_high_i32x4_s(),
+                UnOp::I64x2ExtendHighI32x4U => sink.i64x2_extend_high_i32x4_u(),
             };
         }
         Op::Bin(binop, l, r) => {
@@ -934,6 +1042,7 @@ fn emit_op(
             sink.local_get(ll);
             sink.local_get(rl);
             match binop {
+                // Integer binary (0..=49)
                 BinOp::I32Eq => sink.i32_eq(),
                 BinOp::I32Ne => sink.i32_ne(),
                 BinOp::I32LtS => sink.i32_lt_s(),
@@ -984,6 +1093,103 @@ fn emit_op(
                 BinOp::I64ShrU => sink.i64_shr_u(),
                 BinOp::I64Rotl => sink.i64_rotl(),
                 BinOp::I64Rotr => sink.i64_rotr(),
+                // Scalar FP binary (50..=75)
+                BinOp::F32Add => sink.f32_add(),
+                BinOp::F32Sub => sink.f32_sub(),
+                BinOp::F32Mul => sink.f32_mul(),
+                BinOp::F32Div => sink.f32_div(),
+                BinOp::F32Min => sink.f32_min(),
+                BinOp::F32Max => sink.f32_max(),
+                BinOp::F32Copysign => sink.f32_copysign(),
+                BinOp::F32Eq => sink.f32_eq(),
+                BinOp::F32Ne => sink.f32_ne(),
+                BinOp::F32Lt => sink.f32_lt(),
+                BinOp::F32Gt => sink.f32_gt(),
+                BinOp::F32Le => sink.f32_le(),
+                BinOp::F32Ge => sink.f32_ge(),
+                BinOp::F64Add => sink.f64_add(),
+                BinOp::F64Sub => sink.f64_sub(),
+                BinOp::F64Mul => sink.f64_mul(),
+                BinOp::F64Div => sink.f64_div(),
+                BinOp::F64Min => sink.f64_min(),
+                BinOp::F64Max => sink.f64_max(),
+                BinOp::F64Copysign => sink.f64_copysign(),
+                BinOp::F64Eq => sink.f64_eq(),
+                BinOp::F64Ne => sink.f64_ne(),
+                BinOp::F64Lt => sink.f64_lt(),
+                BinOp::F64Gt => sink.f64_gt(),
+                BinOp::F64Le => sink.f64_le(),
+                BinOp::F64Ge => sink.f64_ge(),
+                // v128 bitwise & swizzle (76..=80)
+                BinOp::V128And => sink.v128_and(),
+                BinOp::V128AndNot => sink.v128_andnot(),
+                BinOp::V128Or => sink.v128_or(),
+                BinOp::V128Xor => sink.v128_xor(),
+                BinOp::I8x16Swizzle => sink.i8x16_swizzle(),
+                // i32x4 lane binary (81..=100)
+                BinOp::I32x4Add => sink.i32x4_add(),
+                BinOp::I32x4Sub => sink.i32x4_sub(),
+                BinOp::I32x4Mul => sink.i32x4_mul(),
+                BinOp::I32x4MinS => sink.i32x4_min_s(),
+                BinOp::I32x4MinU => sink.i32x4_min_u(),
+                BinOp::I32x4MaxS => sink.i32x4_max_s(),
+                BinOp::I32x4MaxU => sink.i32x4_max_u(),
+                BinOp::I32x4Eq => sink.i32x4_eq(),
+                BinOp::I32x4Ne => sink.i32x4_ne(),
+                BinOp::I32x4LtS => sink.i32x4_lt_s(),
+                BinOp::I32x4LtU => sink.i32x4_lt_u(),
+                BinOp::I32x4GtS => sink.i32x4_gt_s(),
+                BinOp::I32x4GtU => sink.i32x4_gt_u(),
+                BinOp::I32x4LeS => sink.i32x4_le_s(),
+                BinOp::I32x4LeU => sink.i32x4_le_u(),
+                BinOp::I32x4GeS => sink.i32x4_ge_s(),
+                BinOp::I32x4GeU => sink.i32x4_ge_u(),
+                BinOp::I32x4Shl => sink.i32x4_shl(),
+                BinOp::I32x4ShrS => sink.i32x4_shr_s(),
+                BinOp::I32x4ShrU => sink.i32x4_shr_u(),
+                // i64x2 lane binary (101..=112)
+                BinOp::I64x2Add => sink.i64x2_add(),
+                BinOp::I64x2Sub => sink.i64x2_sub(),
+                BinOp::I64x2Mul => sink.i64x2_mul(),
+                BinOp::I64x2Eq => sink.i64x2_eq(),
+                BinOp::I64x2Ne => sink.i64x2_ne(),
+                BinOp::I64x2LtS => sink.i64x2_lt_s(),
+                BinOp::I64x2GtS => sink.i64x2_gt_s(),
+                BinOp::I64x2LeS => sink.i64x2_le_s(),
+                BinOp::I64x2GeS => sink.i64x2_ge_s(),
+                BinOp::I64x2Shl => sink.i64x2_shl(),
+                BinOp::I64x2ShrS => sink.i64x2_shr_s(),
+                BinOp::I64x2ShrU => sink.i64x2_shr_u(),
+                // f32x4 lane binary (113..=126)
+                BinOp::F32x4Add => sink.f32x4_add(),
+                BinOp::F32x4Sub => sink.f32x4_sub(),
+                BinOp::F32x4Mul => sink.f32x4_mul(),
+                BinOp::F32x4Div => sink.f32x4_div(),
+                BinOp::F32x4Min => sink.f32x4_min(),
+                BinOp::F32x4Max => sink.f32x4_max(),
+                BinOp::F32x4PMin => sink.f32x4_pmin(),
+                BinOp::F32x4PMax => sink.f32x4_pmax(),
+                BinOp::F32x4Eq => sink.f32x4_eq(),
+                BinOp::F32x4Ne => sink.f32x4_ne(),
+                BinOp::F32x4Lt => sink.f32x4_lt(),
+                BinOp::F32x4Gt => sink.f32x4_gt(),
+                BinOp::F32x4Le => sink.f32x4_le(),
+                BinOp::F32x4Ge => sink.f32x4_ge(),
+                // f64x2 lane binary (127..=140)
+                BinOp::F64x2Add => sink.f64x2_add(),
+                BinOp::F64x2Sub => sink.f64x2_sub(),
+                BinOp::F64x2Mul => sink.f64x2_mul(),
+                BinOp::F64x2Div => sink.f64x2_div(),
+                BinOp::F64x2Min => sink.f64x2_min(),
+                BinOp::F64x2Max => sink.f64x2_max(),
+                BinOp::F64x2PMin => sink.f64x2_pmin(),
+                BinOp::F64x2PMax => sink.f64x2_pmax(),
+                BinOp::F64x2Eq => sink.f64x2_eq(),
+                BinOp::F64x2Ne => sink.f64x2_ne(),
+                BinOp::F64x2Lt => sink.f64x2_lt(),
+                BinOp::F64x2Gt => sink.f64x2_gt(),
+                BinOp::F64x2Le => sink.f64x2_le(),
+                BinOp::F64x2Ge => sink.f64x2_ge(),
             };
         }
         Op::Load {
@@ -1011,10 +1217,13 @@ fn emit_op(
                 (ValType::I64, MemWidth::B4, true) => sink.i64_load32_s(ma),
                 (ValType::I64, MemWidth::B4, false) => sink.i64_load32_u(ma),
                 (ValType::I64, MemWidth::B8, _) => sink.i64_load(ma),
-                (ValType::I32, MemWidth::B8, _) => {
-                    return Err(WasmError::ValidationError(
-                        "invalid 8-byte load into i32".into(),
-                    ));
+                (ValType::F32, MemWidth::B4, _) => sink.f32_load(ma),
+                (ValType::F64, MemWidth::B8, _) => sink.f64_load(ma),
+                (ValType::V128, MemWidth::B16, _) => sink.v128_load(ma),
+                (ty, w, _) => {
+                    return Err(WasmError::ValidationError(format!(
+                        "invalid load width {w:?} for result type {ty:?}"
+                    )));
                 }
             };
         }
@@ -1027,6 +1236,60 @@ fn emit_op(
             let (dl, _) = locals.get(*delta)?;
             sink.local_get(dl);
             sink.memory_grow(mem_idx);
+        }
+        Op::SimdExtractLane { kind, lane, vec } => {
+            if *lane >= kind.num_lanes() {
+                return Err(WasmError::ValidationError(format!(
+                    "SIMD extract lane {lane} out of range for {kind:?}"
+                )));
+            }
+            let (vl, _) = locals.get(*vec)?;
+            sink.local_get(vl);
+            match kind {
+                LaneKind::I8x16S => sink.i8x16_extract_lane_s(*lane),
+                LaneKind::I8x16U => sink.i8x16_extract_lane_u(*lane),
+                LaneKind::I16x8S => sink.i16x8_extract_lane_s(*lane),
+                LaneKind::I16x8U => sink.i16x8_extract_lane_u(*lane),
+                LaneKind::I32x4 => sink.i32x4_extract_lane(*lane),
+                LaneKind::I64x2 => sink.i64x2_extract_lane(*lane),
+                LaneKind::F32x4 => sink.f32x4_extract_lane(*lane),
+                LaneKind::F64x2 => sink.f64x2_extract_lane(*lane),
+            };
+        }
+        Op::SimdReplaceLane { kind, lane, vec, val } => {
+            if *lane >= kind.num_lanes() {
+                return Err(WasmError::ValidationError(format!(
+                    "SIMD replace lane {lane} out of range for {kind:?}"
+                )));
+            }
+            let (vecl, _) = locals.get(*vec)?;
+            let (vall, _) = locals.get(*val)?;
+            sink.local_get(vecl);
+            sink.local_get(vall);
+            match kind {
+                LaneKind::I8x16S | LaneKind::I8x16U => sink.i8x16_replace_lane(*lane),
+                LaneKind::I16x8S | LaneKind::I16x8U => sink.i16x8_replace_lane(*lane),
+                LaneKind::I32x4 => sink.i32x4_replace_lane(*lane),
+                LaneKind::I64x2 => sink.i64x2_replace_lane(*lane),
+                LaneKind::F32x4 => sink.f32x4_replace_lane(*lane),
+                LaneKind::F64x2 => sink.f64x2_replace_lane(*lane),
+            };
+        }
+        Op::SimdBitselect { a, b, mask } => {
+            let (al, _) = locals.get(*a)?;
+            let (bl, _) = locals.get(*b)?;
+            let (ml, _) = locals.get(*mask)?;
+            sink.local_get(al);
+            sink.local_get(bl);
+            sink.local_get(ml);
+            sink.v128_bitselect();
+        }
+        Op::SimdShuffle { lhs, rhs, lanes } => {
+            let (ll, _) = locals.get(*lhs)?;
+            let (rl, _) = locals.get(*rhs)?;
+            sink.local_get(ll);
+            sink.local_get(rl);
+            sink.i8x16_shuffle(*lanes);
         }
     }
     Ok(())
@@ -1061,10 +1324,13 @@ fn emit_effect(
                 (ValType::I64, MemWidth::B2) => sink.i64_store16(ma),
                 (ValType::I64, MemWidth::B4) => sink.i64_store32(ma),
                 (ValType::I64, MemWidth::B8) => sink.i64_store(ma),
-                (ValType::I32, MemWidth::B8) => {
-                    return Err(WasmError::ValidationError(
-                        "invalid 8-byte store from i32".into(),
-                    ));
+                (ValType::F32, MemWidth::B4) => sink.f32_store(ma),
+                (ValType::F64, MemWidth::B8) => sink.f64_store(ma),
+                (ValType::V128, MemWidth::B16) => sink.v128_store(ma),
+                (ty, w) => {
+                    return Err(WasmError::ValidationError(format!(
+                        "invalid store width {w:?} for value type {ty:?}"
+                    )));
                 }
             };
             Ok(false)

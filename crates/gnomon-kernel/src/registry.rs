@@ -202,6 +202,9 @@ const TENV_INLINE: usize = 16;
 const TENV_UNDEF: u8 = 0;
 const TENV_I32: u8 = 1;
 const TENV_I64: u8 = 2;
+const TENV_F32: u8 = 3;
+const TENV_F64: u8 = 4;
+const TENV_V128: u8 = 5;
 
 struct TypeEnv {
     slot_tag: [u8; TENV_INLINE],
@@ -262,6 +265,9 @@ impl TypeEnv {
             let tag = match ty {
                 ValType::I32 => TENV_I32,
                 ValType::I64 => TENV_I64,
+                ValType::F32 => TENV_F32,
+                ValType::F64 => TENV_F64,
+                ValType::V128 => TENV_V128,
             };
             self.trail_meta[self.inline_len] = ((idx as u8) << 4) | self.slot_tag[idx];
             self.slot_tag[idx] = tag;
@@ -306,6 +312,9 @@ impl TypeEnv {
             match self.slot_tag[idx] {
                 TENV_I32 => return Ok(ValType::I32),
                 TENV_I64 => return Ok(ValType::I64),
+                TENV_F32 => return Ok(ValType::F32),
+                TENV_F64 => return Ok(ValType::F64),
+                TENV_V128 => return Ok(ValType::V128),
                 _ => {}
             }
         }
@@ -1142,6 +1151,9 @@ impl StratumRegistry {
         match op {
             Op::ConstI32(_) | Op::MemorySize(_) => Ok(ValType::I32),
             Op::ConstI64(_) => Ok(ValType::I64),
+            Op::ConstF32(_) => Ok(ValType::F32),
+            Op::ConstF64(_) => Ok(ValType::F64),
+            Op::ConstV128(_) => Ok(ValType::V128),
             Op::Copy(v) => env.lookup(*v),
             Op::Select { cond, true_val, false_val } => {
                 Self::expect_ty(*cond, ValType::I32, env)?;
@@ -1155,13 +1167,21 @@ impl StratumRegistry {
                 Ok(u.output_ty())
             }
             Op::Bin(b, l, r) => {
-                Self::expect_ty(*l, b.operand_ty(), env)?;
-                Self::expect_ty(*r, b.operand_ty(), env)?;
+                Self::expect_ty(*l, b.lhs_ty(), env)?;
+                Self::expect_ty(*r, b.rhs_ty(), env)?;
                 Ok(b.output_ty())
             }
             Op::Load { addr, width, result_ty, .. } => {
                 Self::expect_ty(*addr, ValType::I32, env)?;
-                if *width == MemWidth::B8 && *result_ty != ValType::I64 {
+                let ok = matches!(
+                    (*result_ty, *width),
+                    (ValType::I32, MemWidth::B1 | MemWidth::B2 | MemWidth::B4)
+                        | (ValType::I64, MemWidth::B1 | MemWidth::B2 | MemWidth::B4 | MemWidth::B8)
+                        | (ValType::F32, MemWidth::B4)
+                        | (ValType::F64, MemWidth::B8)
+                        | (ValType::V128, MemWidth::B16)
+                );
+                if !ok {
                     return Err(RegistryError::TypeMismatch);
                 }
                 Ok(*result_ty)
@@ -1169,6 +1189,39 @@ impl StratumRegistry {
             Op::MemoryGrow { delta, .. } => {
                 Self::expect_ty(*delta, ValType::I32, env)?;
                 Ok(ValType::I32)
+            }
+            Op::SimdExtractLane { kind, lane, vec } => {
+                if *lane >= kind.num_lanes() {
+                    return Err(RegistryError::TypeMismatch);
+                }
+                Self::expect_ty(*vec, ValType::V128, env)?;
+                Ok(kind.scalar_ty())
+            }
+            Op::SimdReplaceLane { kind, lane, vec, val } => {
+                if *lane >= kind.num_lanes() {
+                    return Err(RegistryError::TypeMismatch);
+                }
+                Self::expect_ty(*vec, ValType::V128, env)?;
+                Self::expect_ty(*val, kind.scalar_ty(), env)?;
+                Ok(ValType::V128)
+            }
+            Op::SimdBitselect { a, b, mask } => {
+                Self::expect_ty(*a, ValType::V128, env)?;
+                Self::expect_ty(*b, ValType::V128, env)?;
+                Self::expect_ty(*mask, ValType::V128, env)?;
+                Ok(ValType::V128)
+            }
+            Op::SimdShuffle { lhs, rhs, lanes } => {
+                let mut i = 0;
+                while i < 16 {
+                    if lanes[i] >= 32 {
+                        return Err(RegistryError::TypeMismatch);
+                    }
+                    i += 1;
+                }
+                Self::expect_ty(*lhs, ValType::V128, env)?;
+                Self::expect_ty(*rhs, ValType::V128, env)?;
+                Ok(ValType::V128)
             }
         }
     }
@@ -1178,7 +1231,15 @@ impl StratumRegistry {
             EffectOp::Store { addr, val, width, .. } => {
                 Self::expect_ty(*addr, ValType::I32, env)?;
                 let vty = env.lookup(*val)?;
-                if *width == MemWidth::B8 && vty != ValType::I64 {
+                let ok = matches!(
+                    (vty, *width),
+                    (ValType::I32, MemWidth::B1 | MemWidth::B2 | MemWidth::B4)
+                        | (ValType::I64, MemWidth::B1 | MemWidth::B2 | MemWidth::B4 | MemWidth::B8)
+                        | (ValType::F32, MemWidth::B4)
+                        | (ValType::F64, MemWidth::B8)
+                        | (ValType::V128, MemWidth::B16)
+                );
+                if !ok {
                     return Err(RegistryError::TypeMismatch);
                 }
             }
@@ -1251,7 +1312,9 @@ impl StratumRegistry {
     ) -> Result<(), RegistryError> {
         match slot.tag {
             TAG_STMT_LET => {
-                let (dst, ty, op) = slot.to_let_op().ok_or(RegistryError::TypeMismatch)?;
+                let (dst, ty, op) = slot
+                    .to_let_op_with_pool(ctx.region.pool.as_slice())
+                    .ok_or(RegistryError::TypeMismatch)?;
                 if Self::check_op(&op, ty, env)? != ty {
                     return Err(RegistryError::TypeMismatch);
                 }

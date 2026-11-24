@@ -4,8 +4,8 @@ use std::collections::{BTreeSet, HashMap};
 
 use gnomon_kernel::{
     BinOp, CallTarget, EffectOp, FuncDef, FuncId, GlobalDef, GlobalId, HostCallId, HostContract,
-    MemId, MemWidth, MemoryDef, Module, Op, Region, RegionBuilder, RegionNode, Stmt, TrapCode,
-    UnOp, Val, ValId, ValType,
+    LaneKind, MemId, MemWidth, MemoryDef, Module, Op, Region, RegionBuilder, RegionNode, Stmt,
+    TrapCode, UnOp, Val, ValId, ValType,
 };
 use wasmparser::{
     BlockType, CompositeInnerType, ConstExpr, DataKind, ExternalKind, FuncType, FunctionBody,
@@ -252,9 +252,9 @@ pub fn lift_wasm(bytes: &[u8]) -> Result<Module, WasmError> {
                             })?;
                             let offset = match eval_const_expr(&offset_expr, &globals)? {
                                 Val::I32(v) => v as u32,
-                                Val::I64(_) => {
+                                _ => {
                                     return Err(WasmError::UnsupportedFeature(
-                                        "64-bit data segment offset is not supported".into(),
+                                        "non-i32 data segment offset is not supported".into(),
                                     ));
                                 }
                             };
@@ -291,7 +291,7 @@ pub fn lift_wasm(bytes: &[u8]) -> Result<Module, WasmError> {
             .and_then(|o| o.as_ref())
             .ok_or_else(|| {
                 WasmError::UnsupportedFeature(format!(
-                    "type index {type_idx} uses unsupported non-i32/i64 or non-function types"
+                    "type index {type_idx} uses unsupported value or non-function types"
                 ))
             })
     };
@@ -381,6 +381,9 @@ fn convert_val_type(ty: WValType) -> Result<ValType, WasmError> {
     match ty {
         WValType::I32 => Ok(ValType::I32),
         WValType::I64 => Ok(ValType::I64),
+        WValType::F32 => Ok(ValType::F32),
+        WValType::F64 => Ok(ValType::F64),
+        WValType::V128 => Ok(ValType::V128),
         other => Err(WasmError::UnsupportedFeature(format!(
             "unsupported value type: {other:?}"
         ))),
@@ -413,6 +416,9 @@ fn eval_const_expr(expr: &ConstExpr<'_>, globals: &[GlobalDef]) -> Result<Val, W
         match op {
             Operator::I32Const { value } => stack.push(Val::I32(value)),
             Operator::I64Const { value } => stack.push(Val::I64(value)),
+            Operator::F32Const { value } => stack.push(Val::F32(value.bits())),
+            Operator::F64Const { value } => stack.push(Val::F64(value.bits())),
+            Operator::V128Const { value } => stack.push(Val::V128(value.i128() as u128)),
             Operator::GlobalGet { global_index } => {
                 let g = globals.get(global_index as usize).ok_or_else(|| {
                     WasmError::ValidationError(format!(
@@ -653,6 +659,9 @@ fn lift_function(
         .map_err(|e| WasmError::ParseError(e.to_string()))?;
     let mut zero_i32: Option<ValId> = None;
     let mut zero_i64: Option<ValId> = None;
+    let mut zero_f32: Option<ValId> = None;
+    let mut zero_f64: Option<ValId> = None;
+    let mut zero_v128: Option<ValId> = None;
     for _ in 0..locals_reader.get_count() {
         let (count, wty) = locals_reader
             .read()
@@ -674,6 +683,33 @@ fn lift_function(
                     dst: id,
                     ty: ValType::I64,
                     op: Op::ConstI64(0),
+                });
+                id
+            }),
+            ValType::F32 => *zero_f32.get_or_insert_with(|| {
+                let id = alloc.fresh();
+                init_stmts.push(Stmt::Let {
+                    dst: id,
+                    ty: ValType::F32,
+                    op: Op::ConstF32(0),
+                });
+                id
+            }),
+            ValType::F64 => *zero_f64.get_or_insert_with(|| {
+                let id = alloc.fresh();
+                init_stmts.push(Stmt::Let {
+                    dst: id,
+                    ty: ValType::F64,
+                    op: Op::ConstF64(0),
+                });
+                id
+            }),
+            ValType::V128 => *zero_v128.get_or_insert_with(|| {
+                let id = alloc.fresh();
+                init_stmts.push(Stmt::Let {
+                    dst: id,
+                    ty: ValType::V128,
+                    op: Op::ConstV128(0),
                 });
                 id
             }),
@@ -1290,6 +1326,36 @@ fn lift_function(
                 });
                 cur.stack.push((dst, ValType::I64));
             }
+            Operator::F32Const { value } => {
+                let dst = alloc.fresh();
+                let cur = frames.last_mut().unwrap();
+                cur.stmts.push(Stmt::Let {
+                    dst,
+                    ty: ValType::F32,
+                    op: Op::ConstF32(value.bits()),
+                });
+                cur.stack.push((dst, ValType::F32));
+            }
+            Operator::F64Const { value } => {
+                let dst = alloc.fresh();
+                let cur = frames.last_mut().unwrap();
+                cur.stmts.push(Stmt::Let {
+                    dst,
+                    ty: ValType::F64,
+                    op: Op::ConstF64(value.bits()),
+                });
+                cur.stack.push((dst, ValType::F64));
+            }
+            Operator::V128Const { value } => {
+                let dst = alloc.fresh();
+                let cur = frames.last_mut().unwrap();
+                cur.stmts.push(Stmt::Let {
+                    dst,
+                    ty: ValType::V128,
+                    op: Op::ConstV128(value.i128() as u128),
+                });
+                cur.stack.push((dst, ValType::V128));
+            }
             Operator::MemorySize { mem } => {
                 let mem_id = ctx.check_mem_idx(mem)?;
                 let dst = alloc.fresh();
@@ -1378,12 +1444,24 @@ fn lift_function(
             Operator::I64Load32U { memarg } => {
                 emit_load(ctx, &mut alloc, frames.last_mut().unwrap(), memarg, MemWidth::B4, false, ValType::I64)?;
             }
+            Operator::F32Load { memarg } => {
+                emit_load(ctx, &mut alloc, frames.last_mut().unwrap(), memarg, MemWidth::B4, false, ValType::F32)?;
+            }
+            Operator::F64Load { memarg } => {
+                emit_load(ctx, &mut alloc, frames.last_mut().unwrap(), memarg, MemWidth::B8, false, ValType::F64)?;
+            }
+            Operator::V128Load { memarg } => {
+                emit_load(ctx, &mut alloc, frames.last_mut().unwrap(), memarg, MemWidth::B16, false, ValType::V128)?;
+            }
             // Stores
-            Operator::I32Store { memarg } => {
+            Operator::I32Store { memarg } | Operator::F32Store { memarg } => {
                 emit_store(ctx, frames.last_mut().unwrap(), memarg, MemWidth::B4)?;
             }
-            Operator::I64Store { memarg } => {
+            Operator::I64Store { memarg } | Operator::F64Store { memarg } => {
                 emit_store(ctx, frames.last_mut().unwrap(), memarg, MemWidth::B8)?;
+            }
+            Operator::V128Store { memarg } => {
+                emit_store(ctx, frames.last_mut().unwrap(), memarg, MemWidth::B16)?;
             }
             Operator::I32Store8 { memarg } | Operator::I64Store8 { memarg } => {
                 emit_store(ctx, frames.last_mut().unwrap(), memarg, MemWidth::B1)?;
@@ -1393,6 +1471,74 @@ fn lift_function(
             }
             Operator::I64Store32 { memarg } => {
                 emit_store(ctx, frames.last_mut().unwrap(), memarg, MemWidth::B4)?;
+            }
+            // SIMD lane extract / replace / bitselect / shuffle
+            Operator::I8x16ExtractLaneS { lane } => {
+                emit_simd_extract(&mut alloc, frames.last_mut().unwrap(), LaneKind::I8x16S, lane)?;
+            }
+            Operator::I8x16ExtractLaneU { lane } => {
+                emit_simd_extract(&mut alloc, frames.last_mut().unwrap(), LaneKind::I8x16U, lane)?;
+            }
+            Operator::I16x8ExtractLaneS { lane } => {
+                emit_simd_extract(&mut alloc, frames.last_mut().unwrap(), LaneKind::I16x8S, lane)?;
+            }
+            Operator::I16x8ExtractLaneU { lane } => {
+                emit_simd_extract(&mut alloc, frames.last_mut().unwrap(), LaneKind::I16x8U, lane)?;
+            }
+            Operator::I32x4ExtractLane { lane } => {
+                emit_simd_extract(&mut alloc, frames.last_mut().unwrap(), LaneKind::I32x4, lane)?;
+            }
+            Operator::I64x2ExtractLane { lane } => {
+                emit_simd_extract(&mut alloc, frames.last_mut().unwrap(), LaneKind::I64x2, lane)?;
+            }
+            Operator::F32x4ExtractLane { lane } => {
+                emit_simd_extract(&mut alloc, frames.last_mut().unwrap(), LaneKind::F32x4, lane)?;
+            }
+            Operator::F64x2ExtractLane { lane } => {
+                emit_simd_extract(&mut alloc, frames.last_mut().unwrap(), LaneKind::F64x2, lane)?;
+            }
+            Operator::I8x16ReplaceLane { lane } => {
+                emit_simd_replace(&mut alloc, frames.last_mut().unwrap(), LaneKind::I8x16U, lane)?;
+            }
+            Operator::I16x8ReplaceLane { lane } => {
+                emit_simd_replace(&mut alloc, frames.last_mut().unwrap(), LaneKind::I16x8U, lane)?;
+            }
+            Operator::I32x4ReplaceLane { lane } => {
+                emit_simd_replace(&mut alloc, frames.last_mut().unwrap(), LaneKind::I32x4, lane)?;
+            }
+            Operator::I64x2ReplaceLane { lane } => {
+                emit_simd_replace(&mut alloc, frames.last_mut().unwrap(), LaneKind::I64x2, lane)?;
+            }
+            Operator::F32x4ReplaceLane { lane } => {
+                emit_simd_replace(&mut alloc, frames.last_mut().unwrap(), LaneKind::F32x4, lane)?;
+            }
+            Operator::F64x2ReplaceLane { lane } => {
+                emit_simd_replace(&mut alloc, frames.last_mut().unwrap(), LaneKind::F64x2, lane)?;
+            }
+            Operator::V128Bitselect => {
+                let cur = frames.last_mut().unwrap();
+                let (mask, _) = pop_val(cur)?;
+                let (b, _) = pop_val(cur)?;
+                let (a, _) = pop_val(cur)?;
+                let dst = alloc.fresh();
+                cur.stmts.push(Stmt::Let {
+                    dst,
+                    ty: ValType::V128,
+                    op: Op::SimdBitselect { a, b, mask },
+                });
+                cur.stack.push((dst, ValType::V128));
+            }
+            Operator::I8x16Shuffle { lanes } => {
+                let cur = frames.last_mut().unwrap();
+                let (rhs, _) = pop_val(cur)?;
+                let (lhs, _) = pop_val(cur)?;
+                let dst = alloc.fresh();
+                cur.stmts.push(Stmt::Let {
+                    dst,
+                    ty: ValType::V128,
+                    op: Op::SimdShuffle { lhs, rhs, lanes },
+                });
+                cur.stack.push((dst, ValType::V128));
             }
             other => {
                 if let Some(unop) = map_unop(&other) {
@@ -1491,8 +1637,67 @@ fn emit_store(
     Ok(())
 }
 
+fn emit_simd_extract(
+    alloc: &mut ValAlloc,
+    cur: &mut ControlFrame,
+    kind: LaneKind,
+    lane: u8,
+) -> Result<(), WasmError> {
+    if lane >= kind.num_lanes() {
+        return Err(WasmError::ValidationError(format!(
+            "SIMD extract lane {lane} out of range for {kind:?}"
+        )));
+    }
+    let vec = cur
+        .stack
+        .pop()
+        .ok_or_else(|| WasmError::ValidationError("stack underflow on SIMD extract_lane".into()))?
+        .0;
+    let dst = alloc.fresh();
+    let ty = kind.scalar_ty();
+    cur.stmts.push(Stmt::Let {
+        dst,
+        ty,
+        op: Op::SimdExtractLane { kind, lane, vec },
+    });
+    cur.stack.push((dst, ty));
+    Ok(())
+}
+
+fn emit_simd_replace(
+    alloc: &mut ValAlloc,
+    cur: &mut ControlFrame,
+    kind: LaneKind,
+    lane: u8,
+) -> Result<(), WasmError> {
+    if lane >= kind.num_lanes() {
+        return Err(WasmError::ValidationError(format!(
+            "SIMD replace lane {lane} out of range for {kind:?}"
+        )));
+    }
+    let val = cur
+        .stack
+        .pop()
+        .ok_or_else(|| WasmError::ValidationError("stack underflow on SIMD replace_lane val".into()))?
+        .0;
+    let vec = cur
+        .stack
+        .pop()
+        .ok_or_else(|| WasmError::ValidationError("stack underflow on SIMD replace_lane vec".into()))?
+        .0;
+    let dst = alloc.fresh();
+    cur.stmts.push(Stmt::Let {
+        dst,
+        ty: ValType::V128,
+        op: Op::SimdReplaceLane { kind, lane, vec, val },
+    });
+    cur.stack.push((dst, ValType::V128));
+    Ok(())
+}
+
 fn map_unop(op: &Operator<'_>) -> Option<UnOp> {
     Some(match op {
+        // Integer unary (0..=15)
         Operator::I32Eqz => UnOp::I32Eqz,
         Operator::I64Eqz => UnOp::I64Eqz,
         Operator::I32Clz => UnOp::I32Clz,
@@ -1509,12 +1714,103 @@ fn map_unop(op: &Operator<'_>) -> Option<UnOp> {
         Operator::I64Extend8S => UnOp::I64Extend8S,
         Operator::I64Extend16S => UnOp::I64Extend16S,
         Operator::I64Extend32S => UnOp::I64Extend32S,
+        // Scalar FP unary (16..=29)
+        Operator::F32Abs => UnOp::F32Abs,
+        Operator::F32Neg => UnOp::F32Neg,
+        Operator::F32Ceil => UnOp::F32Ceil,
+        Operator::F32Floor => UnOp::F32Floor,
+        Operator::F32Trunc => UnOp::F32Trunc,
+        Operator::F32Nearest => UnOp::F32Nearest,
+        Operator::F32Sqrt => UnOp::F32Sqrt,
+        Operator::F64Abs => UnOp::F64Abs,
+        Operator::F64Neg => UnOp::F64Neg,
+        Operator::F64Ceil => UnOp::F64Ceil,
+        Operator::F64Floor => UnOp::F64Floor,
+        Operator::F64Trunc => UnOp::F64Trunc,
+        Operator::F64Nearest => UnOp::F64Nearest,
+        Operator::F64Sqrt => UnOp::F64Sqrt,
+        // Trapping float-to-int truncations (30..=37)
+        Operator::I32TruncF32S => UnOp::I32TruncF32S,
+        Operator::I32TruncF32U => UnOp::I32TruncF32U,
+        Operator::I32TruncF64S => UnOp::I32TruncF64S,
+        Operator::I32TruncF64U => UnOp::I32TruncF64U,
+        Operator::I64TruncF32S => UnOp::I64TruncF32S,
+        Operator::I64TruncF32U => UnOp::I64TruncF32U,
+        Operator::I64TruncF64S => UnOp::I64TruncF64S,
+        Operator::I64TruncF64U => UnOp::I64TruncF64U,
+        // Saturating float-to-int truncations (38..=45)
+        Operator::I32TruncSatF32S => UnOp::I32TruncSatF32S,
+        Operator::I32TruncSatF32U => UnOp::I32TruncSatF32U,
+        Operator::I32TruncSatF64S => UnOp::I32TruncSatF64S,
+        Operator::I32TruncSatF64U => UnOp::I32TruncSatF64U,
+        Operator::I64TruncSatF32S => UnOp::I64TruncSatF32S,
+        Operator::I64TruncSatF32U => UnOp::I64TruncSatF32U,
+        Operator::I64TruncSatF64S => UnOp::I64TruncSatF64S,
+        Operator::I64TruncSatF64U => UnOp::I64TruncSatF64U,
+        // Int-to-float conversions (46..=53)
+        Operator::F32ConvertI32S => UnOp::F32ConvertI32S,
+        Operator::F32ConvertI32U => UnOp::F32ConvertI32U,
+        Operator::F32ConvertI64S => UnOp::F32ConvertI64S,
+        Operator::F32ConvertI64U => UnOp::F32ConvertI64U,
+        Operator::F64ConvertI32S => UnOp::F64ConvertI32S,
+        Operator::F64ConvertI32U => UnOp::F64ConvertI32U,
+        Operator::F64ConvertI64S => UnOp::F64ConvertI64S,
+        Operator::F64ConvertI64U => UnOp::F64ConvertI64U,
+        // Demote / Promote / Reinterpret (54..=59)
+        Operator::F32DemoteF64 => UnOp::F32DemoteF64,
+        Operator::F64PromoteF32 => UnOp::F64PromoteF32,
+        Operator::I32ReinterpretF32 => UnOp::I32ReinterpretF32,
+        Operator::I64ReinterpretF64 => UnOp::I64ReinterpretF64,
+        Operator::F32ReinterpretI32 => UnOp::F32ReinterpretI32,
+        Operator::F64ReinterpretI64 => UnOp::F64ReinterpretI64,
+        // v128 unary / splat / bitmask / lane-convert / extend (60..=99)
+        Operator::V128Not => UnOp::V128Not,
+        Operator::V128AnyTrue => UnOp::V128AnyTrue,
+        Operator::I8x16Splat => UnOp::I8x16Splat,
+        Operator::I16x8Splat => UnOp::I16x8Splat,
+        Operator::I32x4Splat => UnOp::I32x4Splat,
+        Operator::I64x2Splat => UnOp::I64x2Splat,
+        Operator::F32x4Splat => UnOp::F32x4Splat,
+        Operator::F64x2Splat => UnOp::F64x2Splat,
+        Operator::I8x16Bitmask => UnOp::I8x16Bitmask,
+        Operator::I16x8Bitmask => UnOp::I16x8Bitmask,
+        Operator::I32x4Bitmask => UnOp::I32x4Bitmask,
+        Operator::I64x2Bitmask => UnOp::I64x2Bitmask,
+        Operator::I32x4AllTrue => UnOp::I32x4AllTrue,
+        Operator::I64x2AllTrue => UnOp::I64x2AllTrue,
+        Operator::I32x4Abs => UnOp::I32x4Abs,
+        Operator::I32x4Neg => UnOp::I32x4Neg,
+        Operator::I64x2Abs => UnOp::I64x2Abs,
+        Operator::I64x2Neg => UnOp::I64x2Neg,
+        Operator::F32x4Abs => UnOp::F32x4Abs,
+        Operator::F32x4Neg => UnOp::F32x4Neg,
+        Operator::F32x4Sqrt => UnOp::F32x4Sqrt,
+        Operator::F32x4Ceil => UnOp::F32x4Ceil,
+        Operator::F32x4Floor => UnOp::F32x4Floor,
+        Operator::F32x4Trunc => UnOp::F32x4Trunc,
+        Operator::F32x4Nearest => UnOp::F32x4Nearest,
+        Operator::F64x2Abs => UnOp::F64x2Abs,
+        Operator::F64x2Neg => UnOp::F64x2Neg,
+        Operator::F64x2Sqrt => UnOp::F64x2Sqrt,
+        Operator::F64x2Ceil => UnOp::F64x2Ceil,
+        Operator::F64x2Floor => UnOp::F64x2Floor,
+        Operator::F64x2Trunc => UnOp::F64x2Trunc,
+        Operator::F64x2Nearest => UnOp::F64x2Nearest,
+        Operator::I32x4TruncSatF32x4S => UnOp::I32x4TruncSatF32x4S,
+        Operator::I32x4TruncSatF32x4U => UnOp::I32x4TruncSatF32x4U,
+        Operator::F32x4ConvertI32x4S => UnOp::F32x4ConvertI32x4S,
+        Operator::F32x4ConvertI32x4U => UnOp::F32x4ConvertI32x4U,
+        Operator::I64x2ExtendLowI32x4S => UnOp::I64x2ExtendLowI32x4S,
+        Operator::I64x2ExtendLowI32x4U => UnOp::I64x2ExtendLowI32x4U,
+        Operator::I64x2ExtendHighI32x4S => UnOp::I64x2ExtendHighI32x4S,
+        Operator::I64x2ExtendHighI32x4U => UnOp::I64x2ExtendHighI32x4U,
         _ => return None,
     })
 }
 
 fn map_binop(op: &Operator<'_>) -> Option<BinOp> {
     Some(match op {
+        // Integer binary (0..=49)
         Operator::I32Eq => BinOp::I32Eq,
         Operator::I32Ne => BinOp::I32Ne,
         Operator::I32LtS => BinOp::I32LtS,
@@ -1565,6 +1861,103 @@ fn map_binop(op: &Operator<'_>) -> Option<BinOp> {
         Operator::I64ShrU => BinOp::I64ShrU,
         Operator::I64Rotl => BinOp::I64Rotl,
         Operator::I64Rotr => BinOp::I64Rotr,
+        // Scalar FP binary (50..=75)
+        Operator::F32Add => BinOp::F32Add,
+        Operator::F32Sub => BinOp::F32Sub,
+        Operator::F32Mul => BinOp::F32Mul,
+        Operator::F32Div => BinOp::F32Div,
+        Operator::F32Min => BinOp::F32Min,
+        Operator::F32Max => BinOp::F32Max,
+        Operator::F32Copysign => BinOp::F32Copysign,
+        Operator::F32Eq => BinOp::F32Eq,
+        Operator::F32Ne => BinOp::F32Ne,
+        Operator::F32Lt => BinOp::F32Lt,
+        Operator::F32Gt => BinOp::F32Gt,
+        Operator::F32Le => BinOp::F32Le,
+        Operator::F32Ge => BinOp::F32Ge,
+        Operator::F64Add => BinOp::F64Add,
+        Operator::F64Sub => BinOp::F64Sub,
+        Operator::F64Mul => BinOp::F64Mul,
+        Operator::F64Div => BinOp::F64Div,
+        Operator::F64Min => BinOp::F64Min,
+        Operator::F64Max => BinOp::F64Max,
+        Operator::F64Copysign => BinOp::F64Copysign,
+        Operator::F64Eq => BinOp::F64Eq,
+        Operator::F64Ne => BinOp::F64Ne,
+        Operator::F64Lt => BinOp::F64Lt,
+        Operator::F64Gt => BinOp::F64Gt,
+        Operator::F64Le => BinOp::F64Le,
+        Operator::F64Ge => BinOp::F64Ge,
+        // v128 bitwise & swizzle (76..=80)
+        Operator::V128And => BinOp::V128And,
+        Operator::V128AndNot => BinOp::V128AndNot,
+        Operator::V128Or => BinOp::V128Or,
+        Operator::V128Xor => BinOp::V128Xor,
+        Operator::I8x16Swizzle => BinOp::I8x16Swizzle,
+        // i32x4 lane binary (81..=100)
+        Operator::I32x4Add => BinOp::I32x4Add,
+        Operator::I32x4Sub => BinOp::I32x4Sub,
+        Operator::I32x4Mul => BinOp::I32x4Mul,
+        Operator::I32x4MinS => BinOp::I32x4MinS,
+        Operator::I32x4MinU => BinOp::I32x4MinU,
+        Operator::I32x4MaxS => BinOp::I32x4MaxS,
+        Operator::I32x4MaxU => BinOp::I32x4MaxU,
+        Operator::I32x4Eq => BinOp::I32x4Eq,
+        Operator::I32x4Ne => BinOp::I32x4Ne,
+        Operator::I32x4LtS => BinOp::I32x4LtS,
+        Operator::I32x4LtU => BinOp::I32x4LtU,
+        Operator::I32x4GtS => BinOp::I32x4GtS,
+        Operator::I32x4GtU => BinOp::I32x4GtU,
+        Operator::I32x4LeS => BinOp::I32x4LeS,
+        Operator::I32x4LeU => BinOp::I32x4LeU,
+        Operator::I32x4GeS => BinOp::I32x4GeS,
+        Operator::I32x4GeU => BinOp::I32x4GeU,
+        Operator::I32x4Shl => BinOp::I32x4Shl,
+        Operator::I32x4ShrS => BinOp::I32x4ShrS,
+        Operator::I32x4ShrU => BinOp::I32x4ShrU,
+        // i64x2 lane binary (101..=112)
+        Operator::I64x2Add => BinOp::I64x2Add,
+        Operator::I64x2Sub => BinOp::I64x2Sub,
+        Operator::I64x2Mul => BinOp::I64x2Mul,
+        Operator::I64x2Eq => BinOp::I64x2Eq,
+        Operator::I64x2Ne => BinOp::I64x2Ne,
+        Operator::I64x2LtS => BinOp::I64x2LtS,
+        Operator::I64x2GtS => BinOp::I64x2GtS,
+        Operator::I64x2LeS => BinOp::I64x2LeS,
+        Operator::I64x2GeS => BinOp::I64x2GeS,
+        Operator::I64x2Shl => BinOp::I64x2Shl,
+        Operator::I64x2ShrS => BinOp::I64x2ShrS,
+        Operator::I64x2ShrU => BinOp::I64x2ShrU,
+        // f32x4 lane binary (113..=126)
+        Operator::F32x4Add => BinOp::F32x4Add,
+        Operator::F32x4Sub => BinOp::F32x4Sub,
+        Operator::F32x4Mul => BinOp::F32x4Mul,
+        Operator::F32x4Div => BinOp::F32x4Div,
+        Operator::F32x4Min => BinOp::F32x4Min,
+        Operator::F32x4Max => BinOp::F32x4Max,
+        Operator::F32x4PMin => BinOp::F32x4PMin,
+        Operator::F32x4PMax => BinOp::F32x4PMax,
+        Operator::F32x4Eq => BinOp::F32x4Eq,
+        Operator::F32x4Ne => BinOp::F32x4Ne,
+        Operator::F32x4Lt => BinOp::F32x4Lt,
+        Operator::F32x4Gt => BinOp::F32x4Gt,
+        Operator::F32x4Le => BinOp::F32x4Le,
+        Operator::F32x4Ge => BinOp::F32x4Ge,
+        // f64x2 lane binary (127..=140)
+        Operator::F64x2Add => BinOp::F64x2Add,
+        Operator::F64x2Sub => BinOp::F64x2Sub,
+        Operator::F64x2Mul => BinOp::F64x2Mul,
+        Operator::F64x2Div => BinOp::F64x2Div,
+        Operator::F64x2Min => BinOp::F64x2Min,
+        Operator::F64x2Max => BinOp::F64x2Max,
+        Operator::F64x2PMin => BinOp::F64x2PMin,
+        Operator::F64x2PMax => BinOp::F64x2PMax,
+        Operator::F64x2Eq => BinOp::F64x2Eq,
+        Operator::F64x2Ne => BinOp::F64x2Ne,
+        Operator::F64x2Lt => BinOp::F64x2Lt,
+        Operator::F64x2Gt => BinOp::F64x2Gt,
+        Operator::F64x2Le => BinOp::F64x2Le,
+        Operator::F64x2Ge => BinOp::F64x2Ge,
         _ => return None,
     })
 }
@@ -1589,7 +1982,26 @@ fn check_supported_op(ctx: &LiftModuleCtx<'_>, op: &Operator<'_>) -> Result<(), 
         | Operator::GlobalGet { .. }
         | Operator::GlobalSet { .. }
         | Operator::I32Const { .. }
-        | Operator::I64Const { .. } => Ok(()),
+        | Operator::I64Const { .. }
+        | Operator::F32Const { .. }
+        | Operator::F64Const { .. }
+        | Operator::V128Const { .. }
+        | Operator::I8x16ExtractLaneS { .. }
+        | Operator::I8x16ExtractLaneU { .. }
+        | Operator::I16x8ExtractLaneS { .. }
+        | Operator::I16x8ExtractLaneU { .. }
+        | Operator::I32x4ExtractLane { .. }
+        | Operator::I64x2ExtractLane { .. }
+        | Operator::F32x4ExtractLane { .. }
+        | Operator::F64x2ExtractLane { .. }
+        | Operator::I8x16ReplaceLane { .. }
+        | Operator::I16x8ReplaceLane { .. }
+        | Operator::I32x4ReplaceLane { .. }
+        | Operator::I64x2ReplaceLane { .. }
+        | Operator::F32x4ReplaceLane { .. }
+        | Operator::F64x2ReplaceLane { .. }
+        | Operator::V128Bitselect
+        | Operator::I8x16Shuffle { .. } => Ok(()),
         Operator::TypedSelect { ty } => {
             convert_val_type(*ty)?;
             Ok(())
@@ -1607,6 +2019,9 @@ fn check_supported_op(ctx: &LiftModuleCtx<'_>, op: &Operator<'_>) -> Result<(), 
         }
         Operator::I32Load { memarg }
         | Operator::I64Load { memarg }
+        | Operator::F32Load { memarg }
+        | Operator::F64Load { memarg }
+        | Operator::V128Load { memarg }
         | Operator::I32Load8S { memarg }
         | Operator::I32Load8U { memarg }
         | Operator::I32Load16S { memarg }
@@ -1619,6 +2034,9 @@ fn check_supported_op(ctx: &LiftModuleCtx<'_>, op: &Operator<'_>) -> Result<(), 
         | Operator::I64Load32U { memarg }
         | Operator::I32Store { memarg }
         | Operator::I64Store { memarg }
+        | Operator::F32Store { memarg }
+        | Operator::F64Store { memarg }
+        | Operator::V128Store { memarg }
         | Operator::I32Store8 { memarg }
         | Operator::I32Store16 { memarg }
         | Operator::I64Store8 { memarg }

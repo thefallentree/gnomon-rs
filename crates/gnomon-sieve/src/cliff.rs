@@ -10,7 +10,7 @@ use std::collections::BTreeMap;
 
 use gnomon_kernel::{
     BinOp, CallTarget, EffectOp, MAX_CALL_DEPTH, Module, Op, Region, RegionNode, RegionRef, Span,
-    Stmt, StratumRegistry, ValId,
+    Stmt, StratumRegistry, UnOp, ValId,
 };
 use serde::{Deserialize, Serialize};
 
@@ -103,18 +103,42 @@ fn merge_depth_vecs(dst: &mut Vec<DepthPair>, src: &[DepthPair]) {
     }
 }
 
-fn is_nonlinear_64(op: BinOp) -> bool {
-    matches!(
-        op,
-        BinOp::I64Mul | BinOp::I64DivS | BinOp::I64DivU | BinOp::I64RemS | BinOp::I64RemU
-    )
+fn nonlinear_64_weight(op: BinOp) -> usize {
+    match op {
+        BinOp::I64Mul
+        | BinOp::I64DivS
+        | BinOp::I64DivU
+        | BinOp::I64RemS
+        | BinOp::I64RemU
+        | BinOp::F64Mul
+        | BinOp::F64Div => 1,
+        BinOp::I64x2Mul | BinOp::F64x2Mul | BinOp::F64x2Div => 2,
+        _ => 0,
+    }
 }
 
-fn is_nonlinear_32(op: BinOp) -> bool {
-    matches!(
-        op,
-        BinOp::I32Mul | BinOp::I32DivS | BinOp::I32DivU | BinOp::I32RemS | BinOp::I32RemU
-    )
+fn nonlinear_32_weight(op: BinOp) -> usize {
+    match op {
+        BinOp::I32Mul
+        | BinOp::I32DivS
+        | BinOp::I32DivU
+        | BinOp::I32RemS
+        | BinOp::I32RemU
+        | BinOp::F32Mul
+        | BinOp::F32Div => 1,
+        BinOp::I32x4Mul | BinOp::F32x4Mul | BinOp::F32x4Div => 4,
+        _ => 0,
+    }
+}
+
+fn nonlinear_unop_weights(op: UnOp) -> (usize, usize) {
+    match op {
+        UnOp::F64Sqrt => (1, 1),
+        UnOp::F64x2Sqrt => (2, 2),
+        UnOp::F32Sqrt => (1, 0),
+        UnOp::F32x4Sqrt => (4, 0),
+        _ => (0, 0),
+    }
 }
 
 struct CliffWalker<'a> {
@@ -296,12 +320,32 @@ impl<'a> CliffWalker<'a> {
                     let d = match op {
                         Op::ConstI32(_)
                         | Op::ConstI64(_)
+                        | Op::ConstF32(_)
+                        | Op::ConstF64(_)
+                        | Op::ConstV128(_)
                         | Op::GlobalGet(_)
                         | Op::MemorySize(_)
                         | Op::Load { .. }
                         | Op::MemoryGrow { .. } => DepthPair::ZERO,
-                        Op::Copy(a) | Op::Un(_, a) => {
+                        Op::Copy(a) | Op::SimdExtractLane { vec: a, .. } => {
                             val_depths.get(&a).copied().unwrap_or(DepthPair::ZERO)
+                        }
+                        Op::Un(u, a) => {
+                            let base = val_depths.get(&a).copied().unwrap_or(DepthPair::ZERO);
+                            let (w_any, w_64) = nonlinear_unop_weights(u);
+                            if w_64 > 0 {
+                                self.metrics.nonlinear_ops += w_any;
+                                self.metrics.nonlinear64_ops += w_64;
+                                DepthPair {
+                                    any: base.any.saturating_add(1),
+                                    bits64: base.bits64.saturating_add(1),
+                                }
+                            } else if w_any > 0 {
+                                self.metrics.nonlinear_ops += w_any;
+                                DepthPair { any: base.any.saturating_add(1), bits64: base.bits64 }
+                            } else {
+                                base
+                            }
                         }
                         Op::Select { cond, true_val, false_val } => {
                             let c = val_depths.get(&cond).copied().unwrap_or(DepthPair::ZERO);
@@ -309,19 +353,37 @@ impl<'a> CliffWalker<'a> {
                             let f = val_depths.get(&false_val).copied().unwrap_or(DepthPair::ZERO);
                             c.max(t).max(f)
                         }
+                        Op::SimdReplaceLane { vec, val, .. } => {
+                            let vd = val_depths.get(&vec).copied().unwrap_or(DepthPair::ZERO);
+                            let ed = val_depths.get(&val).copied().unwrap_or(DepthPair::ZERO);
+                            vd.max(ed)
+                        }
+                        Op::SimdBitselect { a, b, mask } => {
+                            let ad = val_depths.get(&a).copied().unwrap_or(DepthPair::ZERO);
+                            let bd = val_depths.get(&b).copied().unwrap_or(DepthPair::ZERO);
+                            let md = val_depths.get(&mask).copied().unwrap_or(DepthPair::ZERO);
+                            ad.max(bd).max(md)
+                        }
+                        Op::SimdShuffle { lhs, rhs, .. } => {
+                            let ld = val_depths.get(&lhs).copied().unwrap_or(DepthPair::ZERO);
+                            let rd = val_depths.get(&rhs).copied().unwrap_or(DepthPair::ZERO);
+                            ld.max(rd)
+                        }
                         Op::Bin(bin, l, r_val) => {
                             let ld = val_depths.get(&l).copied().unwrap_or(DepthPair::ZERO);
                             let rd = val_depths.get(&r_val).copied().unwrap_or(DepthPair::ZERO);
                             let base = ld.max(rd);
-                            if is_nonlinear_64(bin) {
-                                self.metrics.nonlinear_ops += 1;
-                                self.metrics.nonlinear64_ops += 1;
+                            let w64 = nonlinear_64_weight(bin);
+                            let w32 = nonlinear_32_weight(bin);
+                            if w64 > 0 {
+                                self.metrics.nonlinear_ops += w64;
+                                self.metrics.nonlinear64_ops += w64;
                                 DepthPair {
                                     any: base.any.saturating_add(1),
                                     bits64: base.bits64.saturating_add(1),
                                 }
-                            } else if is_nonlinear_32(bin) {
-                                self.metrics.nonlinear_ops += 1;
+                            } else if w32 > 0 {
+                                self.metrics.nonlinear_ops += w32;
                                 DepthPair { any: base.any.saturating_add(1), bits64: base.bits64 }
                             } else {
                                 base

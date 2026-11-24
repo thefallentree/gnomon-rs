@@ -1,7 +1,7 @@
 #![forbid(unsafe_code)]
 
 //! Workstream 1C & 2A interface: `egglog` v3.0 regional simplification,
-//! `Bitwuzla` `QF_ABV` SMT oracle, and `stitch_core` consolidation.
+//! `Bitwuzla` `QF_ABVFP` SMT oracle, and `stitch_core` consolidation.
 
 use gnomon_kernel::{
     FuncDef, GlobalId, MemId, Module, Region, StratumRegistry, Val, ValId, ValType, VcObligation,

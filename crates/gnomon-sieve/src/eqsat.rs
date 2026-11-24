@@ -7,9 +7,9 @@ use egglog::ast::{Action, Command, Literal};
 use egglog::prelude::{EGraph, exprs};
 use egglog::{Term, TermDag, TermId, Value, add_primitive};
 use gnomon_kernel::{
-    BinOp, CallTarget, EffectOp, GlobalId, LawKind, MemId, MemWidth, Op, Region, RegionBuilder,
-    RegionNode, RegionRef, Span, Stmt, StratumId, StratumRegistry, UnOp, ValId, ValType,
-    validate_read_only_with_registry,
+    BinOp, CallTarget, EffectOp, GlobalId, LaneKind, LawKind, MemId, MemWidth, Op, Region,
+    RegionBuilder, RegionNode, RegionRef, Span, Stmt, StratumId, StratumRegistry, UnOp, ValId,
+    ValType, validate_read_only_with_registry,
 };
 
 use crate::{EqSatConfig, EqSatReport, SieveError};
@@ -282,7 +282,11 @@ impl EgglogSimplifier {
                         let v_ty = val_env
                             .get(&val)
                             .map(|&(t, _)| t)
-                            .unwrap_or(if width == MemWidth::B8 { ValType::I64 } else { ValType::I32 });
+                            .unwrap_or(match width {
+                                MemWidth::B16 => ValType::V128,
+                                MemWidth::B8 => ValType::I64,
+                                _ => ValType::I32,
+                            });
                         let val_e = lookup_egg(&val_env, val, v_ty);
                         let new_h = format!("$h{heap_seq}");
                         heap_seq += 1;
@@ -591,10 +595,7 @@ enum StmtPlan {
 }
 
 fn ty_tag(ty: ValType) -> i64 {
-    match ty {
-        ValType::I32 => 0,
-        ValType::I64 => 1,
-    }
+    ty.to_u8() as i64
 }
 
 fn width_bytes(w: MemWidth) -> i64 {
@@ -607,6 +608,7 @@ fn bytes_to_width(bytes: i64) -> Option<MemWidth> {
         2 => Some(MemWidth::B2),
         4 => Some(MemWidth::B4),
         8 => Some(MemWidth::B8),
+        16 => Some(MemWidth::B16),
         _ => None,
     }
 }
@@ -670,6 +672,39 @@ fn encode_expr_list(items: &[String]) -> String {
     acc
 }
 
+fn pack_shuffle_lanes(lanes: [u8; 16]) -> (i64, i64) {
+    let lo = u64::from_le_bytes([
+        lanes[0], lanes[1], lanes[2], lanes[3], lanes[4], lanes[5], lanes[6], lanes[7],
+    ]);
+    let hi = u64::from_le_bytes([
+        lanes[8], lanes[9], lanes[10], lanes[11], lanes[12], lanes[13], lanes[14], lanes[15],
+    ]);
+    (lo as i64, hi as i64)
+}
+
+fn unpack_shuffle_lanes(lo: i64, hi: i64) -> [u8; 16] {
+    let lb = (lo as u64).to_le_bytes();
+    let hb = (hi as u64).to_le_bytes();
+    [
+        lb[0], lb[1], lb[2], lb[3], lb[4], lb[5], lb[6], lb[7],
+        hb[0], hb[1], hb[2], hb[3], hb[4], hb[5], hb[6], hb[7],
+    ]
+}
+
+fn is_trapping_unop(u: UnOp) -> bool {
+    matches!(
+        u,
+        UnOp::I32TruncF32S
+            | UnOp::I32TruncF32U
+            | UnOp::I32TruncF64S
+            | UnOp::I32TruncF64U
+            | UnOp::I64TruncF32S
+            | UnOp::I64TruncF32U
+            | UnOp::I64TruncF64S
+            | UnOp::I64TruncF64U
+    )
+}
+
 fn encode_op(
     op: &Op,
     ty: ValType,
@@ -680,6 +715,13 @@ fn encode_op(
     match op {
         Op::ConstI32(v) => format!("(ConstI32 {})", *v as i64),
         Op::ConstI64(v) => format!("(ConstI64 {v})"),
+        Op::ConstF32(bits) => format!("(ConstF32 {})", *bits as i64),
+        Op::ConstF64(bits) => format!("(ConstF64 {})", *bits as i64),
+        Op::ConstV128(bits) => format!(
+            "(ConstV128 {} {})",
+            (*bits as u64) as i64,
+            ((*bits >> 64) as u64) as i64
+        ),
         Op::Copy(id) => lookup_egg(val_env, *id, ty),
         Op::Select { cond, true_val, false_val } => format!(
             "(Select {} {} {})",
@@ -687,13 +729,13 @@ fn encode_op(
             lookup_egg(val_env, *true_val, ty),
             lookup_egg(val_env, *false_val, ty),
         ),
-        Op::GlobalGet(gid) => format!("(GlobalGet {} {})", gid.0, (global_epoch * 2) + ty_tag(ty) as usize),
+        Op::GlobalGet(gid) => format!("(GlobalGet {} {} {})", gid.0, global_epoch, ty_tag(ty)),
         Op::Un(u, a) => format!("(Un {} {})", unop_tag(*u), lookup_egg(val_env, *a, u.input_ty())),
         Op::Bin(b, l, r) => format!(
             "(Bin {} {} {})",
             binop_tag(*b),
-            lookup_egg(val_env, *l, b.operand_ty()),
-            lookup_egg(val_env, *r, b.operand_ty())
+            lookup_egg(val_env, *l, b.lhs_ty()),
+            lookup_egg(val_env, *r, b.rhs_ty())
         ),
         Op::Load { mem, addr, offset, width, signed, result_ty } => format!(
             "(Load {} {heap_sym} {} {} {} {} {})",
@@ -706,12 +748,40 @@ fn encode_op(
         ),
         Op::MemorySize(mem) => format!("(MemSize {} {heap_sym})", mem.0),
         Op::MemoryGrow { .. } => unreachable!("MemoryGrow handled directly"),
+        Op::SimdExtractLane { kind, lane, vec } => format!(
+            "(SimdExtractLane {} {} {})",
+            kind.to_u8(),
+            lane,
+            lookup_egg(val_env, *vec, ValType::V128)
+        ),
+        Op::SimdReplaceLane { kind, lane, vec, val } => format!(
+            "(SimdReplaceLane {} {} {} {})",
+            kind.to_u8(),
+            lane,
+            lookup_egg(val_env, *vec, ValType::V128),
+            lookup_egg(val_env, *val, kind.scalar_ty())
+        ),
+        Op::SimdBitselect { a, b, mask } => format!(
+            "(SimdBitselect {} {} {})",
+            lookup_egg(val_env, *a, ValType::V128),
+            lookup_egg(val_env, *b, ValType::V128),
+            lookup_egg(val_env, *mask, ValType::V128)
+        ),
+        Op::SimdShuffle { lhs, rhs, lanes } => {
+            let (lo, hi) = pack_shuffle_lanes(*lanes);
+            format!(
+                "(SimdShuffle {} {} {lo} {hi})",
+                lookup_egg(val_env, *lhs, ValType::V128),
+                lookup_egg(val_env, *rhs, ValType::V128)
+            )
+        }
     }
 }
 
 fn op_can_trap(op: &Op) -> bool {
     match op {
         Op::Load { .. } | Op::MemoryGrow { .. } => true,
+        Op::Un(u, _) => is_trapping_unop(*u),
         Op::Bin(b, _, _) => matches!(
             b,
             BinOp::I32DivS
@@ -723,6 +793,10 @@ fn op_can_trap(op: &Op) -> bool {
                 | BinOp::I64RemS
                 | BinOp::I64RemU
         ),
+        Op::SimdExtractLane { kind, lane, .. } | Op::SimdReplaceLane { kind, lane, .. } => {
+            *lane >= kind.num_lanes()
+        }
+        Op::SimdShuffle { lanes, .. } => lanes.iter().any(|&l| l >= 32),
         _ => false,
     }
 }
@@ -732,6 +806,13 @@ fn term_contains_trap_op(termdag: &TermDag, tid: TermId) -> bool {
         Term::App(head, children) => {
             let root_traps = match head.as_str() {
                 "Load" | "StratumCall" => true,
+                "Un" => children
+                    .first()
+                    .and_then(|&c| match termdag.get(c) {
+                        Term::Lit(Literal::Int(tag)) => unop_from_tag(*tag),
+                        _ => None,
+                    })
+                    .is_some_and(is_trapping_unop),
                 "Bin" => children
                     .first()
                     .and_then(|&c| match termdag.get(c) {
@@ -751,6 +832,34 @@ fn term_contains_trap_op(termdag: &TermDag, tid: TermId) -> bool {
                                 | BinOp::I64RemU
                         )
                     }),
+                "SimdExtractLane" | "SimdReplaceLane" => {
+                    let kind = children.first().and_then(|&c| match termdag.get(c) {
+                        Term::Lit(Literal::Int(k)) => u8::try_from(*k).ok().and_then(LaneKind::from_u8),
+                        _ => None,
+                    });
+                    let lane = children.get(1).and_then(|&c| match termdag.get(c) {
+                        Term::Lit(Literal::Int(l)) => u8::try_from(*l).ok(),
+                        _ => None,
+                    });
+                    match (kind, lane) {
+                        (Some(k), Some(l)) => l >= k.num_lanes(),
+                        _ => true,
+                    }
+                }
+                "SimdShuffle" => {
+                    let lo = children.get(2).and_then(|&c| match termdag.get(c) {
+                        Term::Lit(Literal::Int(v)) => Some(*v),
+                        _ => None,
+                    });
+                    let hi = children.get(3).and_then(|&c| match termdag.get(c) {
+                        Term::Lit(Literal::Int(v)) => Some(*v),
+                        _ => None,
+                    });
+                    match (lo, hi) {
+                        (Some(l), Some(h)) => unpack_shuffle_lanes(l, h).iter().any(|&x| x >= 32),
+                        _ => true,
+                    }
+                }
                 _ => false,
             };
             root_traps || children.iter().any(|&c| term_contains_trap_op(termdag, c))
@@ -832,10 +941,30 @@ impl ReconstructCtx<'_> {
                     self.builder.push_let(dst, ValType::I64, Op::ConstI64(v));
                     (dst, ValType::I64)
                 }
+                "ConstF32" => {
+                    let bits = expect_int(dag, children[0])? as u32;
+                    let dst = self.fresh_id();
+                    self.builder.push_let(dst, ValType::F32, Op::ConstF32(bits));
+                    (dst, ValType::F32)
+                }
+                "ConstF64" => {
+                    let bits = expect_int(dag, children[0])? as u64;
+                    let dst = self.fresh_id();
+                    self.builder.push_let(dst, ValType::F64, Op::ConstF64(bits));
+                    (dst, ValType::F64)
+                }
+                "ConstV128" => {
+                    let lo = expect_int(dag, children[0])? as u64;
+                    let hi = expect_int(dag, children[1])? as u64;
+                    let bits = (lo as u128) | ((hi as u128) << 64);
+                    let dst = self.fresh_id();
+                    self.builder.push_let(dst, ValType::V128, Op::ConstV128(bits));
+                    (dst, ValType::V128)
+                }
                 "GlobalGet" => {
                     let gid = expect_int(dag, children[0])? as u32;
-                    let epoch_ty = expect_int(dag, children[1])?;
-                    let ty = if epoch_ty % 2 == 0 { ValType::I32 } else { ValType::I64 };
+                    let _epoch = expect_int(dag, children[1])?;
+                    let ty = expect_ty(dag, children[2])?;
                     let dst = self.fresh_id();
                     self.builder.push_let(dst, ty, Op::GlobalGet(GlobalId(gid)));
                     (dst, ty)
@@ -862,12 +991,60 @@ impl ReconstructCtx<'_> {
                     let b_tag = expect_int(dag, children[0])?;
                     let b = binop_from_tag(b_tag)
                         .ok_or_else(|| SieveError::EqSatError(format!("bad BinOp tag {b_tag}")))?;
-                    let (l, _) = self.emit_term(dag, children[1], b.operand_ty())?;
-                    let (r, _) = self.emit_term(dag, children[2], b.operand_ty())?;
+                    let (l, _) = self.emit_term(dag, children[1], b.lhs_ty())?;
+                    let (r, _) = self.emit_term(dag, children[2], b.rhs_ty())?;
                     let dst = self.fresh_id();
                     let out_ty = b.output_ty();
                     self.builder.push_let(dst, out_ty, Op::Bin(b, l, r));
                     (dst, out_ty)
+                }
+                "SimdExtractLane" => {
+                    let k_tag = expect_int(dag, children[0])?;
+                    let kind = u8::try_from(k_tag)
+                        .ok()
+                        .and_then(LaneKind::from_u8)
+                        .ok_or_else(|| SieveError::EqSatError(format!("bad LaneKind tag {k_tag}")))?;
+                    let lane = expect_int(dag, children[1])? as u8;
+                    let (vec, _) = self.emit_term(dag, children[2], ValType::V128)?;
+                    let out_ty = kind.scalar_ty();
+                    let dst = self.fresh_id();
+                    self.builder.push_let(dst, out_ty, Op::SimdExtractLane { kind, lane, vec });
+                    (dst, out_ty)
+                }
+                "SimdReplaceLane" => {
+                    let k_tag = expect_int(dag, children[0])?;
+                    let kind = u8::try_from(k_tag)
+                        .ok()
+                        .and_then(LaneKind::from_u8)
+                        .ok_or_else(|| SieveError::EqSatError(format!("bad LaneKind tag {k_tag}")))?;
+                    let lane = expect_int(dag, children[1])? as u8;
+                    let (vec, _) = self.emit_term(dag, children[2], ValType::V128)?;
+                    let (val, _) = self.emit_term(dag, children[3], kind.scalar_ty())?;
+                    let dst = self.fresh_id();
+                    self.builder.push_let(
+                        dst,
+                        ValType::V128,
+                        Op::SimdReplaceLane { kind, lane, vec, val },
+                    );
+                    (dst, ValType::V128)
+                }
+                "SimdBitselect" => {
+                    let (a, _) = self.emit_term(dag, children[0], ValType::V128)?;
+                    let (b, _) = self.emit_term(dag, children[1], ValType::V128)?;
+                    let (mask, _) = self.emit_term(dag, children[2], ValType::V128)?;
+                    let dst = self.fresh_id();
+                    self.builder.push_let(dst, ValType::V128, Op::SimdBitselect { a, b, mask });
+                    (dst, ValType::V128)
+                }
+                "SimdShuffle" => {
+                    let (lhs, _) = self.emit_term(dag, children[0], ValType::V128)?;
+                    let (rhs, _) = self.emit_term(dag, children[1], ValType::V128)?;
+                    let lo = expect_int(dag, children[2])?;
+                    let hi = expect_int(dag, children[3])?;
+                    let lanes = unpack_shuffle_lanes(lo, hi);
+                    let dst = self.fresh_id();
+                    self.builder.push_let(dst, ValType::V128, Op::SimdShuffle { lhs, rhs, lanes });
+                    (dst, ValType::V128)
                 }
                 "Load" => {
                     let mem = MemId(expect_int(dag, children[0])? as u16);
@@ -947,11 +1124,11 @@ fn expect_int(dag: &TermDag, tid: TermId) -> Result<i64, SieveError> {
 }
 
 fn expect_ty(dag: &TermDag, tid: TermId) -> Result<ValType, SieveError> {
-    match expect_int(dag, tid)? {
-        0 => Ok(ValType::I32),
-        1 => Ok(ValType::I64),
-        other => Err(SieveError::EqSatError(format!("invalid type tag {other}"))),
-    }
+    let raw = expect_int(dag, tid)?;
+    u8::try_from(raw)
+        .ok()
+        .and_then(ValType::from_u8)
+        .ok_or_else(|| SieveError::EqSatError(format!("invalid type tag {raw}")))
 }
 
 fn decode_expr_list(dag: &TermDag, mut tid: TermId) -> Result<Vec<TermId>, SieveError> {
@@ -1170,7 +1347,11 @@ fn collect_free_vars_in_region(region: &Region) -> BTreeSet<ValId> {
                     match s {
                         Stmt::Let { dst, op, .. } => {
                             match op {
-                                Op::Copy(v) | Op::Un(_, v) | Op::Load { addr: v, .. } | Op::MemoryGrow { delta: v, .. } => {
+                                Op::Copy(v)
+                                | Op::Un(_, v)
+                                | Op::Load { addr: v, .. }
+                                | Op::MemoryGrow { delta: v, .. }
+                                | Op::SimdExtractLane { vec: v, .. } => {
                                     rec(v, bound, free);
                                 }
                                 Op::Select { cond, true_val, false_val } => {
@@ -1178,11 +1359,24 @@ fn collect_free_vars_in_region(region: &Region) -> BTreeSet<ValId> {
                                     rec(true_val, bound, free);
                                     rec(false_val, bound, free);
                                 }
-                                Op::Bin(_, l, r) => {
+                                Op::Bin(_, l, r)
+                                | Op::SimdReplaceLane { vec: l, val: r, .. }
+                                | Op::SimdShuffle { lhs: l, rhs: r, .. } => {
                                     rec(l, bound, free);
                                     rec(r, bound, free);
                                 }
-                                _ => {}
+                                Op::SimdBitselect { a, b, mask } => {
+                                    rec(a, bound, free);
+                                    rec(b, bound, free);
+                                    rec(mask, bound, free);
+                                }
+                                Op::ConstI32(_)
+                                | Op::ConstI64(_)
+                                | Op::ConstF32(_)
+                                | Op::ConstF64(_)
+                                | Op::ConstV128(_)
+                                | Op::GlobalGet(_)
+                                | Op::MemorySize(_) => {}
                             }
                             bound.push(dst);
                         }
@@ -1302,13 +1496,32 @@ fn infer_free_var_types(region: &Region, registry: &StratumRegistry) -> BTreeMap
                                 }
                                 Op::Un(u, v) => rec(v, u.input_ty(), bound, out),
                                 Op::Bin(bin, l, r) => {
-                                    rec(l, bin.operand_ty(), bound, out);
-                                    rec(r, bin.operand_ty(), bound, out);
+                                    rec(l, bin.lhs_ty(), bound, out);
+                                    rec(r, bin.rhs_ty(), bound, out);
                                 }
                                 Op::Load { addr, .. } => rec(addr, ValType::I32, bound, out),
                                 Op::MemoryGrow { delta, .. } => rec(delta, ValType::I32, bound, out),
+                                Op::SimdExtractLane { vec, .. } => {
+                                    rec(vec, ValType::V128, bound, out);
+                                }
+                                Op::SimdReplaceLane { kind, vec, val, .. } => {
+                                    rec(vec, ValType::V128, bound, out);
+                                    rec(val, kind.scalar_ty(), bound, out);
+                                }
+                                Op::SimdBitselect { a, b, mask } => {
+                                    rec(a, ValType::V128, bound, out);
+                                    rec(b, ValType::V128, bound, out);
+                                    rec(mask, ValType::V128, bound, out);
+                                }
+                                Op::SimdShuffle { lhs, rhs, .. } => {
+                                    rec(lhs, ValType::V128, bound, out);
+                                    rec(rhs, ValType::V128, bound, out);
+                                }
                                 Op::ConstI32(_)
                                 | Op::ConstI64(_)
+                                | Op::ConstF32(_)
+                                | Op::ConstF64(_)
+                                | Op::ConstV128(_)
                                 | Op::GlobalGet(_)
                                 | Op::MemorySize(_) => {}
                             }
@@ -1317,8 +1530,8 @@ fn infer_free_var_types(region: &Region, registry: &StratumRegistry) -> BTreeMap
                         Stmt::Effect(eff) => match eff {
                             EffectOp::Store { addr, width, val, .. } => {
                                 rec(addr, ValType::I32, bound, out);
-                                if width == MemWidth::B8 {
-                                    rec(val, ValType::I64, bound, out);
+                                if width == MemWidth::B16 {
+                                    rec(val, ValType::V128, bound, out);
                                 }
                             }
                             EffectOp::MemoryCopy { dst, src, len, .. }
@@ -1433,6 +1646,29 @@ fn remap_free_uses(region: &Region, map: &HashMap<ValId, ValId>) -> Region {
                                 Op::MemoryGrow { mem, delta } => {
                                     Op::MemoryGrow { mem, delta: m(delta, shadowed) }
                                 }
+                                Op::SimdExtractLane { kind, lane, vec } => Op::SimdExtractLane {
+                                    kind,
+                                    lane,
+                                    vec: m(vec, shadowed),
+                                },
+                                Op::SimdReplaceLane { kind, lane, vec, val } => {
+                                    Op::SimdReplaceLane {
+                                        kind,
+                                        lane,
+                                        vec: m(vec, shadowed),
+                                        val: m(val, shadowed),
+                                    }
+                                }
+                                Op::SimdBitselect { a, b, mask } => Op::SimdBitselect {
+                                    a: m(a, shadowed),
+                                    b: m(b, shadowed),
+                                    mask: m(mask, shadowed),
+                                },
+                                Op::SimdShuffle { lhs, rhs, lanes } => Op::SimdShuffle {
+                                    lhs: m(lhs, shadowed),
+                                    rhs: m(rhs, shadowed),
+                                    lanes,
+                                },
                                 other => other,
                             };
                             shadowed.push(dst);
@@ -1557,14 +1793,21 @@ fn build_egraph(registry: &StratumRegistry) -> Result<EGraph, SieveError> {
   (Expr
     (ConstI32 i64 :cost 1)
     (ConstI64 i64 :cost 1)
+    (ConstF32 i64 :cost 1)
+    (ConstF64 i64 :cost 1)
+    (ConstV128 i64 i64 :cost 1)
     (Var i64 i64 :cost 1)
-    (GlobalGet i64 i64 :cost 4)
+    (GlobalGet i64 i64 i64 :cost 4)
     (Select Expr Expr Expr :cost 3)
     (Un i64 Expr :cost 2)
     (Bin i64 Expr Expr :cost 3)
     (Load i64 Heap Expr i64 i64 i64 i64 :cost 15)
     (StratumCall i64 Heap i64 ExprList :cost 12)
     (MemSize i64 Heap :cost 4)
+    (SimdExtractLane i64 i64 Expr :cost 3)
+    (SimdReplaceLane i64 i64 Expr Expr :cost 3)
+    (SimdBitselect Expr Expr Expr :cost 3)
+    (SimdShuffle Expr Expr i64 i64 :cost 4)
   )
   (ExprList
     (ENil :cost 1)
@@ -1725,6 +1968,24 @@ fn built_in_rules() -> String {
     let u_64_8s = unop_tag(UnOp::I64Extend8S);
     let u_64_16s = unop_tag(UnOp::I64Extend16S);
     let u_64_32s = unop_tag(UnOp::I64Extend32S);
+
+    // Strictly IEEE-754 bit-exact involutions/idempotencies (NO unsound FP algebraic rules!).
+    let u_f32_abs = unop_tag(UnOp::F32Abs);
+    let u_f32_neg = unop_tag(UnOp::F32Neg);
+    let u_f64_abs = unop_tag(UnOp::F64Abs);
+    let u_f64_neg = unop_tag(UnOp::F64Neg);
+    let u_f32x4_abs = unop_tag(UnOp::F32x4Abs);
+    let u_f32x4_neg = unop_tag(UnOp::F32x4Neg);
+    let u_f64x2_abs = unop_tag(UnOp::F64x2Abs);
+    let u_f64x2_neg = unop_tag(UnOp::F64x2Neg);
+    let u_v128_not = unop_tag(UnOp::V128Not);
+    let u_i32_reint_f32 = unop_tag(UnOp::I32ReinterpretF32);
+    let u_f32_reint_i32 = unop_tag(UnOp::F32ReinterpretI32);
+    let u_i64_reint_f64 = unop_tag(UnOp::I64ReinterpretF64);
+    let u_f64_reint_i64 = unop_tag(UnOp::F64ReinterpretI64);
+    let b_v128_and = binop_tag(BinOp::V128And);
+    let b_v128_or = binop_tag(BinOp::V128Or);
+    let b_v128_xor = binop_tag(BinOp::V128Xor);
 
     format!(
         r#"
@@ -1898,6 +2159,27 @@ fn built_in_rules() -> String {
 (rewrite (Un {u_64_16s} (Un {u_64_16s} ?x)) (Un {u_64_16s} ?x) :name "extend16s-idemp-i64")
 (rewrite (Un {u_64_32s} (Un {u_64_32s} ?x)) (Un {u_64_32s} ?x) :name "extend32s-idemp-i64")
 
+; Strictly IEEE-754 bit-exact bitwise sign, reinterpret & v128 bitwise identities
+; (NEVER add algebraically-unsound FP rules like x + 0.0 == x, x * 0.0 == 0.0, or x - x == 0.0!)
+(rewrite (Un {u_f32_neg} (Un {u_f32_neg} ?x)) ?x :name "f32-neg-neg")
+(rewrite (Un {u_f64_neg} (Un {u_f64_neg} ?x)) ?x :name "f64-neg-neg")
+(rewrite (Un {u_f32_abs} (Un {u_f32_abs} ?x)) (Un {u_f32_abs} ?x) :name "f32-abs-idemp")
+(rewrite (Un {u_f64_abs} (Un {u_f64_abs} ?x)) (Un {u_f64_abs} ?x) :name "f64-abs-idemp")
+(rewrite (Un {u_f32_abs} (Un {u_f32_neg} ?x)) (Un {u_f32_abs} ?x) :name "f32-abs-neg")
+(rewrite (Un {u_f64_abs} (Un {u_f64_neg} ?x)) (Un {u_f64_abs} ?x) :name "f64-abs-neg")
+(rewrite (Un {u_f32x4_neg} (Un {u_f32x4_neg} ?x)) ?x :name "f32x4-neg-neg")
+(rewrite (Un {u_f64x2_neg} (Un {u_f64x2_neg} ?x)) ?x :name "f64x2-neg-neg")
+(rewrite (Un {u_f32x4_abs} (Un {u_f32x4_abs} ?x)) (Un {u_f32x4_abs} ?x) :name "f32x4-abs-idemp")
+(rewrite (Un {u_f64x2_abs} (Un {u_f64x2_abs} ?x)) (Un {u_f64x2_abs} ?x) :name "f64x2-abs-idemp")
+(rewrite (Un {u_v128_not} (Un {u_v128_not} ?x)) ?x :name "v128-not-not")
+(rewrite (Bin {b_v128_and} ?x ?x) ?x :name "v128-and-self")
+(rewrite (Bin {b_v128_or} ?x ?x) ?x :name "v128-or-self")
+(rewrite (Bin {b_v128_xor} ?x ?x) (ConstV128 0 0) :name "v128-xor-self")
+(rewrite (Un {u_f32_reint_i32} (Un {u_i32_reint_f32} ?x)) ?x :name "f32-reinterpret-roundtrip")
+(rewrite (Un {u_i32_reint_f32} (Un {u_f32_reint_i32} ?x)) ?x :name "i32-reinterpret-roundtrip")
+(rewrite (Un {u_f64_reint_i64} (Un {u_i64_reint_f64} ?x)) ?x :name "f64-reinterpret-roundtrip")
+(rewrite (Un {u_i64_reint_f64} (Un {u_f64_reint_i64} ?x)) ?x :name "i64-reinterpret-roundtrip")
+
 ; Disjoint memory-frame & store-to-load forwarding rules
 (rewrite (Load ?m1 (StoreHeap ?m2 ?h ?addr ?off ?w ?val ?vty) ?laddr ?loff ?lw ?ls ?lty)
          (Load ?m1 ?h ?laddr ?loff ?lw ?ls ?lty)
@@ -1909,6 +2191,15 @@ fn built_in_rules() -> String {
 (rewrite (Load ?m (StoreHeap ?m ?h ?addr ?off 8 ?val 1) ?addr ?off 8 ?ls 1)
          ?val
          :name "store-load-forward-b8")
+(rewrite (Load ?m (StoreHeap ?m ?h ?addr ?off 4 ?val 2) ?addr ?off 4 ?ls 2)
+         ?val
+         :name "store-load-forward-f32")
+(rewrite (Load ?m (StoreHeap ?m ?h ?addr ?off 8 ?val 3) ?addr ?off 8 ?ls 3)
+         ?val
+         :name "store-load-forward-f64")
+(rewrite (Load ?m (StoreHeap ?m ?h ?addr ?off 16 ?val 4) ?addr ?off 16 ?ls 4)
+         ?val
+         :name "store-load-forward-v128")
 "#
     )
 }
@@ -1933,6 +2224,13 @@ fn region_to_pattern(
                 let expr = match op {
                     Op::ConstI32(v) => format!("(ConstI32 {})", v as i64),
                     Op::ConstI64(v) => format!("(ConstI64 {v})"),
+                    Op::ConstF32(bits) => format!("(ConstF32 {})", bits as i64),
+                    Op::ConstF64(bits) => format!("(ConstF64 {})", bits as i64),
+                    Op::ConstV128(bits) => format!(
+                        "(ConstV128 {} {})",
+                        (bits as u64) as i64,
+                        ((bits >> 64) as u64) as i64
+                    ),
                     Op::Copy(v) => env.get(&v)?.0.clone(),
                     Op::Select { cond, true_val, false_val } => format!(
                         "(Select {} {} {})",
@@ -1956,6 +2254,33 @@ fn region_to_pattern(
                         i64::from(signed),
                         ty_tag(result_ty)
                     ),
+                    Op::SimdExtractLane { kind, lane, vec } => format!(
+                        "(SimdExtractLane {} {} {})",
+                        kind.to_u8(),
+                        lane,
+                        env.get(&vec)?.0
+                    ),
+                    Op::SimdReplaceLane { kind, lane, vec, val } => format!(
+                        "(SimdReplaceLane {} {} {} {})",
+                        kind.to_u8(),
+                        lane,
+                        env.get(&vec)?.0,
+                        env.get(&val)?.0
+                    ),
+                    Op::SimdBitselect { a, b, mask } => format!(
+                        "(SimdBitselect {} {} {})",
+                        env.get(&a)?.0,
+                        env.get(&b)?.0,
+                        env.get(&mask)?.0
+                    ),
+                    Op::SimdShuffle { lhs, rhs, lanes } => {
+                        let (lo, hi) = pack_shuffle_lanes(lanes);
+                        format!(
+                            "(SimdShuffle {} {} {lo} {hi})",
+                            env.get(&lhs)?.0,
+                            env.get(&rhs)?.0
+                        )
+                    }
                     Op::GlobalGet(_) | Op::MemorySize(_) | Op::MemoryGrow { .. } => return None,
                 };
                 env.insert(dst, (expr, ty));
@@ -2069,17 +2394,31 @@ fn max_val_id_in_region(region: &Region) -> u32 {
                                 Op::Copy(v)
                                 | Op::Un(_, v)
                                 | Op::Load { addr: v, .. }
-                                | Op::MemoryGrow { delta: v, .. } => bump(v, max),
+                                | Op::MemoryGrow { delta: v, .. }
+                                | Op::SimdExtractLane { vec: v, .. } => bump(v, max),
                                 Op::Select { cond, true_val, false_val } => {
                                     bump(cond, max);
                                     bump(true_val, max);
                                     bump(false_val, max);
                                 }
-                                Op::Bin(_, l, rhs) => {
+                                Op::Bin(_, l, rhs)
+                                | Op::SimdReplaceLane { vec: l, val: rhs, .. }
+                                | Op::SimdShuffle { lhs: l, rhs, .. } => {
                                     bump(l, max);
                                     bump(rhs, max);
                                 }
-                                _ => {}
+                                Op::SimdBitselect { a, b, mask } => {
+                                    bump(a, max);
+                                    bump(b, max);
+                                    bump(mask, max);
+                                }
+                                Op::ConstI32(_)
+                                | Op::ConstI64(_)
+                                | Op::ConstF32(_)
+                                | Op::ConstF64(_)
+                                | Op::ConstV128(_)
+                                | Op::GlobalGet(_)
+                                | Op::MemorySize(_) => {}
                             }
                         }
                         Stmt::Region { results, region: sub_id } => {
@@ -2145,68 +2484,24 @@ fn max_val_id_in_region(region: &Region) -> u32 {
 }
 
 fn unop_tag(u: UnOp) -> i64 {
-    match u {
-        UnOp::I32Eqz => 0,
-        UnOp::I64Eqz => 1,
-        UnOp::I32Clz => 2,
-        UnOp::I32Ctz => 3,
-        UnOp::I32Popcnt => 4,
-        UnOp::I64Clz => 5,
-        UnOp::I64Ctz => 6,
-        UnOp::I64Popcnt => 7,
-        UnOp::I32WrapI64 => 8,
-        UnOp::I64ExtendI32S => 9,
-        UnOp::I64ExtendI32U => 10,
-        UnOp::I32Extend8S => 11,
-        UnOp::I32Extend16S => 12,
-        UnOp::I64Extend8S => 13,
-        UnOp::I64Extend16S => 14,
-        UnOp::I64Extend32S => 15,
-    }
+    u.to_u8() as i64
 }
 
 fn unop_from_tag(t: i64) -> Option<UnOp> {
-    Some(match t {
-        0 => UnOp::I32Eqz,
-        1 => UnOp::I64Eqz,
-        2 => UnOp::I32Clz,
-        3 => UnOp::I32Ctz,
-        4 => UnOp::I32Popcnt,
-        5 => UnOp::I64Clz,
-        6 => UnOp::I64Ctz,
-        7 => UnOp::I64Popcnt,
-        8 => UnOp::I32WrapI64,
-        9 => UnOp::I64ExtendI32S,
-        10 => UnOp::I64ExtendI32U,
-        11 => UnOp::I32Extend8S,
-        12 => UnOp::I32Extend16S,
-        13 => UnOp::I64Extend8S,
-        14 => UnOp::I64Extend16S,
-        15 => UnOp::I64Extend32S,
-        _ => return None,
-    })
+    u8::try_from(t).ok().and_then(UnOp::from_u8)
 }
 
 fn binop_tag(b: BinOp) -> i64 {
-    b as u8 as i64
+    b.to_u8() as i64
 }
 
 fn binop_from_tag(t: i64) -> Option<BinOp> {
-    use BinOp::*;
-    const ALL: [BinOp; 50] = [
-        I32Eq, I32Ne, I32LtS, I32LtU, I32GtS, I32GtU, I32LeS, I32LeU, I32GeS, I32GeU,
-        I64Eq, I64Ne, I64LtS, I64LtU, I64GtS, I64GtU, I64LeS, I64LeU, I64GeS, I64GeU,
-        I32Add, I32Sub, I32Mul, I32DivS, I32DivU, I32RemS, I32RemU,
-        I64Add, I64Sub, I64Mul, I64DivS, I64DivU, I64RemS, I64RemU,
-        I32And, I32Or, I32Xor, I32Shl, I32ShrS, I32ShrU, I32Rotl, I32Rotr,
-        I64And, I64Or, I64Xor, I64Shl, I64ShrS, I64ShrU, I64Rotl, I64Rotr,
-    ];
-    usize::try_from(t).ok().and_then(|idx| ALL.get(idx).copied())
+    u8::try_from(t).ok().and_then(BinOp::from_u8)
 }
 
 fn prim_eval_bin_i32(op: i64, a: i64, b: i64) -> Option<i64> {
     let b_op = binop_from_tag(op)?;
-    if b_op.operand_ty() != ValType::I32 {
+    if b_op.lhs_ty() != ValType::I32 || b_op.rhs_ty() != ValType::I32 {
         return None;
     }
     eval_const_binop_i32(b_op, a as i32, b as i32).map(|v| v as i64)
@@ -2214,7 +2509,10 @@ fn prim_eval_bin_i32(op: i64, a: i64, b: i64) -> Option<i64> {
 
 fn prim_eval_bin_i64_val(op: i64, a: i64, b: i64) -> Option<i64> {
     let b_op = binop_from_tag(op)?;
-    if b_op.operand_ty() != ValType::I64 || b_op.output_ty() != ValType::I64 {
+    if b_op.lhs_ty() != ValType::I64
+        || b_op.rhs_ty() != ValType::I64
+        || b_op.output_ty() != ValType::I64
+    {
         return None;
     }
     eval_const_binop_i64_val(b_op, a, b)
@@ -2222,7 +2520,10 @@ fn prim_eval_bin_i64_val(op: i64, a: i64, b: i64) -> Option<i64> {
 
 fn prim_eval_bin_i64_cmp(op: i64, a: i64, b: i64) -> Option<i64> {
     let b_op = binop_from_tag(op)?;
-    if b_op.operand_ty() != ValType::I64 || b_op.output_ty() != ValType::I32 {
+    if b_op.lhs_ty() != ValType::I64
+        || b_op.rhs_ty() != ValType::I64
+        || b_op.output_ty() != ValType::I32
+    {
         return None;
     }
     eval_const_binop_i64_cmp(b_op, a, b).map(|v| v as i64)
@@ -2233,7 +2534,7 @@ fn prim_eval_un_i32(op: i64, a: i64) -> Option<i64> {
     if u.input_ty() != ValType::I32 || u.output_ty() != ValType::I32 {
         return None;
     }
-    Some(eval_const_un_i32(u, a as i32) as i64)
+    eval_const_un_i32(u, a as i32).map(|v| v as i64)
 }
 
 fn prim_eval_un_i64_val(op: i64, a: i64) -> Option<i64> {
@@ -2241,7 +2542,7 @@ fn prim_eval_un_i64_val(op: i64, a: i64) -> Option<i64> {
     if u.input_ty() != ValType::I64 || u.output_ty() != ValType::I64 {
         return None;
     }
-    Some(eval_const_un_i64_val(u, a))
+    eval_const_un_i64_val(u, a)
 }
 
 fn prim_eval_un_i64_to_i32(op: i64, a: i64) -> Option<i64> {
@@ -2265,28 +2566,28 @@ fn prim_eval_un_i32_to_i64(op: i64, a: i64) -> Option<i64> {
     }
 }
 
-fn eval_const_un_i32(u: UnOp, a: i32) -> i32 {
-    match u {
+fn eval_const_un_i32(u: UnOp, a: i32) -> Option<i32> {
+    Some(match u {
         UnOp::I32Eqz => i32::from(a == 0),
         UnOp::I32Clz => a.leading_zeros() as i32,
         UnOp::I32Ctz => a.trailing_zeros() as i32,
         UnOp::I32Popcnt => a.count_ones() as i32,
         UnOp::I32Extend8S => (a as i8) as i32,
         UnOp::I32Extend16S => (a as i16) as i32,
-        _ => unreachable!(),
-    }
+        _ => return None,
+    })
 }
 
-fn eval_const_un_i64_val(u: UnOp, a: i64) -> i64 {
-    match u {
+fn eval_const_un_i64_val(u: UnOp, a: i64) -> Option<i64> {
+    Some(match u {
         UnOp::I64Clz => a.leading_zeros() as i64,
         UnOp::I64Ctz => a.trailing_zeros() as i64,
         UnOp::I64Popcnt => a.count_ones() as i64,
         UnOp::I64Extend8S => (a as i8) as i64,
         UnOp::I64Extend16S => (a as i16) as i64,
         UnOp::I64Extend32S => (a as i32) as i64,
-        _ => unreachable!(),
-    }
+        _ => return None,
+    })
 }
 
 fn eval_const_binop_i32(b: BinOp, a: i32, c: i32) -> Option<i32> {

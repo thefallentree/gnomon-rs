@@ -16,9 +16,9 @@ pub use engine::{
 };
 pub use ir_codec::{
     InputType, IrBinOp, IrCallTarget, IrDocument, IrEffectOp, IrFuncDef, IrGlobalDef,
-    IrHostContract, IrLaw, IrLawKind, IrMemWidth, IrMemoryDef, IrModule, IrOffsetRange, IrOp,
-    IrRegion, IrSliceBound, IrStmt, IrStratum, IrStratumOp, IrTrapCode, IrTypedVar, IrUnOp, IrVal,
-    IrValType, LoadedArtifact, load_artifact_bytes, load_artifact_bytes_with_registry,
+    IrHostContract, IrLaneKind, IrLaw, IrLawKind, IrMemWidth, IrMemoryDef, IrModule, IrOffsetRange,
+    IrOp, IrRegion, IrSliceBound, IrStmt, IrStratum, IrStratumOp, IrTrapCode, IrTypedVar, IrUnOp,
+    IrVal, IrValType, LoadedArtifact, load_artifact_bytes, load_artifact_bytes_with_registry,
     load_artifact_from_mcp_arg, load_artifact_from_mcp_arg_with_registry, read_input_bytes,
     resolve_input_type,
 };

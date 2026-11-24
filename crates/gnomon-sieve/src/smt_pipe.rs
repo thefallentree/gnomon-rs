@@ -9,7 +9,7 @@ use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use gnomon_kernel::{Module, Region, StratumRegistry, VcObligation};
 
 use crate::smt_ir::{
-    RawSat, SmtTarget, run_check_contract, run_check_equivalence_with_options, run_check_vc,
+    FpRm, RawSat, SmtTarget, run_check_contract, run_check_equivalence_with_options, run_check_vc,
 };
 use crate::{ContractSpec, EquivOptions, SieveError, SmtBackend, SmtResult};
 
@@ -79,7 +79,7 @@ impl BitwuzlaPipeBackend {
             query_count: 0,
             dead: false,
         };
-        backend.send_raw("(set-option :produce-models true)\n(set-logic QF_ABV)\n")?;
+        backend.send_raw("(set-option :produce-models true)\n(set-logic QF_ABVFP)\n")?;
         Ok(backend)
     }
 
@@ -247,6 +247,8 @@ struct PipeSession<'a> {
     pending: String,
     expr_cache: HashMap<String, String>,
     cache_stack: Vec<HashMap<String, String>>,
+    fp_bv_cache: HashMap<(String, u64), String>,
+    fp_bv_cache_stack: Vec<HashMap<(String, u64), String>>,
     sorts: HashMap<String, String>,
     push_depth: usize,
 }
@@ -260,6 +262,8 @@ impl<'a> PipeSession<'a> {
             pending: String::new(),
             expr_cache: HashMap::new(),
             cache_stack: Vec::new(),
+            fp_bv_cache: HashMap::new(),
+            fp_bv_cache_stack: Vec::new(),
             sorts: HashMap::new(),
             push_depth: 0,
         }
@@ -292,6 +296,7 @@ impl<'a> PipeSession<'a> {
         self.push_depth = 0;
         self.pending.clear();
         self.cache_stack.clear();
+        self.fp_bv_cache_stack.clear();
         let mut cmd = String::new();
         for _ in 0..pops {
             cmd.push_str("(pop 1)\n");
@@ -314,6 +319,10 @@ impl<'a> PipeSession<'a> {
 
     fn bv_sort_str(bits: u8) -> String {
         format!("(_ BitVec {bits})")
+    }
+
+    fn fp_sort_str(eb: u8, sb: u8) -> String {
+        format!("(_ FloatingPoint {eb} {sb})")
     }
 
     fn parse_get_value_atom(resp: &str) -> Result<String, SieveError> {
@@ -340,34 +349,47 @@ impl<'a> PipeSession<'a> {
     }
 }
 
-fn parse_smt_bv_literal(val_str: &str) -> Result<u64, SieveError> {
+fn parse_smt_bv_literal_u128(val_str: &str) -> Result<u128, SieveError> {
     let s = val_str.trim();
     if let Some(bits) = s.strip_prefix("#b") {
-        u64::from_str_radix(bits, 2)
+        u128::from_str_radix(bits, 2)
             .map_err(|e| SieveError::SolverError(format!("invalid #b literal '{s}': {e}")))
     } else if let Some(hex) = s.strip_prefix("#x") {
-        u64::from_str_radix(hex, 16)
+        u128::from_str_radix(hex, 16)
             .map_err(|e| SieveError::SolverError(format!("invalid #x literal '{s}': {e}")))
     } else if let Some(rest) = s.strip_prefix("(_ bv").and_then(|r| r.strip_suffix(')')) {
         let dec = rest
             .split_whitespace()
             .next()
             .ok_or_else(|| SieveError::SolverError(format!("invalid (_ bv ...) '{s}'")))?;
-        dec.parse::<u64>()
+        dec.parse::<u128>()
             .map_err(|e| SieveError::SolverError(format!("invalid bv decimal '{s}': {e}")))
     } else {
         Err(SieveError::SolverError(format!("unsupported BV value format: '{s}'")))
     }
 }
 
+fn parse_smt_bv_literal(val_str: &str) -> Result<u64, SieveError> {
+    let v = parse_smt_bv_literal_u128(val_str)?;
+    u64::try_from(v)
+        .map_err(|e| SieveError::SolverError(format!("BV literal '{val_str}' exceeds u64: {e}")))
+}
+
 impl SmtTarget for PipeSession<'_> {
     type Term = String;
+
+    fn cmp_term(&self, a: &String, b: &String) -> std::cmp::Ordering {
+        a.cmp(b)
+    }
 
     fn bool_const(&mut self, v: bool) -> String {
         if v { "true".to_string() } else { "false".to_string() }
     }
 
     fn bv_const(&mut self, bits: u8, v: u64) -> String {
+        if bits > 64 {
+            return self.bv_const_u128(bits, v as u128);
+        }
         match bits {
             1 => format!("#b{}", v & 1),
             8 => format!("#x{:02x}", (v as u8)),
@@ -375,6 +397,16 @@ impl SmtTarget for PipeSession<'_> {
             32 => format!("#x{:08x}", (v as u32)),
             64 => format!("#x{:016x}", v),
             n => format!("(_ bv{} {n})", v & ((1u64 << n) - 1)),
+        }
+    }
+
+    fn bv_const_u128(&mut self, bits: u8, v: u128) -> String {
+        if bits <= 64 {
+            return self.bv_const(bits, v as u64);
+        }
+        match bits {
+            128 => format!("#x{:032x}", v),
+            n => format!("(_ bv{} {n})", v & ((1u128 << n) - 1)),
         }
     }
 
@@ -566,6 +598,138 @@ impl SmtTarget for PipeSession<'_> {
         self.def(&Self::bv_sort_str(out_bits), format!("(concat {hi} {lo})"))
     }
 
+    fn bv_not(&mut self, bits: u8, a: &String) -> String {
+        self.def(&Self::bv_sort_str(bits), format!("(bvnot {a})"))
+    }
+
+    fn bv_neg(&mut self, bits: u8, a: &String) -> String {
+        self.def(&Self::bv_sort_str(bits), format!("(bvneg {a})"))
+    }
+
+    fn bv_to_fp(&mut self, eb: u8, sb: u8, bv: &String) -> String {
+        self.def(&Self::fp_sort_str(eb, sb), format!("((_ to_fp {eb} {sb}) {bv})"))
+    }
+
+    fn fp_to_bv_canon(
+        &mut self,
+        eb: u8,
+        sb: u8,
+        canon_nan_bv: u64,
+        fp: &String,
+    ) -> Result<String, SieveError> {
+        let key = (fp.clone(), canon_nan_bv);
+        if let Some(existing) = self.fp_bv_cache.get(&key) {
+            return Ok(existing.clone());
+        }
+        let id = self.next_id;
+        self.next_id += 1;
+        let bits = eb + sb;
+        let name = format!("pq{}_fpbv_{id}", self.qid);
+        let bv = self.fresh_bv(&name, bits);
+        let is_nan = self.fp_is_nan(fp);
+        let nan_c = self.bv_const(bits, canon_nan_bv);
+        let eq_nan = self.eq(&bv, &nan_c);
+        let fp_of_bv = self.bv_to_fp(eb, sb, &bv);
+        let eq_fp = self.eq(&fp_of_bv, fp);
+        let constraint = self.ite(&is_nan, &eq_nan, &eq_fp);
+        self.assert_formula(&constraint)?;
+        self.fp_bv_cache.insert(key, bv.clone());
+        Ok(bv)
+    }
+
+    fn fp_add(&mut self, eb: u8, sb: u8, rm: FpRm, a: &String, b: &String) -> String {
+        self.def(&Self::fp_sort_str(eb, sb), format!("(fp.add {} {a} {b})", rm.smt2()))
+    }
+
+    fn fp_sub(&mut self, eb: u8, sb: u8, rm: FpRm, a: &String, b: &String) -> String {
+        self.def(&Self::fp_sort_str(eb, sb), format!("(fp.sub {} {a} {b})", rm.smt2()))
+    }
+
+    fn fp_mul(&mut self, eb: u8, sb: u8, rm: FpRm, a: &String, b: &String) -> String {
+        self.def(&Self::fp_sort_str(eb, sb), format!("(fp.mul {} {a} {b})", rm.smt2()))
+    }
+
+    fn fp_div(&mut self, eb: u8, sb: u8, rm: FpRm, a: &String, b: &String) -> String {
+        self.def(&Self::fp_sort_str(eb, sb), format!("(fp.div {} {a} {b})", rm.smt2()))
+    }
+
+    fn fp_sqrt(&mut self, eb: u8, sb: u8, rm: FpRm, a: &String) -> String {
+        self.def(&Self::fp_sort_str(eb, sb), format!("(fp.sqrt {} {a})", rm.smt2()))
+    }
+
+    fn fp_rti(&mut self, eb: u8, sb: u8, rm: FpRm, a: &String) -> String {
+        self.def(&Self::fp_sort_str(eb, sb), format!("(fp.roundToIntegral {} {a})", rm.smt2()))
+    }
+
+    fn fp_eq(&mut self, a: &String, b: &String) -> String {
+        self.def("Bool", format!("(fp.eq {a} {b})"))
+    }
+
+    fn fp_lt(&mut self, a: &String, b: &String) -> String {
+        self.def("Bool", format!("(fp.lt {a} {b})"))
+    }
+
+    fn fp_le(&mut self, a: &String, b: &String) -> String {
+        self.def("Bool", format!("(fp.leq {a} {b})"))
+    }
+
+    fn fp_gt(&mut self, a: &String, b: &String) -> String {
+        self.def("Bool", format!("(fp.gt {a} {b})"))
+    }
+
+    fn fp_ge(&mut self, a: &String, b: &String) -> String {
+        self.def("Bool", format!("(fp.geq {a} {b})"))
+    }
+
+    fn fp_is_nan(&mut self, a: &String) -> String {
+        self.def("Bool", format!("(fp.isNaN {a})"))
+    }
+
+    fn fp_is_zero(&mut self, a: &String) -> String {
+        self.def("Bool", format!("(fp.isZero {a})"))
+    }
+
+    fn fp_is_neg(&mut self, a: &String) -> String {
+        self.def("Bool", format!("(fp.isNegative {a})"))
+    }
+
+    fn fp_is_pos(&mut self, a: &String) -> String {
+        self.def("Bool", format!("(fp.isPositive {a})"))
+    }
+
+    fn fp_is_inf(&mut self, a: &String) -> String {
+        self.def("Bool", format!("(fp.isInfinite {a})"))
+    }
+
+    fn fp_from_sbv(&mut self, eb: u8, sb: u8, rm: FpRm, bv: &String) -> String {
+        self.def(
+            &Self::fp_sort_str(eb, sb),
+            format!("((_ to_fp {eb} {sb}) {} {bv})", rm.smt2()),
+        )
+    }
+
+    fn fp_from_ubv(&mut self, eb: u8, sb: u8, rm: FpRm, bv: &String) -> String {
+        self.def(
+            &Self::fp_sort_str(eb, sb),
+            format!("((_ to_fp_unsigned {eb} {sb}) {} {bv})", rm.smt2()),
+        )
+    }
+
+    fn fp_to_sbv(&mut self, bits: u8, rm: FpRm, fp: &String) -> String {
+        self.def(&Self::bv_sort_str(bits), format!("((_ fp.to_sbv {bits}) {} {fp})", rm.smt2()))
+    }
+
+    fn fp_to_ubv(&mut self, bits: u8, rm: FpRm, fp: &String) -> String {
+        self.def(&Self::bv_sort_str(bits), format!("((_ fp.to_ubv {bits}) {} {fp})", rm.smt2()))
+    }
+
+    fn fp_to_fp(&mut self, eb: u8, sb: u8, rm: FpRm, fp: &String) -> String {
+        self.def(
+            &Self::fp_sort_str(eb, sb),
+            format!("((_ to_fp {eb} {sb}) {} {fp})", rm.smt2()),
+        )
+    }
+
     fn assert_formula(&mut self, cond: &String) -> Result<(), SieveError> {
         self.pending.push_str(&format!("(assert {cond})\n"));
         Ok(())
@@ -574,6 +738,7 @@ impl SmtTarget for PipeSession<'_> {
     fn push(&mut self) -> Result<(), SieveError> {
         self.flush_pending()?;
         self.cache_stack.push(self.expr_cache.clone());
+        self.fp_bv_cache_stack.push(self.fp_bv_cache.clone());
         self.push_depth += 1;
         self.backend.send_raw("(push 1)\n")
     }
@@ -584,6 +749,9 @@ impl SmtTarget for PipeSession<'_> {
             self.push_depth -= 1;
             if let Some(prev) = self.cache_stack.pop() {
                 self.expr_cache = prev;
+            }
+            if let Some(prev) = self.fp_bv_cache_stack.pop() {
+                self.fp_bv_cache = prev;
             }
             self.backend.send_raw("(pop 1)\n")
         } else {
@@ -610,6 +778,14 @@ impl SmtTarget for PipeSession<'_> {
         let resp = self.backend.read_sexpr_response()?;
         let val_str = Self::parse_get_value_atom(&resp)?;
         parse_smt_bv_literal(&val_str)
+    }
+
+    fn get_bv_u128(&mut self, term: &String, _bits: u8) -> Result<u128, SieveError> {
+        self.flush_pending()?;
+        self.backend.send_raw(&format!("(get-value ({term}))\n"))?;
+        let resp = self.backend.read_sexpr_response()?;
+        let val_str = Self::parse_get_value_atom(&resp)?;
+        parse_smt_bv_literal_u128(&val_str)
     }
 
     fn get_bool(&mut self, term: &String) -> Result<bool, SieveError> {

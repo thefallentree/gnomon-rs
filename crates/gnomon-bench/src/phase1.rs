@@ -74,6 +74,26 @@ fn eval_to_outcome(
 fn build_probe_vectors(params: &[(ValId, gnomon_kernel::ValType)], count: usize, seed: u64) -> Vec<Vec<Val>> {
     const BOUNDARY_32: [i32; 8] = [0, 1, -1, 2, 31, 64, i32::MAX, i32::MIN];
     const BOUNDARY_64: [i64; 8] = [0, 1, -1, 2, 63, 64, i64::MAX, i64::MIN];
+    const BOUNDARY_F32: [u32; 8] = [
+        0x0000_0000, // +0.0
+        0x8000_0000, // -0.0
+        0x3F80_0000, // 1.0
+        0xBF80_0000, // -1.0
+        0x3F00_0000, // 0.5
+        0xBF00_0000, // -0.5
+        0x7F80_0000, // +Inf
+        0x7FC0_0000, // qNaN
+    ];
+    const BOUNDARY_F64: [u64; 8] = [
+        0x0000_0000_0000_0000, // +0.0
+        0x8000_0000_0000_0000, // -0.0
+        0x3FF0_0000_0000_0000, // 1.0
+        0xBFF0_0000_0000_0000, // -1.0
+        0x3FE0_0000_0000_0000, // 0.5
+        0xBFE0_0000_0000_0000, // -0.5
+        0x7FF0_0000_0000_0000, // +Inf
+        0x7FF8_0000_0000_0000, // qNaN
+    ];
     let mut state = seed ^ 0x9E37_79B9_7F4A_7C15;
     let mut next_u64 = || {
         state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
@@ -102,6 +122,30 @@ fn build_probe_vectors(params: &[(ValId, gnomon_kernel::ValType)], count: usize,
                                 Val::I64(BOUNDARY_64[(idx + p_idx) & 7])
                             } else {
                                 Val::I64(r as i64)
+                            }
+                        }
+                        gnomon_kernel::ValType::F32 => {
+                            if idx < 8 {
+                                Val::F32(BOUNDARY_F32[(idx + p_idx) & 7])
+                            } else {
+                                Val::F32(r as u32)
+                            }
+                        }
+                        gnomon_kernel::ValType::F64 => {
+                            if idx < 8 {
+                                Val::F64(BOUNDARY_F64[(idx + p_idx) & 7])
+                            } else {
+                                Val::F64(r)
+                            }
+                        }
+                        gnomon_kernel::ValType::V128 => {
+                            let hi = next_u64();
+                            if idx == 0 {
+                                Val::V128(0)
+                            } else if idx == 1 {
+                                Val::V128(u128::MAX)
+                            } else {
+                                Val::V128((r as u128) | ((hi as u128) << 64))
                             }
                         }
                     }

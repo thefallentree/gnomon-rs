@@ -27,7 +27,8 @@ use gnomon_wasm::{ExecOutcome, WasmError, emit_wasm, lift_wasm};
 use serde::{Deserialize, Serialize};
 use wasm_smith::{Config as SmithConfig, InstructionKind, InstructionKinds, Module as SmithModule};
 use wasmtime::{
-    Config as WtConfig, Engine, Instance, Module as WtModule, OptLevel, Store, Trap, Val as WtVal,
+    Config as WtConfig, Engine, Instance, Module as WtModule, OptLevel, Store, Trap, V128 as WtV128,
+    Val as WtVal,
 };
 
 /// Default base seed (`"GNOMONSM"` in ASCII) for deterministic `wasm-smith` runs.
@@ -295,6 +296,9 @@ fn to_wt_val(v: Val) -> WtVal {
     match v {
         Val::I32(x) => WtVal::I32(x),
         Val::I64(x) => WtVal::I64(x),
+        Val::F32(b) => WtVal::F32(b),
+        Val::F64(b) => WtVal::F64(b),
+        Val::V128(b) => WtVal::V128(WtV128::from(b)),
     }
 }
 
@@ -302,6 +306,9 @@ fn from_wt_val(v: &WtVal) -> Result<Val, String> {
     match *v {
         WtVal::I32(x) => Ok(Val::I32(x)),
         WtVal::I64(x) => Ok(Val::I64(x)),
+        WtVal::F32(b) => Ok(Val::F32(b)),
+        WtVal::F64(b) => Ok(Val::F64(b)),
+        WtVal::V128(b) => Ok(Val::V128(b.as_u128())),
         ref other => Err(format!("unexpected wasmtime result val: {other:?}")),
     }
 }
@@ -341,6 +348,9 @@ fn run_wasmtime_compiled(
         .map(|&ty| match ty {
             ValType::I32 => WtVal::I32(0),
             ValType::I64 => WtVal::I64(0),
+            ValType::F32 => WtVal::F32(0),
+            ValType::F64 => WtVal::F64(0),
+            ValType::V128 => WtVal::V128(WtV128::from(0)),
         })
         .collect();
 
@@ -438,6 +448,26 @@ fn build_input_vectors(
     }
     const B32: [i32; 8] = [0, 1, -1, 2, 16, 65_536, i32::MAX, i32::MIN];
     const B64: [i64; 8] = [0, 1, -1, 2, 63, 65_536, i64::MAX, i64::MIN];
+    const BF32: [u32; 8] = [
+        0x0000_0000,
+        0x8000_0000,
+        0x3F80_0000,
+        0xBF80_0000,
+        0x3F00_0000,
+        0xBF00_0000,
+        0x7F80_0000,
+        0x7FC0_0000,
+    ];
+    const BF64: [u64; 8] = [
+        0x0000_0000_0000_0000,
+        0x8000_0000_0000_0000,
+        0x3FF0_0000_0000_0000,
+        0xBFF0_0000_0000_0000,
+        0x3FE0_0000_0000_0000,
+        0xBFE0_0000_0000_0000,
+        0x7FF0_0000_0000_0000,
+        0x7FF8_0000_0000_0000,
+    ];
     let mut state = seed ^ 0xD1B5_4A32_D192_ED03;
     let mut next_u64 = || {
         state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
@@ -466,6 +496,30 @@ fn build_input_vectors(
                                 Val::I64(B64[(vec_idx + p_idx) & 7])
                             } else {
                                 Val::I64(r as i64)
+                            }
+                        }
+                        ValType::F32 => {
+                            if vec_idx < 4 {
+                                Val::F32(BF32[(vec_idx + p_idx) & 7])
+                            } else {
+                                Val::F32(r as u32)
+                            }
+                        }
+                        ValType::F64 => {
+                            if vec_idx < 4 {
+                                Val::F64(BF64[(vec_idx + p_idx) & 7])
+                            } else {
+                                Val::F64(r)
+                            }
+                        }
+                        ValType::V128 => {
+                            let hi = next_u64();
+                            if vec_idx == 0 {
+                                Val::V128(0)
+                            } else if vec_idx == 1 {
+                                Val::V128(u128::MAX)
+                            } else {
+                                Val::V128((r as u128) | ((hi as u128) << 64))
                             }
                         }
                     }

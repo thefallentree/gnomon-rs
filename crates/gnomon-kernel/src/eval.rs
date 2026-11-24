@@ -1,6 +1,7 @@
 //! Deterministic reference interpreter for `GnomonIR`.
 
 use alloc::{boxed::Box, vec, vec::Vec};
+use crate::fp::*;
 use crate::ir::*;
 use crate::registry::StratumRegistry;
 use crate::vc::validate_read_only_with_registry;
@@ -38,33 +39,61 @@ impl MemoryState {
         ty: ValType,
     ) -> Result<Val, TrapCode> {
         let s = &self.bytes[self.ea_end(addr, offset, w.bytes())?..][..w.bytes() as usize];
-        let v: i64 = match (w, signed) {
-            (MemWidth::B1, false) => s[0] as i64,
-            (MemWidth::B1, true) => (s[0] as i8) as i64,
-            (MemWidth::B2, false) => u16::from_le_bytes([s[0], s[1]]) as i64,
-            (MemWidth::B2, true) => i16::from_le_bytes([s[0], s[1]]) as i64,
-            (MemWidth::B4, false) => u32::from_le_bytes([s[0], s[1], s[2], s[3]]) as i64,
-            (MemWidth::B4, true) => i32::from_le_bytes([s[0], s[1], s[2], s[3]]) as i64,
-            (MemWidth::B8, _) if ty == ValType::I64 => {
-                u64::from_le_bytes([s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7]]) as i64
+        match (ty, w) {
+            (ValType::F32, MemWidth::B4) => {
+                Ok(Val::F32(u32::from_le_bytes([s[0], s[1], s[2], s[3]])))
             }
-            (MemWidth::B8, _) => return Err(TrapCode::Unreachable),
-        };
-        Ok(match ty {
-            ValType::I32 => Val::I32(v as i32),
-            ValType::I64 => Val::I64(v),
-        })
+            (ValType::F64, MemWidth::B8) => {
+                Ok(Val::F64(u64::from_le_bytes([s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7]])))
+            }
+            (ValType::V128, MemWidth::B16) => Ok(Val::V128(u128::from_le_bytes([
+                s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7],
+                s[8], s[9], s[10], s[11], s[12], s[13], s[14], s[15],
+            ]))),
+            (ValType::I32, MemWidth::B1) => {
+                Ok(Val::I32(if signed { (s[0] as i8) as i32 } else { s[0] as i32 }))
+            }
+            (ValType::I32, MemWidth::B2) => {
+                let raw = u16::from_le_bytes([s[0], s[1]]);
+                Ok(Val::I32(if signed { (raw as i16) as i32 } else { raw as i32 }))
+            }
+            (ValType::I32, MemWidth::B4) => {
+                Ok(Val::I32(i32::from_le_bytes([s[0], s[1], s[2], s[3]])))
+            }
+            (ValType::I64, MemWidth::B1) => {
+                Ok(Val::I64(if signed { (s[0] as i8) as i64 } else { s[0] as i64 }))
+            }
+            (ValType::I64, MemWidth::B2) => {
+                let raw = u16::from_le_bytes([s[0], s[1]]);
+                Ok(Val::I64(if signed { (raw as i16) as i64 } else { raw as i64 }))
+            }
+            (ValType::I64, MemWidth::B4) => {
+                let raw = u32::from_le_bytes([s[0], s[1], s[2], s[3]]);
+                Ok(Val::I64(if signed { (raw as i32) as i64 } else { raw as i64 }))
+            }
+            (ValType::I64, MemWidth::B8) => {
+                Ok(Val::I64(i64::from_le_bytes([s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7]])))
+            }
+            _ => Err(TrapCode::Unreachable),
+        }
     }
 
     pub fn store(&mut self, addr: u32, offset: u32, w: MemWidth, val: Val) -> Result<(), TrapCode> {
         let start = self.ea_end(addr, offset, w.bytes())?;
-        let raw = match val {
-            Val::I32(v) if w != MemWidth::B8 => v as u32 as u64,
-            Val::I64(v) => v as u64,
-            Val::I32(_) => return Err(TrapCode::Unreachable),
-        };
-        self.bytes[start..start + w.bytes() as usize]
-            .copy_from_slice(&raw.to_le_bytes()[..w.bytes() as usize]);
+        let dst = &mut self.bytes[start..start + w.bytes() as usize];
+        match (val, w) {
+            (Val::I32(v), MemWidth::B1) => dst.copy_from_slice(&(v as u8).to_le_bytes()),
+            (Val::I32(v), MemWidth::B2) => dst.copy_from_slice(&(v as u16).to_le_bytes()),
+            (Val::I32(v), MemWidth::B4) => dst.copy_from_slice(&v.to_le_bytes()),
+            (Val::I64(v), MemWidth::B1) => dst.copy_from_slice(&(v as u8).to_le_bytes()),
+            (Val::I64(v), MemWidth::B2) => dst.copy_from_slice(&(v as u16).to_le_bytes()),
+            (Val::I64(v), MemWidth::B4) => dst.copy_from_slice(&(v as u32).to_le_bytes()),
+            (Val::I64(v), MemWidth::B8) => dst.copy_from_slice(&v.to_le_bytes()),
+            (Val::F32(b), MemWidth::B4) => dst.copy_from_slice(&b.to_le_bytes()),
+            (Val::F64(b), MemWidth::B8) => dst.copy_from_slice(&b.to_le_bytes()),
+            (Val::V128(b), MemWidth::B16) => dst.copy_from_slice(&b.to_le_bytes()),
+            _ => return Err(TrapCode::Unreachable),
+        }
         Ok(())
     }
 
@@ -187,11 +216,14 @@ const ENV_INLINE: usize = 16;
 const ENV_UNDEF: u8 = 0;
 const ENV_I32: u8 = 1;
 const ENV_I64: u8 = 2;
+const ENV_F32: u8 = 3;
+const ENV_F64: u8 = 4;
+const ENV_V128: u8 = 5;
 
 struct Env {
-    slot_val: [u64; ENV_INLINE],
+    slot_val: [u128; ENV_INLINE],
     slot_tag: [u8; ENV_INLINE],
-    trail_val: [u64; ENV_INLINE],
+    trail_val: [u128; ENV_INLINE],
     trail_meta: [u8; ENV_INLINE],
     inline_len: usize,
     total_len: usize,
@@ -255,8 +287,11 @@ impl Env {
         let idx = id.0 as usize;
         if self.spill.is_empty() && self.inline_len < ENV_INLINE && idx < ENV_INLINE {
             let (tag, bits) = match val {
-                Val::I32(x) => (ENV_I32, x as u32 as u64),
-                Val::I64(x) => (ENV_I64, x as u64),
+                Val::I32(x) => (ENV_I32, x as u32 as u128),
+                Val::I64(x) => (ENV_I64, x as u64 as u128),
+                Val::F32(b) => (ENV_F32, b as u128),
+                Val::F64(b) => (ENV_F64, b as u128),
+                Val::V128(b) => (ENV_V128, b),
             };
             self.trail_meta[self.inline_len] = ((idx as u8) << 4) | self.slot_tag[idx];
             self.trail_val[self.inline_len] = self.slot_val[idx];
@@ -293,7 +328,10 @@ impl Env {
         if idx < ENV_INLINE {
             match self.slot_tag[idx] {
                 ENV_I32 => return Ok(Val::I32(self.slot_val[idx] as u32 as i32)),
-                ENV_I64 => return Ok(Val::I64(self.slot_val[idx] as i64)),
+                ENV_I64 => return Ok(Val::I64(self.slot_val[idx] as u64 as i64)),
+                ENV_F32 => return Ok(Val::F32(self.slot_val[idx] as u32)),
+                ENV_F64 => return Ok(Val::F64(self.slot_val[idx] as u64)),
+                ENV_V128 => return Ok(Val::V128(self.slot_val[idx])),
                 _ => {}
             }
         }
@@ -883,8 +921,9 @@ fn eval_block_stmts(
         heap.consume_fuel(1)?;
         match slot.tag {
             TAG_STMT_LET => {
-                let (dst, ty, op) = slot.to_let_op().ok_or(TrapCode::Unreachable)?;
-                let val = eval_op(env, heap, &op)?;
+                let dst = ValId(slot.w0);
+                let ty = ValType::from_u8((slot.aux & 0x7) as u8).ok_or(TrapCode::Unreachable)?;
+                let val = eval_let_slot(env, heap, reg.pool.as_slice(), slot)?;
                 if val.val_type() != ty {
                     return Err(TrapCode::Unreachable);
                 }
@@ -1164,27 +1203,132 @@ fn eval_host_call(
     Ok(res_sv)
 }
 
-fn eval_op(env: &Env, heap: &mut HeapState, op: &Op) -> Result<Val, TrapCode> {
-    match op {
-        Op::ConstI32(v) => Ok(Val::I32(*v)),
-        Op::ConstI64(v) => Ok(Val::I64(*v)),
-        Op::Copy(id) => env.get(*id),
-        Op::Select { cond, true_val, false_val } => {
-            let (c, t, f) = (env.u32(*cond)?, env.get(*true_val)?, env.get(*false_val)?);
+fn eval_let_slot(
+    env: &Env,
+    heap: &mut HeapState,
+    pool: &[IrSlot],
+    slot: IrSlot,
+) -> Result<Val, TrapCode> {
+    match slot.sub {
+        OP_CONST_I32 => Ok(Val::I32(slot.w1 as i32)),
+        OP_CONST_I64 => Ok(Val::I64((((slot.w2 as u64) << 32) | (slot.w1 as u64)) as i64)),
+        OP_CONST_F32 => Ok(Val::F32(slot.w1)),
+        OP_CONST_F64 => Ok(Val::F64(((slot.w2 as u64) << 32) | (slot.w1 as u64))),
+        OP_CONST_V128 => Ok(Val::V128(
+            (slot.w1 as u128)
+                | ((slot.w2 as u128) << 32)
+                | ((slot.w3 as u128) << 64)
+                | ((slot.w4 as u128) << 96),
+        )),
+        OP_COPY => env.get(ValId(slot.w1)),
+        OP_SELECT => {
+            let (c, t, f) = (env.u32(ValId(slot.w1))?, env.get(ValId(slot.w2))?, env.get(ValId(slot.w3))?);
             if t.val_type() != f.val_type() {
                 Err(TrapCode::Unreachable)
             } else {
                 Ok(if c != 0 { t } else { f })
             }
         }
-        Op::GlobalGet(gid) => heap.globals.get(gid.0 as usize).copied().ok_or(TrapCode::Unreachable),
-        Op::Un(u, a) => eval_unop(*u, env.get(*a)?),
-        Op::Bin(b, l, r) => eval_binop(*b, env.get(*l)?, env.get(*r)?),
-        Op::Load { mem, addr, offset, width, signed, result_ty } => {
-            heap.memory(*mem)?.load(env.u32(*addr)?, *offset, *width, *signed, *result_ty)
+        OP_GLOBAL_GET => {
+            heap.globals.get(slot.w1 as usize).copied().ok_or(TrapCode::Unreachable)
         }
-        Op::MemorySize(mem) => Ok(Val::I32(heap.memory(*mem)?.size_pages() as i32)),
-        Op::MemoryGrow { mem, delta } => Ok(Val::I32(heap.memory_mut(*mem)?.grow(env.u32(*delta)?))),
+        OP_UN => {
+            let u = UnOp::from_u8((slot.aux >> 3) as u8).ok_or(TrapCode::Unreachable)?;
+            eval_unop(u, env.get(ValId(slot.w1))?)
+        }
+        OP_BIN => {
+            let b = BinOp::from_u8((slot.aux >> 3) as u8).ok_or(TrapCode::Unreachable)?;
+            eval_binop(b, env.get(ValId(slot.w1))?, env.get(ValId(slot.w2))?)
+        }
+        OP_LOAD => {
+            let width =
+                MemWidth::from_u8(((slot.aux >> 3) & 0x1F) as u8).ok_or(TrapCode::Unreachable)?;
+            let signed = ((slot.aux >> 8) & 1) != 0;
+            let result_ty =
+                ValType::from_u8(((slot.aux >> 9) & 0x7) as u8).ok_or(TrapCode::Unreachable)?;
+            heap.memory(MemId(slot.w1 as u16))?
+                .load(env.u32(ValId(slot.w2))?, slot.w3, width, signed, result_ty)
+        }
+        OP_MEM_SIZE => Ok(Val::I32(heap.memory(MemId(slot.w1 as u16))?.size_pages() as i32)),
+        OP_MEM_GROW => Ok(Val::I32(
+            heap.memory_mut(MemId(slot.w1 as u16))?.grow(env.u32(ValId(slot.w2))?),
+        )),
+        OP_SIMD_EXTRACT_LANE => {
+            let kind =
+                LaneKind::from_u8(((slot.aux >> 3) & 0x1F) as u8).ok_or(TrapCode::Unreachable)?;
+            let lane = (slot.aux >> 8) as u8;
+            if lane >= kind.num_lanes() {
+                return Err(TrapCode::Unreachable);
+            }
+            let v = env.get(ValId(slot.w1))?.as_v128_bits().ok_or(TrapCode::Unreachable)?;
+            let idx = lane as u32;
+            Ok(match kind {
+                LaneKind::I8x16S => Val::I32(((v >> (idx * 8)) as u8 as i8) as i32),
+                LaneKind::I8x16U => Val::I32(((v >> (idx * 8)) as u8) as i32),
+                LaneKind::I16x8S => Val::I32(((v >> (idx * 16)) as u16 as i16) as i32),
+                LaneKind::I16x8U => Val::I32(((v >> (idx * 16)) as u16) as i32),
+                LaneKind::I32x4 => Val::I32(((v >> (idx * 32)) as u32) as i32),
+                LaneKind::I64x2 => Val::I64(((v >> (idx * 64)) as u64) as i64),
+                LaneKind::F32x4 => Val::F32((v >> (idx * 32)) as u32),
+                LaneKind::F64x2 => Val::F64((v >> (idx * 64)) as u64),
+            })
+        }
+        OP_SIMD_REPLACE_LANE => {
+            let kind =
+                LaneKind::from_u8(((slot.aux >> 3) & 0x1F) as u8).ok_or(TrapCode::Unreachable)?;
+            let lane = (slot.aux >> 8) as u8;
+            if lane >= kind.num_lanes() {
+                return Err(TrapCode::Unreachable);
+            }
+            let v = env.get(ValId(slot.w1))?.as_v128_bits().ok_or(TrapCode::Unreachable)?;
+            let elem = env.get(ValId(slot.w2))?;
+            let idx = lane as u32;
+            let replaced = match (kind, elem) {
+                (LaneKind::I8x16S | LaneKind::I8x16U, Val::I32(x)) => {
+                    let sh = idx * 8;
+                    (v & !(0xffu128 << sh)) | (((x as u8) as u128) << sh)
+                }
+                (LaneKind::I16x8S | LaneKind::I16x8U, Val::I32(x)) => {
+                    let sh = idx * 16;
+                    (v & !(0xffffu128 << sh)) | (((x as u16) as u128) << sh)
+                }
+                (LaneKind::I32x4, Val::I32(x)) => {
+                    let sh = idx * 32;
+                    (v & !(0xffff_ffffu128 << sh)) | (((x as u32) as u128) << sh)
+                }
+                (LaneKind::I64x2, Val::I64(x)) => {
+                    let sh = idx * 64;
+                    (v & !(0xffff_ffff_ffff_ffffu128 << sh)) | (((x as u64) as u128) << sh)
+                }
+                (LaneKind::F32x4, Val::F32(b)) => {
+                    let sh = idx * 32;
+                    (v & !(0xffff_ffffu128 << sh)) | ((b as u128) << sh)
+                }
+                (LaneKind::F64x2, Val::F64(b)) => {
+                    let sh = idx * 64;
+                    (v & !(0xffff_ffff_ffff_ffffu128 << sh)) | ((b as u128) << sh)
+                }
+                _ => return Err(TrapCode::Unreachable),
+            };
+            Ok(Val::V128(replaced))
+        }
+        OP_SIMD_BITSELECT => {
+            let va = env.get(ValId(slot.w1))?.as_v128_bits().ok_or(TrapCode::Unreachable)?;
+            let vb = env.get(ValId(slot.w2))?.as_v128_bits().ok_or(TrapCode::Unreachable)?;
+            let vm = env.get(ValId(slot.w3))?.as_v128_bits().ok_or(TrapCode::Unreachable)?;
+            Ok(Val::V128((va & vm) | (vb & !vm)))
+        }
+        OP_SIMD_SHUFFLE => {
+            let aux_i = slot.w3 as usize;
+            let lanes = pool
+                .get(aux_i)
+                .and_then(|s| s.decode_aux_shuffle())
+                .ok_or(TrapCode::Unreachable)?;
+            let vl = env.get(ValId(slot.w1))?.as_v128_bits().ok_or(TrapCode::Unreachable)?;
+            let vr = env.get(ValId(slot.w2))?.as_v128_bits().ok_or(TrapCode::Unreachable)?;
+            Ok(Val::V128(i8x16_shuffle(vl, vr, lanes)?))
+        }
+        _ => Err(TrapCode::Unreachable),
     }
 }
 
@@ -1218,26 +1362,160 @@ fn eval_effect(
     }
 }
 
-pub(crate) fn eval_unop(op: UnOp, v: Val) -> Result<Val, TrapCode> {
+fn eval_unop_int(op: UnOp, v: Val) -> Result<Val, TrapCode> {
+    use UnOp::*;
     Ok(match (op, v) {
-        (UnOp::I32Eqz, Val::I32(x)) => Val::I32(i32::from(x == 0)),
-        (UnOp::I64Eqz, Val::I64(x)) => Val::I32(i32::from(x == 0)),
-        (UnOp::I32Clz, Val::I32(x)) => Val::I32(x.leading_zeros() as i32),
-        (UnOp::I32Ctz, Val::I32(x)) => Val::I32(x.trailing_zeros() as i32),
-        (UnOp::I32Popcnt, Val::I32(x)) => Val::I32(x.count_ones() as i32),
-        (UnOp::I64Clz, Val::I64(x)) => Val::I64(x.leading_zeros() as i64),
-        (UnOp::I64Ctz, Val::I64(x)) => Val::I64(x.trailing_zeros() as i64),
-        (UnOp::I64Popcnt, Val::I64(x)) => Val::I64(x.count_ones() as i64),
-        (UnOp::I32WrapI64, Val::I64(x)) => Val::I32(x as i32),
-        (UnOp::I64ExtendI32S, Val::I32(x)) => Val::I64(x as i64),
-        (UnOp::I64ExtendI32U, Val::I32(x)) => Val::I64((x as u32) as i64),
-        (UnOp::I32Extend8S, Val::I32(x)) => Val::I32((x as i8) as i32),
-        (UnOp::I32Extend16S, Val::I32(x)) => Val::I32((x as i16) as i32),
-        (UnOp::I64Extend8S, Val::I64(x)) => Val::I64((x as i8) as i64),
-        (UnOp::I64Extend16S, Val::I64(x)) => Val::I64((x as i16) as i64),
-        (UnOp::I64Extend32S, Val::I64(x)) => Val::I64((x as i32) as i64),
+        (I32Eqz, Val::I32(x)) => Val::I32(i32::from(x == 0)),
+        (I64Eqz, Val::I64(x)) => Val::I32(i32::from(x == 0)),
+        (I32Clz, Val::I32(x)) => Val::I32(x.leading_zeros() as i32),
+        (I32Ctz, Val::I32(x)) => Val::I32(x.trailing_zeros() as i32),
+        (I32Popcnt, Val::I32(x)) => Val::I32(x.count_ones() as i32),
+        (I64Clz, Val::I64(x)) => Val::I64(x.leading_zeros() as i64),
+        (I64Ctz, Val::I64(x)) => Val::I64(x.trailing_zeros() as i64),
+        (I64Popcnt, Val::I64(x)) => Val::I64(x.count_ones() as i64),
+        (I32WrapI64, Val::I64(x)) => Val::I32(x as i32),
+        (I64ExtendI32S, Val::I32(x)) => Val::I64(x as i64),
+        (I64ExtendI32U, Val::I32(x)) => Val::I64((x as u32) as i64),
+        (I32Extend8S, Val::I32(x)) => Val::I32((x as i8) as i32),
+        (I32Extend16S, Val::I32(x)) => Val::I32((x as i16) as i32),
+        (I64Extend8S, Val::I64(x)) => Val::I64((x as i8) as i64),
+        (I64Extend16S, Val::I64(x)) => Val::I64((x as i16) as i64),
+        (I64Extend32S, Val::I64(x)) => Val::I64((x as i32) as i64),
         _ => return Err(TrapCode::Unreachable),
     })
+}
+
+fn eval_unop_fp(op: UnOp, v: Val) -> Result<Val, TrapCode> {
+    use UnOp::*;
+    Ok(match (op, v) {
+        (F32Abs, Val::F32(b)) => Val::F32(f32_abs(b)),
+        (F32Neg, Val::F32(b)) => Val::F32(f32_neg(b)),
+        (F32Ceil, Val::F32(b)) => Val::F32(f32_ceil(b)),
+        (F32Floor, Val::F32(b)) => Val::F32(f32_floor(b)),
+        (F32Trunc, Val::F32(b)) => Val::F32(f32_trunc(b)),
+        (F32Nearest, Val::F32(b)) => Val::F32(f32_nearest(b)),
+        (F32Sqrt, Val::F32(b)) => Val::F32(f32_sqrt(b)),
+        (F64Abs, Val::F64(b)) => Val::F64(f64_abs(b)),
+        (F64Neg, Val::F64(b)) => Val::F64(f64_neg(b)),
+        (F64Ceil, Val::F64(b)) => Val::F64(f64_ceil(b)),
+        (F64Floor, Val::F64(b)) => Val::F64(f64_floor(b)),
+        (F64Trunc, Val::F64(b)) => Val::F64(f64_trunc(b)),
+        (F64Nearest, Val::F64(b)) => Val::F64(f64_nearest(b)),
+        (F64Sqrt, Val::F64(b)) => Val::F64(f64_sqrt(b)),
+        (I32TruncF32S, Val::F32(b)) => Val::I32(i32_trunc_f32_s(b)?),
+        (I32TruncF32U, Val::F32(b)) => Val::I32(i32_trunc_f32_u(b)?),
+        (I32TruncF64S, Val::F64(b)) => Val::I32(i32_trunc_f64_s(b)?),
+        (I32TruncF64U, Val::F64(b)) => Val::I32(i32_trunc_f64_u(b)?),
+        (I64TruncF32S, Val::F32(b)) => Val::I64(i64_trunc_f32_s(b)?),
+        (I64TruncF32U, Val::F32(b)) => Val::I64(i64_trunc_f32_u(b)?),
+        (I64TruncF64S, Val::F64(b)) => Val::I64(i64_trunc_f64_s(b)?),
+        (I64TruncF64U, Val::F64(b)) => Val::I64(i64_trunc_f64_u(b)?),
+        (I32TruncSatF32S, Val::F32(b)) => Val::I32(i32_trunc_sat_f32_s(b)),
+        (I32TruncSatF32U, Val::F32(b)) => Val::I32(i32_trunc_sat_f32_u(b)),
+        (I32TruncSatF64S, Val::F64(b)) => Val::I32(i32_trunc_sat_f64_s(b)),
+        (I32TruncSatF64U, Val::F64(b)) => Val::I32(i32_trunc_sat_f64_u(b)),
+        (I64TruncSatF32S, Val::F32(b)) => Val::I64(i64_trunc_sat_f32_s(b)),
+        (I64TruncSatF32U, Val::F32(b)) => Val::I64(i64_trunc_sat_f32_u(b)),
+        (I64TruncSatF64S, Val::F64(b)) => Val::I64(i64_trunc_sat_f64_s(b)),
+        (I64TruncSatF64U, Val::F64(b)) => Val::I64(i64_trunc_sat_f64_u(b)),
+        (F32ConvertI32S, Val::I32(x)) => Val::F32((x as f32).to_bits()),
+        (F32ConvertI32U, Val::I32(x)) => Val::F32(((x as u32) as f32).to_bits()),
+        (F32ConvertI64S, Val::I64(x)) => Val::F32((x as f32).to_bits()),
+        (F32ConvertI64U, Val::I64(x)) => Val::F32(((x as u64) as f32).to_bits()),
+        (F64ConvertI32S, Val::I32(x)) => Val::F64((x as f64).to_bits()),
+        (F64ConvertI32U, Val::I32(x)) => Val::F64(((x as u32) as f64).to_bits()),
+        (F64ConvertI64S, Val::I64(x)) => Val::F64((x as f64).to_bits()),
+        (F64ConvertI64U, Val::I64(x)) => Val::F64(((x as u64) as f64).to_bits()),
+        (F32DemoteF64, Val::F64(b)) => Val::F32(f32_demote_f64(b)),
+        (F64PromoteF32, Val::F32(b)) => Val::F64(f64_promote_f32(b)),
+        (I32ReinterpretF32, Val::F32(b)) => Val::I32(b as i32),
+        (I64ReinterpretF64, Val::F64(b)) => Val::I64(b as i64),
+        (F32ReinterpretI32, Val::I32(x)) => Val::F32(x as u32),
+        (F64ReinterpretI64, Val::I64(x)) => Val::F64(x as u64),
+        _ => return Err(TrapCode::Unreachable),
+    })
+}
+
+fn eval_unop_simd(op: UnOp, v: Val) -> Result<Val, TrapCode> {
+    use UnOp::*;
+    Ok(match (op, v) {
+        (V128Not, Val::V128(x)) => Val::V128(!x),
+        (V128AnyTrue, Val::V128(x)) => Val::I32(i32::from(x != 0)),
+        (I8x16Splat, Val::I32(x)) => Val::V128(splat_u8(x as u8)),
+        (I16x8Splat, Val::I32(x)) => Val::V128(splat_u16(x as u16)),
+        (I32x4Splat, Val::I32(x)) => Val::V128(splat_u32(x as u32)),
+        (I64x2Splat, Val::I64(x)) => Val::V128(splat_u64(x as u64)),
+        (F32x4Splat, Val::F32(b)) => Val::V128(splat_u32(b)),
+        (F64x2Splat, Val::F64(b)) => Val::V128(splat_u64(b)),
+        (I8x16Bitmask, Val::V128(x)) => Val::I32(i8x16_bitmask(x)),
+        (I16x8Bitmask, Val::V128(x)) => Val::I32(i16x8_bitmask(x)),
+        (I32x4Bitmask, Val::V128(x)) => Val::I32(i32x4_bitmask(x)),
+        (I64x2Bitmask, Val::V128(x)) => Val::I32(i64x2_bitmask(x)),
+        (I32x4AllTrue, Val::V128(x)) => {
+            let a = unpack_u32x4(x);
+            Val::I32(i32::from(a[0] != 0 && a[1] != 0 && a[2] != 0 && a[3] != 0))
+        }
+        (I64x2AllTrue, Val::V128(x)) => {
+            let a = unpack_u64x2(x);
+            Val::I32(i32::from(a[0] != 0 && a[1] != 0))
+        }
+        (I32x4Abs, Val::V128(x)) => Val::V128(map_u32x4(x, |l| (l as i32).wrapping_abs() as u32)),
+        (I32x4Neg, Val::V128(x)) => Val::V128(map_u32x4(x, |l| (l as i32).wrapping_neg() as u32)),
+        (I64x2Abs, Val::V128(x)) => Val::V128(map_u64x2(x, |l| (l as i64).wrapping_abs() as u64)),
+        (I64x2Neg, Val::V128(x)) => Val::V128(map_u64x2(x, |l| (l as i64).wrapping_neg() as u64)),
+        (F32x4Abs, Val::V128(x)) => Val::V128(map_u32x4(x, f32_abs)),
+        (F32x4Neg, Val::V128(x)) => Val::V128(map_u32x4(x, f32_neg)),
+        (F32x4Sqrt, Val::V128(x)) => Val::V128(map_u32x4(x, f32_sqrt)),
+        (F32x4Ceil, Val::V128(x)) => Val::V128(map_u32x4(x, f32_ceil)),
+        (F32x4Floor, Val::V128(x)) => Val::V128(map_u32x4(x, f32_floor)),
+        (F32x4Trunc, Val::V128(x)) => Val::V128(map_u32x4(x, f32_trunc)),
+        (F32x4Nearest, Val::V128(x)) => Val::V128(map_u32x4(x, f32_nearest)),
+        (F64x2Abs, Val::V128(x)) => Val::V128(map_u64x2(x, f64_abs)),
+        (F64x2Neg, Val::V128(x)) => Val::V128(map_u64x2(x, f64_neg)),
+        (F64x2Sqrt, Val::V128(x)) => Val::V128(map_u64x2(x, f64_sqrt)),
+        (F64x2Ceil, Val::V128(x)) => Val::V128(map_u64x2(x, f64_ceil)),
+        (F64x2Floor, Val::V128(x)) => Val::V128(map_u64x2(x, f64_floor)),
+        (F64x2Trunc, Val::V128(x)) => Val::V128(map_u64x2(x, f64_trunc)),
+        (F64x2Nearest, Val::V128(x)) => Val::V128(map_u64x2(x, f64_nearest)),
+        (I32x4TruncSatF32x4S, Val::V128(x)) => {
+            Val::V128(map_u32x4(x, |l| i32_trunc_sat_f32_s(l) as u32))
+        }
+        (I32x4TruncSatF32x4U, Val::V128(x)) => {
+            Val::V128(map_u32x4(x, |l| i32_trunc_sat_f32_u(l) as u32))
+        }
+        (F32x4ConvertI32x4S, Val::V128(x)) => {
+            Val::V128(map_u32x4(x, |l| ((l as i32) as f32).to_bits()))
+        }
+        (F32x4ConvertI32x4U, Val::V128(x)) => Val::V128(map_u32x4(x, |l| (l as f32).to_bits())),
+        (I64x2ExtendLowI32x4S, Val::V128(x)) => {
+            let a = unpack_u32x4(x);
+            Val::V128(pack_u64x2([(a[0] as i32) as i64 as u64, (a[1] as i32) as i64 as u64]))
+        }
+        (I64x2ExtendLowI32x4U, Val::V128(x)) => {
+            let a = unpack_u32x4(x);
+            Val::V128(pack_u64x2([a[0] as u64, a[1] as u64]))
+        }
+        (I64x2ExtendHighI32x4S, Val::V128(x)) => {
+            let a = unpack_u32x4(x);
+            Val::V128(pack_u64x2([(a[2] as i32) as i64 as u64, (a[3] as i32) as i64 as u64]))
+        }
+        (I64x2ExtendHighI32x4U, Val::V128(x)) => {
+            let a = unpack_u32x4(x);
+            Val::V128(pack_u64x2([a[2] as u64, a[3] as u64]))
+        }
+        _ => return Err(TrapCode::Unreachable),
+    })
+}
+
+pub(crate) fn eval_unop(op: UnOp, v: Val) -> Result<Val, TrapCode> {
+    let code = op.to_u8();
+    if code <= UnOp::I64Extend32S.to_u8() {
+        eval_unop_int(op, v)
+    } else if code <= UnOp::F64ReinterpretI64.to_u8() {
+        eval_unop_fp(op, v)
+    } else {
+        eval_unop_simd(op, v)
+    }
 }
 
 macro_rules! int_ops {
@@ -1281,7 +1559,7 @@ macro_rules! int_ops {
     }};
 }
 
-pub(crate) fn eval_binop(op: BinOp, l: Val, r: Val) -> Result<Val, TrapCode> {
+fn eval_binop_int(op: BinOp, l: Val, r: Val) -> Result<Val, TrapCode> {
     use BinOp::*;
     match (l, r) {
         (Val::I32(a), Val::I32(c)) => int_ops!(a, c, i32, u32, Val::I32, 31, op;
@@ -1293,5 +1571,153 @@ pub(crate) fn eval_binop(op: BinOp, l: Val, r: Val) -> Result<Val, TrapCode> {
             I64Add, I64Sub, I64Mul, I64DivS, I64DivU, I64RemS, I64RemU,
             I64And, I64Or, I64Xor, I64Shl, I64ShrS, I64ShrU, I64Rotl, I64Rotr),
         _ => Err(TrapCode::Unreachable),
+    }
+}
+
+fn eval_binop_fp(op: BinOp, l: Val, r: Val) -> Result<Val, TrapCode> {
+    use BinOp::*;
+    match (l, r) {
+        (Val::F32(a), Val::F32(c)) => Ok(match op {
+            F32Add => Val::F32(f32_add(a, c)),
+            F32Sub => Val::F32(f32_sub(a, c)),
+            F32Mul => Val::F32(f32_mul(a, c)),
+            F32Div => Val::F32(f32_div(a, c)),
+            F32Min => Val::F32(f32_min(a, c)),
+            F32Max => Val::F32(f32_max(a, c)),
+            F32Copysign => Val::F32(f32_copysign(a, c)),
+            F32Eq => Val::I32(i32::from(f32_eq(a, c))),
+            F32Ne => Val::I32(i32::from(f32_ne(a, c))),
+            F32Lt => Val::I32(i32::from(f32_lt(a, c))),
+            F32Gt => Val::I32(i32::from(f32_gt(a, c))),
+            F32Le => Val::I32(i32::from(f32_le(a, c))),
+            F32Ge => Val::I32(i32::from(f32_ge(a, c))),
+            _ => return Err(TrapCode::Unreachable),
+        }),
+        (Val::F64(a), Val::F64(c)) => Ok(match op {
+            F64Add => Val::F64(f64_add(a, c)),
+            F64Sub => Val::F64(f64_sub(a, c)),
+            F64Mul => Val::F64(f64_mul(a, c)),
+            F64Div => Val::F64(f64_div(a, c)),
+            F64Min => Val::F64(f64_min(a, c)),
+            F64Max => Val::F64(f64_max(a, c)),
+            F64Copysign => Val::F64(f64_copysign(a, c)),
+            F64Eq => Val::I32(i32::from(f64_eq(a, c))),
+            F64Ne => Val::I32(i32::from(f64_ne(a, c))),
+            F64Lt => Val::I32(i32::from(f64_lt(a, c))),
+            F64Gt => Val::I32(i32::from(f64_gt(a, c))),
+            F64Le => Val::I32(i32::from(f64_le(a, c))),
+            F64Ge => Val::I32(i32::from(f64_ge(a, c))),
+            _ => return Err(TrapCode::Unreachable),
+        }),
+        _ => Err(TrapCode::Unreachable),
+    }
+}
+
+fn eval_binop_simd(op: BinOp, l: Val, r: Val) -> Result<Val, TrapCode> {
+    use BinOp::*;
+    let b32 = |c: bool| if c { u32::MAX } else { 0u32 };
+    let b64 = |c: bool| if c { u64::MAX } else { 0u64 };
+    match (l, r) {
+        (Val::V128(a), Val::I32(s)) => Ok(Val::V128(match op {
+            I32x4Shl => {
+                let sh = (s as u32) & 31;
+                map_u32x4(a, |x| x.wrapping_shl(sh))
+            }
+            I32x4ShrS => {
+                let sh = (s as u32) & 31;
+                map_u32x4(a, |x| (x as i32).wrapping_shr(sh) as u32)
+            }
+            I32x4ShrU => {
+                let sh = (s as u32) & 31;
+                map_u32x4(a, |x| x.wrapping_shr(sh))
+            }
+            I64x2Shl => {
+                let sh = (s as u32) & 63;
+                map_u64x2(a, |x| x.wrapping_shl(sh))
+            }
+            I64x2ShrS => {
+                let sh = (s as u32) & 63;
+                map_u64x2(a, |x| (x as i64).wrapping_shr(sh) as u64)
+            }
+            I64x2ShrU => {
+                let sh = (s as u32) & 63;
+                map_u64x2(a, |x| x.wrapping_shr(sh))
+            }
+            _ => return Err(TrapCode::Unreachable),
+        })),
+        (Val::V128(a), Val::V128(c)) => Ok(Val::V128(match op {
+            V128And => a & c,
+            V128AndNot => a & !c,
+            V128Or => a | c,
+            V128Xor => a ^ c,
+            I8x16Swizzle => i8x16_swizzle(a, c),
+            I32x4Add => zip_u32x4(a, c, u32::wrapping_add),
+            I32x4Sub => zip_u32x4(a, c, u32::wrapping_sub),
+            I32x4Mul => zip_u32x4(a, c, u32::wrapping_mul),
+            I32x4MinS => zip_u32x4(a, c, |x, y| (x as i32).min(y as i32) as u32),
+            I32x4MinU => zip_u32x4(a, c, u32::min),
+            I32x4MaxS => zip_u32x4(a, c, |x, y| (x as i32).max(y as i32) as u32),
+            I32x4MaxU => zip_u32x4(a, c, u32::max),
+            I32x4Eq => zip_u32x4(a, c, |x, y| b32(x == y)),
+            I32x4Ne => zip_u32x4(a, c, |x, y| b32(x != y)),
+            I32x4LtS => zip_u32x4(a, c, |x, y| b32((x as i32) < (y as i32))),
+            I32x4LtU => zip_u32x4(a, c, |x, y| b32(x < y)),
+            I32x4GtS => zip_u32x4(a, c, |x, y| b32((x as i32) > (y as i32))),
+            I32x4GtU => zip_u32x4(a, c, |x, y| b32(x > y)),
+            I32x4LeS => zip_u32x4(a, c, |x, y| b32((x as i32) <= (y as i32))),
+            I32x4LeU => zip_u32x4(a, c, |x, y| b32(x <= y)),
+            I32x4GeS => zip_u32x4(a, c, |x, y| b32((x as i32) >= (y as i32))),
+            I32x4GeU => zip_u32x4(a, c, |x, y| b32(x >= y)),
+            I64x2Add => zip_u64x2(a, c, u64::wrapping_add),
+            I64x2Sub => zip_u64x2(a, c, u64::wrapping_sub),
+            I64x2Mul => zip_u64x2(a, c, u64::wrapping_mul),
+            I64x2Eq => zip_u64x2(a, c, |x, y| b64(x == y)),
+            I64x2Ne => zip_u64x2(a, c, |x, y| b64(x != y)),
+            I64x2LtS => zip_u64x2(a, c, |x, y| b64((x as i64) < (y as i64))),
+            I64x2GtS => zip_u64x2(a, c, |x, y| b64((x as i64) > (y as i64))),
+            I64x2LeS => zip_u64x2(a, c, |x, y| b64((x as i64) <= (y as i64))),
+            I64x2GeS => zip_u64x2(a, c, |x, y| b64((x as i64) >= (y as i64))),
+            F32x4Add => zip_u32x4(a, c, f32_add),
+            F32x4Sub => zip_u32x4(a, c, f32_sub),
+            F32x4Mul => zip_u32x4(a, c, f32_mul),
+            F32x4Div => zip_u32x4(a, c, f32_div),
+            F32x4Min => zip_u32x4(a, c, f32_min),
+            F32x4Max => zip_u32x4(a, c, f32_max),
+            F32x4PMin => zip_u32x4(a, c, f32_pmin),
+            F32x4PMax => zip_u32x4(a, c, f32_pmax),
+            F32x4Eq => zip_u32x4(a, c, |x, y| b32(f32_eq(x, y))),
+            F32x4Ne => zip_u32x4(a, c, |x, y| b32(f32_ne(x, y))),
+            F32x4Lt => zip_u32x4(a, c, |x, y| b32(f32_lt(x, y))),
+            F32x4Gt => zip_u32x4(a, c, |x, y| b32(f32_gt(x, y))),
+            F32x4Le => zip_u32x4(a, c, |x, y| b32(f32_le(x, y))),
+            F32x4Ge => zip_u32x4(a, c, |x, y| b32(f32_ge(x, y))),
+            F64x2Add => zip_u64x2(a, c, f64_add),
+            F64x2Sub => zip_u64x2(a, c, f64_sub),
+            F64x2Mul => zip_u64x2(a, c, f64_mul),
+            F64x2Div => zip_u64x2(a, c, f64_div),
+            F64x2Min => zip_u64x2(a, c, f64_min),
+            F64x2Max => zip_u64x2(a, c, f64_max),
+            F64x2PMin => zip_u64x2(a, c, f64_pmin),
+            F64x2PMax => zip_u64x2(a, c, f64_pmax),
+            F64x2Eq => zip_u64x2(a, c, |x, y| b64(f64_eq(x, y))),
+            F64x2Ne => zip_u64x2(a, c, |x, y| b64(f64_ne(x, y))),
+            F64x2Lt => zip_u64x2(a, c, |x, y| b64(f64_lt(x, y))),
+            F64x2Gt => zip_u64x2(a, c, |x, y| b64(f64_gt(x, y))),
+            F64x2Le => zip_u64x2(a, c, |x, y| b64(f64_le(x, y))),
+            F64x2Ge => zip_u64x2(a, c, |x, y| b64(f64_ge(x, y))),
+            _ => return Err(TrapCode::Unreachable),
+        })),
+        _ => Err(TrapCode::Unreachable),
+    }
+}
+
+pub(crate) fn eval_binop(op: BinOp, l: Val, r: Val) -> Result<Val, TrapCode> {
+    let code = op.to_u8();
+    if code <= BinOp::I64Rotr.to_u8() {
+        eval_binop_int(op, l, r)
+    } else if code <= BinOp::F64Ge.to_u8() {
+        eval_binop_fp(op, l, r)
+    } else {
+        eval_binop_simd(op, l, r)
     }
 }

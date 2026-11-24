@@ -7,67 +7,110 @@
 
 use alloc::{string::String, vec::Vec};
 
-/// Primitive WebAssembly scalar value types supported in `GnomonIR`.
+/// Primitive WebAssembly scalar and SIMD value types supported in `GnomonIR`.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum ValType {
     I32,
     I64,
+    F32,
+    F64,
+    V128,
 }
 
 impl ValType {
-    pub(crate) const fn to_u8(self) -> u8 {
+    pub const fn to_u8(self) -> u8 {
         match self {
             Self::I32 => 0,
             Self::I64 => 1,
+            Self::F32 => 2,
+            Self::F64 => 3,
+            Self::V128 => 4,
         }
     }
 
-    pub(crate) const fn from_u8(v: u8) -> Option<Self> {
+    pub const fn from_u8(v: u8) -> Option<Self> {
         match v {
             0 => Some(Self::I32),
             1 => Some(Self::I64),
+            2 => Some(Self::F32),
+            3 => Some(Self::F64),
+            4 => Some(Self::V128),
             _ => None,
         }
     }
 }
 
-/// Runtime scalar value with exact two's-complement bit width.
+/// Runtime value with exact deterministic bit representation (two's-complement integers,
+/// raw IEEE-754 `u32`/`u64` bit patterns, and little-endian `u128` SIMD vectors).
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum Val {
     I32(i32),
     I64(i64),
+    F32(u32),
+    F64(u64),
+    V128(u128),
 }
 
 impl Val {
-    pub fn val_type(self) -> ValType {
+    pub const fn val_type(self) -> ValType {
         match self {
             Self::I32(_) => ValType::I32,
             Self::I64(_) => ValType::I64,
+            Self::F32(_) => ValType::F32,
+            Self::F64(_) => ValType::F64,
+            Self::V128(_) => ValType::V128,
         }
     }
-    pub fn default_for(ty: ValType) -> Self {
+    pub const fn default_for(ty: ValType) -> Self {
         match ty {
             ValType::I32 => Self::I32(0),
             ValType::I64 => Self::I64(0),
+            ValType::F32 => Self::F32(0),
+            ValType::F64 => Self::F64(0),
+            ValType::V128 => Self::V128(0),
         }
     }
-    pub fn as_i32(self) -> Option<i32> {
+    pub const fn as_i32(self) -> Option<i32> {
         match self {
             Self::I32(v) => Some(v),
-            Self::I64(_) => None,
+            _ => None,
         }
     }
-    pub fn as_i64(self) -> Option<i64> {
+    pub const fn as_i64(self) -> Option<i64> {
         match self {
             Self::I64(v) => Some(v),
-            Self::I32(_) => None,
+            _ => None,
         }
     }
-    pub fn as_u32(self) -> Option<u32> {
-        self.as_i32().map(|v| v as u32)
+    pub const fn as_u32(self) -> Option<u32> {
+        match self {
+            Self::I32(v) => Some(v as u32),
+            _ => None,
+        }
     }
-    pub fn as_u64(self) -> Option<u64> {
-        self.as_i64().map(|v| v as u64)
+    pub const fn as_u64(self) -> Option<u64> {
+        match self {
+            Self::I64(v) => Some(v as u64),
+            _ => None,
+        }
+    }
+    pub const fn as_f32_bits(self) -> Option<u32> {
+        match self {
+            Self::F32(b) => Some(b),
+            _ => None,
+        }
+    }
+    pub const fn as_f64_bits(self) -> Option<u64> {
+        match self {
+            Self::F64(b) => Some(b),
+            _ => None,
+        }
+    }
+    pub const fn as_v128_bits(self) -> Option<u128> {
+        match self {
+            Self::V128(b) => Some(b),
+            _ => None,
+        }
     }
 }
 
@@ -155,6 +198,7 @@ pub enum MemWidth {
     B2 = 2,
     B4 = 4,
     B8 = 8,
+    B16 = 16,
 }
 
 impl MemWidth {
@@ -162,24 +206,77 @@ impl MemWidth {
         self as u64
     }
 
-    pub(crate) const fn to_u8(self) -> u8 {
+    pub const fn to_u8(self) -> u8 {
         self as u8
     }
 
-    pub(crate) const fn from_u8(v: u8) -> Option<Self> {
+    pub const fn from_u8(v: u8) -> Option<Self> {
         match v {
             1 => Some(Self::B1),
             2 => Some(Self::B2),
             4 => Some(Self::B4),
             8 => Some(Self::B8),
+            16 => Some(Self::B16),
             _ => None,
         }
     }
 }
 
-/// Deterministic unary WebAssembly operations.
+/// Lane interpretation for `v128` extract/replace lane operations.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum LaneKind {
+    I8x16S,
+    I8x16U,
+    I16x8S,
+    I16x8U,
+    I32x4,
+    I64x2,
+    F32x4,
+    F64x2,
+}
+
+impl LaneKind {
+    pub const fn to_u8(self) -> u8 {
+        self as u8
+    }
+
+    pub const fn from_u8(v: u8) -> Option<Self> {
+        match v {
+            0 => Some(Self::I8x16S),
+            1 => Some(Self::I8x16U),
+            2 => Some(Self::I16x8S),
+            3 => Some(Self::I16x8U),
+            4 => Some(Self::I32x4),
+            5 => Some(Self::I64x2),
+            6 => Some(Self::F32x4),
+            7 => Some(Self::F64x2),
+            _ => None,
+        }
+    }
+
+    pub const fn num_lanes(self) -> u8 {
+        match self {
+            Self::I8x16S | Self::I8x16U => 16,
+            Self::I16x8S | Self::I16x8U => 8,
+            Self::I32x4 | Self::F32x4 => 4,
+            Self::I64x2 | Self::F64x2 => 2,
+        }
+    }
+
+    pub const fn scalar_ty(self) -> ValType {
+        match self {
+            Self::I8x16S | Self::I8x16U | Self::I16x8S | Self::I16x8U | Self::I32x4 => ValType::I32,
+            Self::I64x2 => ValType::I64,
+            Self::F32x4 => ValType::F32,
+            Self::F64x2 => ValType::F64,
+        }
+    }
+}
+
+/// Deterministic unary WebAssembly scalar and `v128` SIMD operations.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum UnOp {
+    // Integer unary (0..=15)
     I32Eqz,
     I64Eqz,
     I32Clz,
@@ -196,14 +293,106 @@ pub enum UnOp {
     I64Extend8S,
     I64Extend16S,
     I64Extend32S,
+    // Scalar FP unary (16..=29)
+    F32Abs,
+    F32Neg,
+    F32Ceil,
+    F32Floor,
+    F32Trunc,
+    F32Nearest,
+    F32Sqrt,
+    F64Abs,
+    F64Neg,
+    F64Ceil,
+    F64Floor,
+    F64Trunc,
+    F64Nearest,
+    F64Sqrt,
+    // Trapping float-to-int truncations (30..=37)
+    I32TruncF32S,
+    I32TruncF32U,
+    I32TruncF64S,
+    I32TruncF64U,
+    I64TruncF32S,
+    I64TruncF32U,
+    I64TruncF64S,
+    I64TruncF64U,
+    // Saturating float-to-int truncations (38..=45)
+    I32TruncSatF32S,
+    I32TruncSatF32U,
+    I32TruncSatF64S,
+    I32TruncSatF64U,
+    I64TruncSatF32S,
+    I64TruncSatF32U,
+    I64TruncSatF64S,
+    I64TruncSatF64U,
+    // Int-to-float conversions (46..=53)
+    F32ConvertI32S,
+    F32ConvertI32U,
+    F32ConvertI64S,
+    F32ConvertI64U,
+    F64ConvertI32S,
+    F64ConvertI32U,
+    F64ConvertI64S,
+    F64ConvertI64U,
+    // Demote / Promote / Reinterpret (54..=59)
+    F32DemoteF64,
+    F64PromoteF32,
+    I32ReinterpretF32,
+    I64ReinterpretF64,
+    F32ReinterpretI32,
+    F64ReinterpretI64,
+    // v128 unary / splat / bitmask / lane-convert (60..=95)
+    V128Not,
+    V128AnyTrue,
+    I8x16Splat,
+    I16x8Splat,
+    I32x4Splat,
+    I64x2Splat,
+    F32x4Splat,
+    F64x2Splat,
+    I8x16Bitmask,
+    I16x8Bitmask,
+    I32x4Bitmask,
+    I64x2Bitmask,
+    I32x4AllTrue,
+    I64x2AllTrue,
+    I32x4Abs,
+    I32x4Neg,
+    I64x2Abs,
+    I64x2Neg,
+    F32x4Abs,
+    F32x4Neg,
+    F32x4Sqrt,
+    F32x4Ceil,
+    F32x4Floor,
+    F32x4Trunc,
+    F32x4Nearest,
+    F64x2Abs,
+    F64x2Neg,
+    F64x2Sqrt,
+    F64x2Ceil,
+    F64x2Floor,
+    F64x2Trunc,
+    F64x2Nearest,
+    I32x4TruncSatF32x4S,
+    I32x4TruncSatF32x4U,
+    F32x4ConvertI32x4S,
+    F32x4ConvertI32x4U,
+    I64x2ExtendLowI32x4S,
+    I64x2ExtendLowI32x4U,
+    I64x2ExtendHighI32x4S,
+    I64x2ExtendHighI32x4U,
 }
 
 impl UnOp {
-    pub(crate) const fn to_u8(self) -> u8 {
+    pub const COUNT: u8 = 100;
+
+    pub const fn to_u8(self) -> u8 {
         self as u8
     }
 
-    pub(crate) const fn from_u8(v: u8) -> Option<Self> {
+    pub const fn from_u8(v: u8) -> Option<Self> {
         match v {
             0 => Some(Self::I32Eqz),
             1 => Some(Self::I64Eqz),
@@ -221,12 +410,112 @@ impl UnOp {
             13 => Some(Self::I64Extend8S),
             14 => Some(Self::I64Extend16S),
             15 => Some(Self::I64Extend32S),
+            16 => Some(Self::F32Abs),
+            17 => Some(Self::F32Neg),
+            18 => Some(Self::F32Ceil),
+            19 => Some(Self::F32Floor),
+            20 => Some(Self::F32Trunc),
+            21 => Some(Self::F32Nearest),
+            22 => Some(Self::F32Sqrt),
+            23 => Some(Self::F64Abs),
+            24 => Some(Self::F64Neg),
+            25 => Some(Self::F64Ceil),
+            26 => Some(Self::F64Floor),
+            27 => Some(Self::F64Trunc),
+            28 => Some(Self::F64Nearest),
+            29 => Some(Self::F64Sqrt),
+            30 => Some(Self::I32TruncF32S),
+            31 => Some(Self::I32TruncF32U),
+            32 => Some(Self::I32TruncF64S),
+            33 => Some(Self::I32TruncF64U),
+            34 => Some(Self::I64TruncF32S),
+            35 => Some(Self::I64TruncF32U),
+            36 => Some(Self::I64TruncF64S),
+            37 => Some(Self::I64TruncF64U),
+            38 => Some(Self::I32TruncSatF32S),
+            39 => Some(Self::I32TruncSatF32U),
+            40 => Some(Self::I32TruncSatF64S),
+            41 => Some(Self::I32TruncSatF64U),
+            42 => Some(Self::I64TruncSatF32S),
+            43 => Some(Self::I64TruncSatF32U),
+            44 => Some(Self::I64TruncSatF64S),
+            45 => Some(Self::I64TruncSatF64U),
+            46 => Some(Self::F32ConvertI32S),
+            47 => Some(Self::F32ConvertI32U),
+            48 => Some(Self::F32ConvertI64S),
+            49 => Some(Self::F32ConvertI64U),
+            50 => Some(Self::F64ConvertI32S),
+            51 => Some(Self::F64ConvertI32U),
+            52 => Some(Self::F64ConvertI64S),
+            53 => Some(Self::F64ConvertI64U),
+            54 => Some(Self::F32DemoteF64),
+            55 => Some(Self::F64PromoteF32),
+            56 => Some(Self::I32ReinterpretF32),
+            57 => Some(Self::I64ReinterpretF64),
+            58 => Some(Self::F32ReinterpretI32),
+            59 => Some(Self::F64ReinterpretI64),
+            60 => Some(Self::V128Not),
+            61 => Some(Self::V128AnyTrue),
+            62 => Some(Self::I8x16Splat),
+            63 => Some(Self::I16x8Splat),
+            64 => Some(Self::I32x4Splat),
+            65 => Some(Self::I64x2Splat),
+            66 => Some(Self::F32x4Splat),
+            67 => Some(Self::F64x2Splat),
+            68 => Some(Self::I8x16Bitmask),
+            69 => Some(Self::I16x8Bitmask),
+            70 => Some(Self::I32x4Bitmask),
+            71 => Some(Self::I64x2Bitmask),
+            72 => Some(Self::I32x4AllTrue),
+            73 => Some(Self::I64x2AllTrue),
+            74 => Some(Self::I32x4Abs),
+            75 => Some(Self::I32x4Neg),
+            76 => Some(Self::I64x2Abs),
+            77 => Some(Self::I64x2Neg),
+            78 => Some(Self::F32x4Abs),
+            79 => Some(Self::F32x4Neg),
+            80 => Some(Self::F32x4Sqrt),
+            81 => Some(Self::F32x4Ceil),
+            82 => Some(Self::F32x4Floor),
+            83 => Some(Self::F32x4Trunc),
+            84 => Some(Self::F32x4Nearest),
+            85 => Some(Self::F64x2Abs),
+            86 => Some(Self::F64x2Neg),
+            87 => Some(Self::F64x2Sqrt),
+            88 => Some(Self::F64x2Ceil),
+            89 => Some(Self::F64x2Floor),
+            90 => Some(Self::F64x2Trunc),
+            91 => Some(Self::F64x2Nearest),
+            92 => Some(Self::I32x4TruncSatF32x4S),
+            93 => Some(Self::I32x4TruncSatF32x4U),
+            94 => Some(Self::F32x4ConvertI32x4S),
+            95 => Some(Self::F32x4ConvertI32x4U),
+            96 => Some(Self::I64x2ExtendLowI32x4S),
+            97 => Some(Self::I64x2ExtendLowI32x4U),
+            98 => Some(Self::I64x2ExtendHighI32x4S),
+            99 => Some(Self::I64x2ExtendHighI32x4U),
             _ => None,
         }
     }
 
-    pub fn input_ty(self) -> ValType {
+    pub const fn input_ty(self) -> ValType {
         match self {
+            Self::I32Eqz
+            | Self::I32Clz
+            | Self::I32Ctz
+            | Self::I32Popcnt
+            | Self::I64ExtendI32S
+            | Self::I64ExtendI32U
+            | Self::I32Extend8S
+            | Self::I32Extend16S
+            | Self::F32ConvertI32S
+            | Self::F32ConvertI32U
+            | Self::F64ConvertI32S
+            | Self::F64ConvertI32U
+            | Self::F32ReinterpretI32
+            | Self::I8x16Splat
+            | Self::I16x8Splat
+            | Self::I32x4Splat => ValType::I32,
             Self::I64Eqz
             | Self::I64Clz
             | Self::I64Ctz
@@ -234,12 +523,112 @@ impl UnOp {
             | Self::I32WrapI64
             | Self::I64Extend8S
             | Self::I64Extend16S
-            | Self::I64Extend32S => ValType::I64,
-            _ => ValType::I32,
+            | Self::I64Extend32S
+            | Self::F32ConvertI64S
+            | Self::F32ConvertI64U
+            | Self::F64ConvertI64S
+            | Self::F64ConvertI64U
+            | Self::F64ReinterpretI64
+            | Self::I64x2Splat => ValType::I64,
+            Self::F32Abs
+            | Self::F32Neg
+            | Self::F32Ceil
+            | Self::F32Floor
+            | Self::F32Trunc
+            | Self::F32Nearest
+            | Self::F32Sqrt
+            | Self::I32TruncF32S
+            | Self::I32TruncF32U
+            | Self::I64TruncF32S
+            | Self::I64TruncF32U
+            | Self::I32TruncSatF32S
+            | Self::I32TruncSatF32U
+            | Self::I64TruncSatF32S
+            | Self::I64TruncSatF32U
+            | Self::F64PromoteF32
+            | Self::I32ReinterpretF32
+            | Self::F32x4Splat => ValType::F32,
+            Self::F64Abs
+            | Self::F64Neg
+            | Self::F64Ceil
+            | Self::F64Floor
+            | Self::F64Trunc
+            | Self::F64Nearest
+            | Self::F64Sqrt
+            | Self::I32TruncF64S
+            | Self::I32TruncF64U
+            | Self::I64TruncF64S
+            | Self::I64TruncF64U
+            | Self::I32TruncSatF64S
+            | Self::I32TruncSatF64U
+            | Self::I64TruncSatF64S
+            | Self::I64TruncSatF64U
+            | Self::F32DemoteF64
+            | Self::I64ReinterpretF64
+            | Self::F64x2Splat => ValType::F64,
+            Self::V128Not
+            | Self::V128AnyTrue
+            | Self::I8x16Bitmask
+            | Self::I16x8Bitmask
+            | Self::I32x4Bitmask
+            | Self::I64x2Bitmask
+            | Self::I32x4AllTrue
+            | Self::I64x2AllTrue
+            | Self::I32x4Abs
+            | Self::I32x4Neg
+            | Self::I64x2Abs
+            | Self::I64x2Neg
+            | Self::F32x4Abs
+            | Self::F32x4Neg
+            | Self::F32x4Sqrt
+            | Self::F32x4Ceil
+            | Self::F32x4Floor
+            | Self::F32x4Trunc
+            | Self::F32x4Nearest
+            | Self::F64x2Abs
+            | Self::F64x2Neg
+            | Self::F64x2Sqrt
+            | Self::F64x2Ceil
+            | Self::F64x2Floor
+            | Self::F64x2Trunc
+            | Self::F64x2Nearest
+            | Self::I32x4TruncSatF32x4S
+            | Self::I32x4TruncSatF32x4U
+            | Self::F32x4ConvertI32x4S
+            | Self::F32x4ConvertI32x4U
+            | Self::I64x2ExtendLowI32x4S
+            | Self::I64x2ExtendLowI32x4U
+            | Self::I64x2ExtendHighI32x4S
+            | Self::I64x2ExtendHighI32x4U => ValType::V128,
         }
     }
-    pub fn output_ty(self) -> ValType {
+
+    pub const fn output_ty(self) -> ValType {
         match self {
+            Self::I32Eqz
+            | Self::I64Eqz
+            | Self::I32Clz
+            | Self::I32Ctz
+            | Self::I32Popcnt
+            | Self::I32WrapI64
+            | Self::I32Extend8S
+            | Self::I32Extend16S
+            | Self::I32TruncF32S
+            | Self::I32TruncF32U
+            | Self::I32TruncF64S
+            | Self::I32TruncF64U
+            | Self::I32TruncSatF32S
+            | Self::I32TruncSatF32U
+            | Self::I32TruncSatF64S
+            | Self::I32TruncSatF64U
+            | Self::I32ReinterpretF32
+            | Self::V128AnyTrue
+            | Self::I8x16Bitmask
+            | Self::I16x8Bitmask
+            | Self::I32x4Bitmask
+            | Self::I64x2Bitmask
+            | Self::I32x4AllTrue
+            | Self::I64x2AllTrue => ValType::I32,
             Self::I64Clz
             | Self::I64Ctz
             | Self::I64Popcnt
@@ -247,15 +636,83 @@ impl UnOp {
             | Self::I64ExtendI32U
             | Self::I64Extend8S
             | Self::I64Extend16S
-            | Self::I64Extend32S => ValType::I64,
-            _ => ValType::I32,
+            | Self::I64Extend32S
+            | Self::I64TruncF32S
+            | Self::I64TruncF32U
+            | Self::I64TruncF64S
+            | Self::I64TruncF64U
+            | Self::I64TruncSatF32S
+            | Self::I64TruncSatF32U
+            | Self::I64TruncSatF64S
+            | Self::I64TruncSatF64U
+            | Self::I64ReinterpretF64 => ValType::I64,
+            Self::F32Abs
+            | Self::F32Neg
+            | Self::F32Ceil
+            | Self::F32Floor
+            | Self::F32Trunc
+            | Self::F32Nearest
+            | Self::F32Sqrt
+            | Self::F32ConvertI32S
+            | Self::F32ConvertI32U
+            | Self::F32ConvertI64S
+            | Self::F32ConvertI64U
+            | Self::F32DemoteF64
+            | Self::F32ReinterpretI32 => ValType::F32,
+            Self::F64Abs
+            | Self::F64Neg
+            | Self::F64Ceil
+            | Self::F64Floor
+            | Self::F64Trunc
+            | Self::F64Nearest
+            | Self::F64Sqrt
+            | Self::F64ConvertI32S
+            | Self::F64ConvertI32U
+            | Self::F64ConvertI64S
+            | Self::F64ConvertI64U
+            | Self::F64PromoteF32
+            | Self::F64ReinterpretI64 => ValType::F64,
+            Self::V128Not
+            | Self::I8x16Splat
+            | Self::I16x8Splat
+            | Self::I32x4Splat
+            | Self::I64x2Splat
+            | Self::F32x4Splat
+            | Self::F64x2Splat
+            | Self::I32x4Abs
+            | Self::I32x4Neg
+            | Self::I64x2Abs
+            | Self::I64x2Neg
+            | Self::F32x4Abs
+            | Self::F32x4Neg
+            | Self::F32x4Sqrt
+            | Self::F32x4Ceil
+            | Self::F32x4Floor
+            | Self::F32x4Trunc
+            | Self::F32x4Nearest
+            | Self::F64x2Abs
+            | Self::F64x2Neg
+            | Self::F64x2Sqrt
+            | Self::F64x2Ceil
+            | Self::F64x2Floor
+            | Self::F64x2Trunc
+            | Self::F64x2Nearest
+            | Self::I32x4TruncSatF32x4S
+            | Self::I32x4TruncSatF32x4U
+            | Self::F32x4ConvertI32x4S
+            | Self::F32x4ConvertI32x4U
+            | Self::I64x2ExtendLowI32x4S
+            | Self::I64x2ExtendLowI32x4U
+            | Self::I64x2ExtendHighI32x4S
+            | Self::I64x2ExtendHighI32x4U => ValType::V128,
         }
     }
 }
 
-/// Deterministic binary WebAssembly operations.
+/// Deterministic binary WebAssembly scalar and `v128` SIMD operations.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum BinOp {
+    // Integer binary (0..=49)
     I32Eq,
     I32Ne,
     I32LtS,
@@ -306,14 +763,113 @@ pub enum BinOp {
     I64ShrU,
     I64Rotl,
     I64Rotr,
+    // Scalar FP binary (50..=75)
+    F32Add,
+    F32Sub,
+    F32Mul,
+    F32Div,
+    F32Min,
+    F32Max,
+    F32Copysign,
+    F32Eq,
+    F32Ne,
+    F32Lt,
+    F32Gt,
+    F32Le,
+    F32Ge,
+    F64Add,
+    F64Sub,
+    F64Mul,
+    F64Div,
+    F64Min,
+    F64Max,
+    F64Copysign,
+    F64Eq,
+    F64Ne,
+    F64Lt,
+    F64Gt,
+    F64Le,
+    F64Ge,
+    // v128 bitwise & swizzle (76..=80)
+    V128And,
+    V128AndNot,
+    V128Or,
+    V128Xor,
+    I8x16Swizzle,
+    // i32x4 lane binary (81..=100)
+    I32x4Add,
+    I32x4Sub,
+    I32x4Mul,
+    I32x4MinS,
+    I32x4MinU,
+    I32x4MaxS,
+    I32x4MaxU,
+    I32x4Eq,
+    I32x4Ne,
+    I32x4LtS,
+    I32x4LtU,
+    I32x4GtS,
+    I32x4GtU,
+    I32x4LeS,
+    I32x4LeU,
+    I32x4GeS,
+    I32x4GeU,
+    I32x4Shl,
+    I32x4ShrS,
+    I32x4ShrU,
+    // i64x2 lane binary (101..=112)
+    I64x2Add,
+    I64x2Sub,
+    I64x2Mul,
+    I64x2Eq,
+    I64x2Ne,
+    I64x2LtS,
+    I64x2GtS,
+    I64x2LeS,
+    I64x2GeS,
+    I64x2Shl,
+    I64x2ShrS,
+    I64x2ShrU,
+    // f32x4 lane binary (113..=126)
+    F32x4Add,
+    F32x4Sub,
+    F32x4Mul,
+    F32x4Div,
+    F32x4Min,
+    F32x4Max,
+    F32x4PMin,
+    F32x4PMax,
+    F32x4Eq,
+    F32x4Ne,
+    F32x4Lt,
+    F32x4Gt,
+    F32x4Le,
+    F32x4Ge,
+    // f64x2 lane binary (127..=140)
+    F64x2Add,
+    F64x2Sub,
+    F64x2Mul,
+    F64x2Div,
+    F64x2Min,
+    F64x2Max,
+    F64x2PMin,
+    F64x2PMax,
+    F64x2Eq,
+    F64x2Ne,
+    F64x2Lt,
+    F64x2Gt,
+    F64x2Le,
+    F64x2Ge,
 }
 
 impl BinOp {
-    pub(crate) const fn to_u8(self) -> u8 {
+    pub const COUNT: u8 = 141;
+
+    pub const fn to_u8(self) -> u8 {
         self as u8
     }
 
-    pub(crate) const fn from_u8(v: u8) -> Option<Self> {
+    pub const fn from_u8(v: u8) -> Option<Self> {
         match v {
             0 => Some(Self::I32Eq),
             1 => Some(Self::I32Ne),
@@ -365,27 +921,152 @@ impl BinOp {
             47 => Some(Self::I64ShrU),
             48 => Some(Self::I64Rotl),
             49 => Some(Self::I64Rotr),
+            50 => Some(Self::F32Add),
+            51 => Some(Self::F32Sub),
+            52 => Some(Self::F32Mul),
+            53 => Some(Self::F32Div),
+            54 => Some(Self::F32Min),
+            55 => Some(Self::F32Max),
+            56 => Some(Self::F32Copysign),
+            57 => Some(Self::F32Eq),
+            58 => Some(Self::F32Ne),
+            59 => Some(Self::F32Lt),
+            60 => Some(Self::F32Gt),
+            61 => Some(Self::F32Le),
+            62 => Some(Self::F32Ge),
+            63 => Some(Self::F64Add),
+            64 => Some(Self::F64Sub),
+            65 => Some(Self::F64Mul),
+            66 => Some(Self::F64Div),
+            67 => Some(Self::F64Min),
+            68 => Some(Self::F64Max),
+            69 => Some(Self::F64Copysign),
+            70 => Some(Self::F64Eq),
+            71 => Some(Self::F64Ne),
+            72 => Some(Self::F64Lt),
+            73 => Some(Self::F64Gt),
+            74 => Some(Self::F64Le),
+            75 => Some(Self::F64Ge),
+            76 => Some(Self::V128And),
+            77 => Some(Self::V128AndNot),
+            78 => Some(Self::V128Or),
+            79 => Some(Self::V128Xor),
+            80 => Some(Self::I8x16Swizzle),
+            81 => Some(Self::I32x4Add),
+            82 => Some(Self::I32x4Sub),
+            83 => Some(Self::I32x4Mul),
+            84 => Some(Self::I32x4MinS),
+            85 => Some(Self::I32x4MinU),
+            86 => Some(Self::I32x4MaxS),
+            87 => Some(Self::I32x4MaxU),
+            88 => Some(Self::I32x4Eq),
+            89 => Some(Self::I32x4Ne),
+            90 => Some(Self::I32x4LtS),
+            91 => Some(Self::I32x4LtU),
+            92 => Some(Self::I32x4GtS),
+            93 => Some(Self::I32x4GtU),
+            94 => Some(Self::I32x4LeS),
+            95 => Some(Self::I32x4LeU),
+            96 => Some(Self::I32x4GeS),
+            97 => Some(Self::I32x4GeU),
+            98 => Some(Self::I32x4Shl),
+            99 => Some(Self::I32x4ShrS),
+            100 => Some(Self::I32x4ShrU),
+            101 => Some(Self::I64x2Add),
+            102 => Some(Self::I64x2Sub),
+            103 => Some(Self::I64x2Mul),
+            104 => Some(Self::I64x2Eq),
+            105 => Some(Self::I64x2Ne),
+            106 => Some(Self::I64x2LtS),
+            107 => Some(Self::I64x2GtS),
+            108 => Some(Self::I64x2LeS),
+            109 => Some(Self::I64x2GeS),
+            110 => Some(Self::I64x2Shl),
+            111 => Some(Self::I64x2ShrS),
+            112 => Some(Self::I64x2ShrU),
+            113 => Some(Self::F32x4Add),
+            114 => Some(Self::F32x4Sub),
+            115 => Some(Self::F32x4Mul),
+            116 => Some(Self::F32x4Div),
+            117 => Some(Self::F32x4Min),
+            118 => Some(Self::F32x4Max),
+            119 => Some(Self::F32x4PMin),
+            120 => Some(Self::F32x4PMax),
+            121 => Some(Self::F32x4Eq),
+            122 => Some(Self::F32x4Ne),
+            123 => Some(Self::F32x4Lt),
+            124 => Some(Self::F32x4Gt),
+            125 => Some(Self::F32x4Le),
+            126 => Some(Self::F32x4Ge),
+            127 => Some(Self::F64x2Add),
+            128 => Some(Self::F64x2Sub),
+            129 => Some(Self::F64x2Mul),
+            130 => Some(Self::F64x2Div),
+            131 => Some(Self::F64x2Min),
+            132 => Some(Self::F64x2Max),
+            133 => Some(Self::F64x2PMin),
+            134 => Some(Self::F64x2PMax),
+            135 => Some(Self::F64x2Eq),
+            136 => Some(Self::F64x2Ne),
+            137 => Some(Self::F64x2Lt),
+            138 => Some(Self::F64x2Gt),
+            139 => Some(Self::F64x2Le),
+            140 => Some(Self::F64x2Ge),
             _ => None,
         }
     }
 
-    pub fn operand_ty(self) -> ValType {
+    pub const fn lhs_ty(self) -> ValType {
         let x = self as u8;
-        if (Self::I64Eq as u8..=Self::I64GeU as u8).contains(&x)
-            || (Self::I64Add as u8..=Self::I64RemU as u8).contains(&x)
-            || x >= Self::I64And as u8
+        if x <= Self::I32GeU as u8
+            || (x >= Self::I32Add as u8 && x <= Self::I32RemU as u8)
+            || (x >= Self::I32And as u8 && x <= Self::I32Rotr as u8)
         {
-            ValType::I64
-        } else {
             ValType::I32
+        } else if x <= Self::I64Rotr as u8 {
+            ValType::I64
+        } else if x <= Self::F32Ge as u8 {
+            ValType::F32
+        } else if x <= Self::F64Ge as u8 {
+            ValType::F64
+        } else {
+            ValType::V128
         }
     }
-    pub fn output_ty(self) -> ValType {
+
+    pub const fn rhs_ty(self) -> ValType {
+        match self {
+            Self::I32x4Shl
+            | Self::I32x4ShrS
+            | Self::I32x4ShrU
+            | Self::I64x2Shl
+            | Self::I64x2ShrS
+            | Self::I64x2ShrU => ValType::I32,
+            _ => self.lhs_ty(),
+        }
+    }
+
+    pub const fn operand_ty(self) -> ValType {
+        self.lhs_ty()
+    }
+
+    pub const fn output_ty(self) -> ValType {
         let x = self as u8;
-        if (Self::I64Add as u8..=Self::I64RemU as u8).contains(&x) || x >= Self::I64And as u8 {
-            ValType::I64
-        } else {
+        if x <= Self::I64GeU as u8
+            || (x >= Self::I32Add as u8 && x <= Self::I32RemU as u8)
+            || (x >= Self::I32And as u8 && x <= Self::I32Rotr as u8)
+            || (x >= Self::F32Eq as u8 && x <= Self::F32Ge as u8)
+            || (x >= Self::F64Eq as u8 && x <= Self::F64Ge as u8)
+        {
             ValType::I32
+        } else if x <= Self::I64Rotr as u8 {
+            ValType::I64
+        } else if x <= Self::F32Copysign as u8 {
+            ValType::F32
+        } else if x <= Self::F64Copysign as u8 {
+            ValType::F64
+        } else {
+            ValType::V128
         }
     }
 }
@@ -395,6 +1076,9 @@ impl BinOp {
 pub enum Op {
     ConstI32(i32),
     ConstI64(i64),
+    ConstF32(u32),
+    ConstF64(u64),
+    ConstV128(u128),
     Copy(ValId),
     Select { cond: ValId, true_val: ValId, false_val: ValId },
     GlobalGet(GlobalId),
@@ -403,6 +1087,10 @@ pub enum Op {
     Load { mem: MemId, addr: ValId, offset: u32, width: MemWidth, signed: bool, result_ty: ValType },
     MemorySize(MemId),
     MemoryGrow { mem: MemId, delta: ValId },
+    SimdExtractLane { kind: LaneKind, lane: u8, vec: ValId },
+    SimdReplaceLane { kind: LaneKind, lane: u8, vec: ValId, val: ValId },
+    SimdBitselect { a: ValId, b: ValId, mask: ValId },
+    SimdShuffle { lhs: ValId, rhs: ValId, lanes: [u8; 16] },
 }
 
 /// Side-effecting statement primitive in `GnomonIR`.
@@ -524,6 +1212,13 @@ pub(crate) const OP_BIN: u8 = 6;
 pub(crate) const OP_LOAD: u8 = 7;
 pub(crate) const OP_MEM_SIZE: u8 = 8;
 pub(crate) const OP_MEM_GROW: u8 = 9;
+pub(crate) const OP_CONST_F32: u8 = 10;
+pub(crate) const OP_CONST_F64: u8 = 11;
+pub(crate) const OP_CONST_V128: u8 = 12;
+pub(crate) const OP_SIMD_EXTRACT_LANE: u8 = 13;
+pub(crate) const OP_SIMD_REPLACE_LANE: u8 = 14;
+pub(crate) const OP_SIMD_BITSELECT: u8 = 15;
+pub(crate) const OP_SIMD_SHUFFLE: u8 = 16;
 
 pub(crate) const EFF_STORE: u8 = 0;
 pub(crate) const EFF_MEM_COPY: u8 = 1;
@@ -644,30 +1339,92 @@ impl IrSlot {
         s
     }
 
+    pub(crate) const fn node_aux_shuffle(lanes: [u8; 16]) -> Self {
+        let mut s = Self::base(TAG_NODE_AUX, 2, 0);
+        s.w0 = u32::from_le_bytes([lanes[0], lanes[1], lanes[2], lanes[3]]);
+        s.w1 = u32::from_le_bytes([lanes[4], lanes[5], lanes[6], lanes[7]]);
+        s.w2 = u32::from_le_bytes([lanes[8], lanes[9], lanes[10], lanes[11]]);
+        s.w3 = u32::from_le_bytes([lanes[12], lanes[13], lanes[14], lanes[15]]);
+        s
+    }
+
+    pub(crate) const fn decode_aux_shuffle(self) -> Option<[u8; 16]> {
+        if self.tag != TAG_NODE_AUX || self.sub != 2 {
+            return None;
+        }
+        let b0 = self.w0.to_le_bytes();
+        let b1 = self.w1.to_le_bytes();
+        let b2 = self.w2.to_le_bytes();
+        let b3 = self.w3.to_le_bytes();
+        Some([
+            b0[0], b0[1], b0[2], b0[3],
+            b1[0], b1[1], b1[2], b1[3],
+            b2[0], b2[1], b2[2], b2[3],
+            b3[0], b3[1], b3[2], b3[3],
+        ])
+    }
+
+    pub(crate) const fn let_simd_shuffle(
+        dst: ValId,
+        ty: ValType,
+        lhs: ValId,
+        rhs: ValId,
+        aux_idx: u32,
+    ) -> Self {
+        let mut s = Self::base(TAG_STMT_LET, OP_SIMD_SHUFFLE, ty.to_u8() as u16);
+        s.w0 = dst.0;
+        s.w1 = lhs.0;
+        s.w2 = rhs.0;
+        s.w3 = aux_idx;
+        s
+    }
+
     pub const fn let_op(dst: ValId, ty: ValType, op: Op) -> Self {
-        let ty_bit = ty.to_u8() as u16;
+        let ty_bits = ty.to_u8() as u16;
         match op {
             Op::ConstI32(x) => {
-                let mut s = Self::base(TAG_STMT_LET, OP_CONST_I32, ty_bit);
+                let mut s = Self::base(TAG_STMT_LET, OP_CONST_I32, ty_bits);
                 s.w0 = dst.0;
                 s.w1 = x as u32;
                 s
             }
             Op::ConstI64(x) => {
-                let mut s = Self::base(TAG_STMT_LET, OP_CONST_I64, ty_bit);
+                let mut s = Self::base(TAG_STMT_LET, OP_CONST_I64, ty_bits);
                 s.w0 = dst.0;
                 s.w1 = x as u32;
                 s.w2 = ((x as u64) >> 32) as u32;
                 s
             }
+            Op::ConstF32(bits) => {
+                let mut s = Self::base(TAG_STMT_LET, OP_CONST_F32, ty_bits);
+                s.w0 = dst.0;
+                s.w1 = bits;
+                s
+            }
+            Op::ConstF64(bits) => {
+                let mut s = Self::base(TAG_STMT_LET, OP_CONST_F64, ty_bits);
+                s.w0 = dst.0;
+                s.w1 = bits as u32;
+                s.w2 = (bits >> 32) as u32;
+                s
+            }
+            Op::ConstV128(bits) => {
+                let mut s = Self::base(TAG_STMT_LET, OP_CONST_V128, ty_bits);
+                s.w0 = dst.0;
+                s.w1 = bits as u32;
+                s.w2 = (bits >> 32) as u32;
+                s.w3 = (bits >> 64) as u32;
+                s.w4 = (bits >> 96) as u32;
+                s
+            }
             Op::Copy(v) => {
-                let mut s = Self::base(TAG_STMT_LET, OP_COPY, ty_bit);
+                let mut s = Self::base(TAG_STMT_LET, OP_COPY, ty_bits);
                 s.w0 = dst.0;
                 s.w1 = v.0;
                 s
             }
             Op::Select { cond, true_val, false_val } => {
-                let mut s = Self::base(TAG_STMT_LET, OP_SELECT, ty_bit);
+                let mut s = Self::base(TAG_STMT_LET, OP_SELECT, ty_bits);
                 s.w0 = dst.0;
                 s.w1 = cond.0;
                 s.w2 = true_val.0;
@@ -675,31 +1432,31 @@ impl IrSlot {
                 s
             }
             Op::GlobalGet(id) => {
-                let mut s = Self::base(TAG_STMT_LET, OP_GLOBAL_GET, ty_bit);
+                let mut s = Self::base(TAG_STMT_LET, OP_GLOBAL_GET, ty_bits);
                 s.w0 = dst.0;
                 s.w1 = id.0;
                 s
             }
             Op::Un(u, v) => {
                 let mut s =
-                    Self::base(TAG_STMT_LET, OP_UN, ty_bit | ((u.to_u8() as u16) << 1));
+                    Self::base(TAG_STMT_LET, OP_UN, ty_bits | ((u.to_u8() as u16) << 3));
                 s.w0 = dst.0;
                 s.w1 = v.0;
                 s
             }
             Op::Bin(b, l, r) => {
                 let mut s =
-                    Self::base(TAG_STMT_LET, OP_BIN, ty_bit | ((b.to_u8() as u16) << 1));
+                    Self::base(TAG_STMT_LET, OP_BIN, ty_bits | ((b.to_u8() as u16) << 3));
                 s.w0 = dst.0;
                 s.w1 = l.0;
                 s.w2 = r.0;
                 s
             }
             Op::Load { mem, addr, offset, width, signed, result_ty } => {
-                let aux = ty_bit
-                    | ((width.to_u8() as u16) << 1)
-                    | ((signed as u16) << 5)
-                    | ((result_ty.to_u8() as u16) << 6);
+                let aux = ty_bits
+                    | ((width.to_u8() as u16) << 3)
+                    | ((signed as u16) << 8)
+                    | ((result_ty.to_u8() as u16) << 9);
                 let mut s = Self::base(TAG_STMT_LET, OP_LOAD, aux);
                 s.w0 = dst.0;
                 s.w1 = mem.0 as u32;
@@ -708,17 +1465,43 @@ impl IrSlot {
                 s
             }
             Op::MemorySize(mem) => {
-                let mut s = Self::base(TAG_STMT_LET, OP_MEM_SIZE, ty_bit);
+                let mut s = Self::base(TAG_STMT_LET, OP_MEM_SIZE, ty_bits);
                 s.w0 = dst.0;
                 s.w1 = mem.0 as u32;
                 s
             }
             Op::MemoryGrow { mem, delta } => {
-                let mut s = Self::base(TAG_STMT_LET, OP_MEM_GROW, ty_bit);
+                let mut s = Self::base(TAG_STMT_LET, OP_MEM_GROW, ty_bits);
                 s.w0 = dst.0;
                 s.w1 = mem.0 as u32;
                 s.w2 = delta.0;
                 s
+            }
+            Op::SimdExtractLane { kind, lane, vec } => {
+                let aux = ty_bits | ((kind.to_u8() as u16) << 3) | ((lane as u16) << 8);
+                let mut s = Self::base(TAG_STMT_LET, OP_SIMD_EXTRACT_LANE, aux);
+                s.w0 = dst.0;
+                s.w1 = vec.0;
+                s
+            }
+            Op::SimdReplaceLane { kind, lane, vec, val } => {
+                let aux = ty_bits | ((kind.to_u8() as u16) << 3) | ((lane as u16) << 8);
+                let mut s = Self::base(TAG_STMT_LET, OP_SIMD_REPLACE_LANE, aux);
+                s.w0 = dst.0;
+                s.w1 = vec.0;
+                s.w2 = val.0;
+                s
+            }
+            Op::SimdBitselect { a, b, mask } => {
+                let mut s = Self::base(TAG_STMT_LET, OP_SIMD_BITSELECT, ty_bits);
+                s.w0 = dst.0;
+                s.w1 = a.0;
+                s.w2 = b.0;
+                s.w3 = mask.0;
+                s
+            }
+            Op::SimdShuffle { lhs, rhs, .. } => {
+                Self::let_simd_shuffle(dst, ty, lhs, rhs, u32::MAX)
             }
         }
     }
@@ -926,14 +1709,26 @@ impl IrSlot {
     }
 
     pub const fn to_let_op(self) -> Option<(ValId, ValType, Op)> {
+        self.to_let_op_with_pool(&[])
+    }
+
+    pub const fn to_let_op_with_pool(self, pool: &[IrSlot]) -> Option<(ValId, ValType, Op)> {
         if self.tag != TAG_STMT_LET {
             return None;
         }
-        let Some(ty) = ValType::from_u8((self.aux & 1) as u8) else { return None };
+        let Some(ty) = ValType::from_u8((self.aux & 0x7) as u8) else { return None };
         let dst = ValId(self.w0);
         let op = match self.sub {
             OP_CONST_I32 => Op::ConstI32(self.w1 as i32),
             OP_CONST_I64 => Op::ConstI64((((self.w2 as u64) << 32) | (self.w1 as u64)) as i64),
+            OP_CONST_F32 => Op::ConstF32(self.w1),
+            OP_CONST_F64 => Op::ConstF64(((self.w2 as u64) << 32) | (self.w1 as u64)),
+            OP_CONST_V128 => Op::ConstV128(
+                (self.w1 as u128)
+                    | ((self.w2 as u128) << 32)
+                    | ((self.w3 as u128) << 64)
+                    | ((self.w4 as u128) << 96),
+            ),
             OP_COPY => Op::Copy(ValId(self.w1)),
             OP_SELECT => Op::Select {
                 cond: ValId(self.w1),
@@ -942,19 +1737,19 @@ impl IrSlot {
             },
             OP_GLOBAL_GET => Op::GlobalGet(GlobalId(self.w1)),
             OP_UN => {
-                let Some(u) = UnOp::from_u8((self.aux >> 1) as u8) else { return None };
+                let Some(u) = UnOp::from_u8((self.aux >> 3) as u8) else { return None };
                 Op::Un(u, ValId(self.w1))
             }
             OP_BIN => {
-                let Some(b) = BinOp::from_u8((self.aux >> 1) as u8) else { return None };
+                let Some(b) = BinOp::from_u8((self.aux >> 3) as u8) else { return None };
                 Op::Bin(b, ValId(self.w1), ValId(self.w2))
             }
             OP_LOAD => {
-                let Some(width) = MemWidth::from_u8(((self.aux >> 1) & 0xF) as u8) else {
+                let Some(width) = MemWidth::from_u8(((self.aux >> 3) & 0x1F) as u8) else {
                     return None;
                 };
-                let signed = ((self.aux >> 5) & 1) != 0;
-                let Some(result_ty) = ValType::from_u8(((self.aux >> 6) & 1) as u8) else {
+                let signed = ((self.aux >> 8) & 1) != 0;
+                let Some(result_ty) = ValType::from_u8(((self.aux >> 9) & 0x7) as u8) else {
                     return None;
                 };
                 Op::Load {
@@ -968,6 +1763,33 @@ impl IrSlot {
             }
             OP_MEM_SIZE => Op::MemorySize(MemId(self.w1 as u16)),
             OP_MEM_GROW => Op::MemoryGrow { mem: MemId(self.w1 as u16), delta: ValId(self.w2) },
+            OP_SIMD_EXTRACT_LANE => {
+                let Some(kind) = LaneKind::from_u8(((self.aux >> 3) & 0x1F) as u8) else {
+                    return None;
+                };
+                let lane = (self.aux >> 8) as u8;
+                Op::SimdExtractLane { kind, lane, vec: ValId(self.w1) }
+            }
+            OP_SIMD_REPLACE_LANE => {
+                let Some(kind) = LaneKind::from_u8(((self.aux >> 3) & 0x1F) as u8) else {
+                    return None;
+                };
+                let lane = (self.aux >> 8) as u8;
+                Op::SimdReplaceLane { kind, lane, vec: ValId(self.w1), val: ValId(self.w2) }
+            }
+            OP_SIMD_BITSELECT => Op::SimdBitselect {
+                a: ValId(self.w1),
+                b: ValId(self.w2),
+                mask: ValId(self.w3),
+            },
+            OP_SIMD_SHUFFLE => {
+                let aux_i = self.w3 as usize;
+                if aux_i >= pool.len() {
+                    return None;
+                }
+                let Some(lanes) = pool[aux_i].decode_aux_shuffle() else { return None };
+                Op::SimdShuffle { lhs: ValId(self.w1), rhs: ValId(self.w2), lanes }
+            }
             _ => return None,
         };
         Some((dst, ty, op))
@@ -1012,9 +1834,13 @@ impl IrSlot {
     }
 
     pub const fn to_stmt(self) -> Option<Stmt> {
+        self.to_stmt_with_pool(&[])
+    }
+
+    pub const fn to_stmt_with_pool(self, pool: &[IrSlot]) -> Option<Stmt> {
         match self.tag {
             TAG_STMT_LET => {
-                let Some((dst, ty, op)) = self.to_let_op() else { return None };
+                let Some((dst, ty, op)) = self.to_let_op_with_pool(pool) else { return None };
                 Some(Stmt::Let { dst, ty, op })
             }
             TAG_STMT_EFFECT => {
@@ -1078,9 +1904,16 @@ impl IrSlot {
                 s.w4 += offset;
             }
             TAG_NODE_AUX => {
-                (s.w0, s.w1) = shift_pair(s.w0, s.w1, offset);
-                if s.sub == 1 {
+                if s.sub == 0 {
+                    (s.w0, s.w1) = shift_pair(s.w0, s.w1, offset);
+                } else if s.sub == 1 {
+                    (s.w0, s.w1) = shift_pair(s.w0, s.w1, offset);
                     (s.w2, s.w3) = shift_pair(s.w2, s.w3, offset);
+                }
+            }
+            TAG_STMT_LET => {
+                if s.sub == OP_SIMD_SHUFFLE {
+                    s.w3 += offset;
                 }
             }
             TAG_STMT_REGION => {
@@ -1386,6 +2219,12 @@ impl Region {
 
     /// Creates a 1-statement `Block([stmt])` region.
     pub fn single_stmt(stmt: Stmt) -> Self {
+        if let Stmt::Let { dst, ty, op: Op::SimdShuffle { lhs, rhs, lanes } } = stmt {
+            let mut pool = SlotPool::with_capacity(2);
+            pool.push(IrSlot::node_aux_shuffle(lanes));
+            pool.push(IrSlot::let_simd_shuffle(dst, ty, lhs, rhs, 0));
+            return Self { root: RegionNode::Block(Span { start: 1, len: 1 }), pool };
+        }
         Self::single_slot(IrSlot::from_stmt(stmt))
     }
 
@@ -1697,7 +2536,7 @@ impl Region {
     }
 
     pub fn try_stmt(&self, span: Span, idx: u32) -> Option<Stmt> {
-        self.try_stmt_slot(span, idx)?.to_stmt()
+        self.try_stmt_slot(span, idx)?.to_stmt_with_pool(self.pool.as_slice())
     }
 
     pub fn try_val(&self, span: Span, idx: u32) -> Option<ValId> {
@@ -1731,7 +2570,7 @@ impl Region {
     }
 
     pub fn stmts(&self, span: Span) -> StmtIter<'_> {
-        StmtIter(self.slice(span).iter())
+        StmtIter { pool: self.pool.as_slice(), iter: self.slice(span).iter() }
     }
     pub fn vals(&self, span: Span) -> ValIter<'_> {
         ValIter(self.slice(span).iter())
@@ -1776,7 +2615,30 @@ macro_rules! impl_elem_iter {
     };
 }
 
-impl_elem_iter!(StmtIter, Stmt, to_stmt);
+#[derive(Clone)]
+pub struct StmtIter<'a> {
+    pool: &'a [IrSlot],
+    iter: core::slice::Iter<'a, IrSlot>,
+}
+
+impl<'a> Iterator for StmtIter<'a> {
+    type Item = Stmt;
+    fn next(&mut self) -> Option<Self::Item> {
+        self.iter.next()?.to_stmt_with_pool(self.pool)
+    }
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.iter.size_hint()
+    }
+}
+
+impl<'a> DoubleEndedIterator for StmtIter<'a> {
+    fn next_back(&mut self) -> Option<Self::Item> {
+        self.iter.next_back()?.to_stmt_with_pool(self.pool)
+    }
+}
+
+impl<'a> ExactSizeIterator for StmtIter<'a> {}
+
 impl_elem_iter!(ValIter, ValId, to_val);
 impl_elem_iter!(VarIter, (ValId, ValType), to_var);
 impl_elem_iter!(TyIter, ValType, to_ty);
@@ -1894,9 +2756,17 @@ impl Region {
                     if s1.tag != s2.tag {
                         return false;
                     }
-                    if (s1.tag == TAG_STMT_LET && s2.tag == TAG_STMT_LET)
-                        || (s1.tag == TAG_STMT_EFFECT && s2.tag == TAG_STMT_EFFECT)
-                    {
+                    if s1.tag == TAG_STMT_LET && s2.tag == TAG_STMT_LET {
+                        if s1.sub == OP_SIMD_SHUFFLE || s2.sub == OP_SIMD_SHUFFLE {
+                            let d1 = s1.to_let_op_with_pool(a.pool.as_slice());
+                            let d2 = s2.to_let_op_with_pool(b.pool.as_slice());
+                            if d1.is_none() || d1 != d2 {
+                                return false;
+                            }
+                        } else if s1 != s2 {
+                            return false;
+                        }
+                    } else if s1.tag == TAG_STMT_EFFECT && s2.tag == TAG_STMT_EFFECT {
                         if s1 != s2 {
                             return false;
                         }
@@ -2086,9 +2956,21 @@ impl RegionBuilder {
         if stmts.is_empty() {
             return Span::EMPTY;
         }
-        let start = self.pool.len() as u32;
+        let aux_base = self.pool.len() as u32;
         for &s in stmts {
-            self.pool.push(IrSlot::from_stmt(s));
+            if let Stmt::Let { op: Op::SimdShuffle { lanes, .. }, .. } = s {
+                self.pool.push(IrSlot::node_aux_shuffle(lanes));
+            }
+        }
+        let start = self.pool.len() as u32;
+        let mut aux_k = 0u32;
+        for &s in stmts {
+            if let Stmt::Let { dst, ty, op: Op::SimdShuffle { lhs, rhs, .. } } = s {
+                self.pool.push(IrSlot::let_simd_shuffle(dst, ty, lhs, rhs, aux_base + aux_k));
+                aux_k += 1;
+            } else {
+                self.pool.push(IrSlot::from_stmt(s));
+            }
         }
         Span { start, len: stmts.len() as u32 }
     }
@@ -2120,7 +3002,13 @@ impl RegionBuilder {
     }
 
     pub fn push_let(&mut self, dst: ValId, ty: ValType, op: Op) {
-        self.stmts.push(IrSlot::let_op(dst, ty, op));
+        if let Op::SimdShuffle { lhs, rhs, lanes } = op {
+            let aux_idx = self.pool.len() as u32;
+            self.pool.push(IrSlot::node_aux_shuffle(lanes));
+            self.stmts.push(IrSlot::let_simd_shuffle(dst, ty, lhs, rhs, aux_idx));
+        } else {
+            self.stmts.push(IrSlot::let_op(dst, ty, op));
+        }
     }
 
     pub fn push_effect(&mut self, eff: EffectOp) {

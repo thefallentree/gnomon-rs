@@ -969,3 +969,349 @@ fn test_registry_candidate_and_ro_store_spills() {
     assert!(reg2.is_stratum_read_only(StratumId(12)));
     assert!(reg2.candidates().iter().all(|c| c.id != StratumId(12)));
 }
+
+#[test]
+fn test_fp_special_values_rounding_sqrt_and_trunc() {
+    use gnomon_kernel::fp::*;
+    let (m, reg) = empty_mod_reg();
+    let heap = HeapState::from_module(&m, 10_000).unwrap();
+
+    let eval_u = |op: UnOp, v: Val| {
+        let r = Region::build(|b| {
+            b.push_let(ValId(1), op.output_ty(), Op::Un(op, ValId(0)));
+            b.push_yield(&[ValId(1)]);
+        });
+        eval_region(&m, &reg, &r, &[(ValId(0), v)], heap.clone()).map(|(vs, _)| vs[0])
+    };
+    let eval_b = |op: BinOp, l: Val, r_val: Val| {
+        let r = Region::build(|b| {
+            b.push_let(ValId(2), op.output_ty(), Op::Bin(op, ValId(0), ValId(1)));
+            b.push_yield(&[ValId(2)]);
+        });
+        eval_region(&m, &reg, &r, &[(ValId(0), l), (ValId(1), r_val)], heap.clone())
+            .map(|(vs, _)| vs[0])
+    };
+
+    // Bitwise abs / neg / copysign preserve non-canonical NaN payloads verbatim.
+    let custom_snan32: u32 = 0xff80_1234;
+    let custom_snan64: u64 = 0xfff0_1234_5678_9abc;
+    assert_eq!(eval_u(UnOp::F32Abs, Val::F32(custom_snan32)), Ok(Val::F32(0x7f80_1234)));
+    assert_eq!(eval_u(UnOp::F32Neg, Val::F32(custom_snan32)), Ok(Val::F32(0x7f80_1234)));
+    assert_eq!(
+        eval_b(BinOp::F32Copysign, Val::F32(0x7f80_1234), Val::F32(0x8000_0000)),
+        Ok(Val::F32(custom_snan32))
+    );
+    assert_eq!(
+        eval_u(UnOp::F64Abs, Val::F64(custom_snan64)),
+        Ok(Val::F64(0x7ff0_1234_5678_9abc))
+    );
+    assert_eq!(
+        eval_b(BinOp::F64Copysign, Val::F64(0x7ff0_1234_5678_9abc), Val::F64(0x8000_0000_0000_0000)),
+        Ok(Val::F64(custom_snan64))
+    );
+
+    // Arithmetic / min / max / sqrt / rounding canonicalize any NaN to Wasm canonical qNaN.
+    let pos0_32 = Val::F32(0x0000_0000);
+    let neg0_32 = Val::F32(0x8000_0000);
+    assert_eq!(eval_b(BinOp::F32Div, pos0_32, pos0_32), Ok(Val::F32(F32_CANON_NAN)));
+    assert_eq!(eval_b(BinOp::F32Min, pos0_32, neg0_32), Ok(neg0_32));
+    assert_eq!(eval_b(BinOp::F32Min, neg0_32, pos0_32), Ok(neg0_32));
+    assert_eq!(eval_b(BinOp::F32Max, pos0_32, neg0_32), Ok(pos0_32));
+    assert_eq!(eval_b(BinOp::F32Max, neg0_32, pos0_32), Ok(pos0_32));
+    assert_eq!(eval_b(BinOp::F32Min, Val::F32(custom_snan32), Val::F32(1.0f32.to_bits())), Ok(Val::F32(F32_CANON_NAN)));
+    assert_eq!(eval_b(BinOp::F32Max, Val::F32(1.0f32.to_bits()), Val::F32(custom_snan32)), Ok(Val::F32(F32_CANON_NAN)));
+
+    // Comparisons: -0.0 == +0.0, NaN != NaN, NaN unordered.
+    assert_eq!(eval_b(BinOp::F32Eq, neg0_32, pos0_32), Ok(Val::I32(1)));
+    assert_eq!(eval_b(BinOp::F32Lt, neg0_32, pos0_32), Ok(Val::I32(0)));
+    assert_eq!(eval_b(BinOp::F32Le, neg0_32, pos0_32), Ok(Val::I32(1)));
+    assert_eq!(eval_b(BinOp::F32Eq, Val::F32(F32_CANON_NAN), Val::F32(F32_CANON_NAN)), Ok(Val::I32(0)));
+    assert_eq!(eval_b(BinOp::F32Ne, Val::F32(F32_CANON_NAN), Val::F32(F32_CANON_NAN)), Ok(Val::I32(1)));
+
+    // Rounding edge cases (including -0.0 preservation & RNE ties-to-even).
+    let f32_cases: &[u32] = &[
+        0x0000_0000, // +0.0
+        0x8000_0000, // -0.0
+        0x0000_0001, // +min subnormal
+        0x8000_0001, // -min subnormal
+        0x007f_ffff, // +max subnormal
+        0x807f_ffff, // -max subnormal
+        0x0080_0000, // +min normal
+        0x3eff_ffff, // 0.5 - ulp
+        0x3f00_0000, // +0.5
+        0x3f00_0001, // 0.5 + ulp
+        0xbf00_0000, // -0.5
+        0xbf00_0001, // -0.5 - ulp
+        0x3fc0_0000, // +1.5 -> RNE 2.0
+        0xbfc0_0000, // -1.5 -> RNE -2.0
+        0x4020_0000, // +2.5 -> RNE 2.0
+        0xc020_0000, // -2.5 -> RNE -2.0
+        0x4060_0000, // +3.5 -> RNE 4.0
+        0x4aff_ffff, // 2^23 - 0.5 -> RNE 2^23
+        0x4b00_0000, // 2^23
+        0x7f7f_ffff, // +MAX
+        0xff7f_ffff, // -MAX
+        0x7f80_0000, // +Inf
+        0xff80_0000, // -Inf
+        custom_snan32,
+    ];
+    for &bits in f32_cases {
+        let f = f32::from_bits(bits);
+        assert_eq!(f32_ceil(bits), f32_canon(f.ceil()), "f32_ceil({bits:#010x})");
+        assert_eq!(f32_floor(bits), f32_canon(f.floor()), "f32_floor({bits:#010x})");
+        assert_eq!(f32_trunc(bits), f32_canon(f.trunc()), "f32_trunc({bits:#010x})");
+        assert_eq!(f32_nearest(bits), f32_canon(f.round_ties_even()), "f32_nearest({bits:#010x})");
+        assert_eq!(f32_sqrt(bits), f32_canon(f.sqrt()), "f32_sqrt({bits:#010x})");
+    }
+
+    let f64_cases: &[u64] = &[
+        0x0000_0000_0000_0000,
+        0x8000_0000_0000_0000,
+        0x0000_0000_0000_0001,
+        0x8000_0000_0000_0001,
+        0x000f_ffff_ffff_ffff,
+        0x0010_0000_0000_0000,
+        (-0.5_f64).to_bits(),
+        (0.5_f64).to_bits(),
+        (1.5_f64).to_bits(),
+        (-1.5_f64).to_bits(),
+        (2.5_f64).to_bits(),
+        (-2.5_f64).to_bits(),
+        (3.5_f64).to_bits(),
+        f64::MAX.to_bits(),
+        f64::INFINITY.to_bits(),
+        f64::NEG_INFINITY.to_bits(),
+        custom_snan64,
+    ];
+    for &bits in f64_cases {
+        let f = f64::from_bits(bits);
+        assert_eq!(f64_ceil(bits), f64_canon(f.ceil()), "f64_ceil({bits:#018x})");
+        assert_eq!(f64_floor(bits), f64_canon(f.floor()), "f64_floor({bits:#018x})");
+        assert_eq!(f64_trunc(bits), f64_canon(f.trunc()), "f64_trunc({bits:#018x})");
+        assert_eq!(f64_nearest(bits), f64_canon(f.round_ties_even()), "f64_nearest({bits:#018x})");
+        assert_eq!(f64_sqrt(bits), f64_canon(f.sqrt()), "f64_sqrt({bits:#018x})");
+    }
+
+    // Trapping trunc vs saturating trunc_sat exact Wasm boundary semantics.
+    assert_eq!(eval_u(UnOp::I32TruncF32U, Val::F32((-0.999999_f32).to_bits())), Ok(Val::I32(0)));
+    assert_eq!(eval_u(UnOp::I32TruncF32U, Val::F32((-1.0_f32).to_bits())), Err(TrapCode::IntOverflow));
+    assert_eq!(eval_u(UnOp::I32TruncF32S, Val::F32((-2147483648.0_f32).to_bits())), Ok(Val::I32(i32::MIN)));
+    assert_eq!(eval_u(UnOp::I32TruncF32S, Val::F32(2147483648.0_f32.to_bits())), Err(TrapCode::IntOverflow));
+    assert_eq!(eval_u(UnOp::I32TruncF64S, Val::F64((-2147483648.999_f64).to_bits())), Ok(Val::I32(i32::MIN)));
+    assert_eq!(eval_u(UnOp::I32TruncF64S, Val::F64((-2147483649.0_f64).to_bits())), Err(TrapCode::IntOverflow));
+    assert_eq!(eval_u(UnOp::I32TruncF64U, Val::F64((-0.999999_f64).to_bits())), Ok(Val::I32(0)));
+    assert_eq!(eval_u(UnOp::I32TruncF64U, Val::F64((-1.0_f64).to_bits())), Err(TrapCode::IntOverflow));
+    assert_eq!(eval_u(UnOp::I64TruncF64S, Val::F64(f64::NAN.to_bits())), Err(TrapCode::IntOverflow));
+    assert_eq!(eval_u(UnOp::I64TruncF64U, Val::F64(f64::INFINITY.to_bits())), Err(TrapCode::IntOverflow));
+
+    // Saturating trunc_sat never traps.
+    assert_eq!(eval_u(UnOp::I32TruncSatF32S, Val::F32(custom_snan32)), Ok(Val::I32(0)));
+    assert_eq!(eval_u(UnOp::I32TruncSatF32S, Val::F32(f32::INFINITY.to_bits())), Ok(Val::I32(i32::MAX)));
+    assert_eq!(eval_u(UnOp::I32TruncSatF32S, Val::F32(f32::NEG_INFINITY.to_bits())), Ok(Val::I32(i32::MIN)));
+    assert_eq!(eval_u(UnOp::I32TruncSatF32U, Val::F32(f32::NEG_INFINITY.to_bits())), Ok(Val::I32(0)));
+    assert_eq!(eval_u(UnOp::I32TruncSatF32U, Val::F32(f32::INFINITY.to_bits())), Ok(Val::I32(u32::MAX as i32)));
+    assert_eq!(eval_u(UnOp::I64TruncSatF64S, Val::F64(custom_snan64)), Ok(Val::I64(0)));
+    assert_eq!(eval_u(UnOp::I64TruncSatF64U, Val::F64(f64::INFINITY.to_bits())), Ok(Val::I64(u64::MAX as i64)));
+
+    // Promote / demote / convert / reinterpret.
+    assert_eq!(eval_u(UnOp::F32DemoteF64, Val::F64(custom_snan64)), Ok(Val::F32(F32_CANON_NAN)));
+    assert_eq!(eval_u(UnOp::F64PromoteF32, Val::F32(custom_snan32)), Ok(Val::F64(F64_CANON_NAN)));
+    assert_eq!(eval_u(UnOp::F32ConvertI32S, Val::I32(-42)), Ok(Val::F32((-42.0_f32).to_bits())));
+    assert_eq!(eval_u(UnOp::F64ConvertI64U, Val::I64(-1)), Ok(Val::F64((u64::MAX as f64).to_bits())));
+    assert_eq!(eval_u(UnOp::I32ReinterpretF32, Val::F32(custom_snan32)), Ok(Val::I32(custom_snan32 as i32)));
+    assert_eq!(eval_u(UnOp::F64ReinterpretI64, Val::I64(custom_snan64 as i64)), Ok(Val::F64(custom_snan64)));
+}
+
+#[test]
+fn test_v128_simd_ops_pmin_pmax_shuffle_and_mem16() {
+    use gnomon_kernel::fp::*;
+    let m = mod_with_mem(1, Some(1));
+    let mut reg = StratumRegistry::new();
+    let heap = HeapState::from_module(&m, 10_000).unwrap();
+
+    let v_a = pack_u32x4([10, 20, (-5i32) as u32, 40]);
+    let v_b = pack_u32x4([15, 20, 3, 10]);
+    let shuffle_lanes: [u8; 16] = [0, 1, 2, 3, 20, 21, 22, 23, 8, 9, 10, 11, 28, 29, 30, 31];
+
+    let body = Region::build(|b| {
+        b.push_let(ValId(0), ValType::V128, Op::ConstV128(v_a));
+        b.push_let(ValId(1), ValType::V128, Op::ConstV128(v_b));
+        b.push_let(ValId(2), ValType::V128, Op::Bin(BinOp::I32x4LeS, ValId(0), ValId(1)));
+        b.push_let(ValId(3), ValType::I32, Op::Un(UnOp::I32x4Bitmask, ValId(2)));
+        b.push_let(ValId(4), ValType::V128, Op::Bin(BinOp::V128And, ValId(0), ValId(2)));
+        b.push_let(ValId(5), ValType::I32, Op::ConstI32(33)); // 33 & 31 == 1
+        b.push_let(ValId(6), ValType::V128, Op::Bin(BinOp::I32x4Shl, ValId(0), ValId(5)));
+        b.push_let(
+            ValId(7),
+            ValType::V128,
+            Op::SimdShuffle { lhs: ValId(0), rhs: ValId(1), lanes: shuffle_lanes },
+        );
+        b.push_let(ValId(8), ValType::I32, Op::ConstI32(64));
+        b.push_effect(EffectOp::Store {
+            mem: MemId(0),
+            addr: ValId(8),
+            offset: 16,
+            width: MemWidth::B16,
+            val: ValId(7),
+        });
+        b.push_let(
+            ValId(9),
+            ValType::V128,
+            Op::Load {
+                mem: MemId(0),
+                addr: ValId(8),
+                offset: 16,
+                width: MemWidth::B16,
+                signed: false,
+                result_ty: ValType::V128,
+            },
+        );
+        b.push_let(
+            ValId(10),
+            ValType::I32,
+            Op::SimdExtractLane { kind: LaneKind::I32x4, lane: 2, vec: ValId(9) },
+        );
+        b.push_yield(&[ValId(3), ValId(4), ValId(6), ValId(9), ValId(10)]);
+    });
+
+    // Verify StratumRegistry accepts all new v2 types/ops including asymmetric shift & SimdShuffle!
+    let op_id = reg
+        .register_candidate_op(StratumOp {
+            id: StratumId(77),
+            name: "simd_v2_test".into(),
+            layer: 1,
+            params: vec![],
+            results: vec![ValType::I32, ValType::V128, ValType::V128, ValType::V128, ValType::I32],
+            body: body.clone(),
+            docstring: "v2 simd test".into(),
+        })
+        .unwrap();
+    assert_eq!(op_id, StratumId(77));
+
+    // Verify remap_region_vals & structural Region::eq preserve SimdShuffle!
+    let mut nf = 100;
+    let remapped = remap_region_vals(&body, &[], &mut nf);
+    let (vs1, heap1) = eval_region(&m, &reg, &body, &[], heap.clone()).unwrap();
+    let (vs2, heap2) = eval_region(&m, &reg, &remapped, &[], heap.clone()).unwrap();
+    assert_eq!(vs1, vs2);
+    assert_eq!(heap1.memories, heap2.memories);
+
+    // Check exact results:
+    // I32x4LeS([10,20,-5,40], [15,20,3,10]) = [true, true, true, false] => bitmask 0b0111 = 7
+    assert_eq!(vs1[0], Val::I32(0b0111));
+    assert_eq!(vs1[1], Val::V128(pack_u32x4([10, 20, (-5i32) as u32, 0])));
+    assert_eq!(vs1[2], Val::V128(pack_u32x4([20, 40, (-10i32) as u32, 80])));
+    let expected_shuf = pack_u32x4([10, 20, (-5i32) as u32, 10]);
+    assert_eq!(vs1[3], Val::V128(expected_shuf));
+    assert_eq!(vs1[4], Val::I32(-5));
+
+    // Check pmin / pmax do NOT canonicalize NaN and select operand `a` on NaN or -0.0/+0.0!
+    let custom_nan = 0xffc0_0042u32;
+    let p_a = pack_u32x4([custom_nan, 1.0f32.to_bits(), 0x8000_0000, 2.0f32.to_bits()]);
+    let p_b = pack_u32x4([5.0f32.to_bits(), custom_nan, 0x0000_0000, 1.0f32.to_bits()]);
+    let p_reg = Region::build(|b| {
+        b.push_let(ValId(0), ValType::V128, Op::ConstV128(p_a));
+        b.push_let(ValId(1), ValType::V128, Op::ConstV128(p_b));
+        b.push_let(ValId(2), ValType::V128, Op::Bin(BinOp::F32x4PMin, ValId(0), ValId(1)));
+        b.push_let(ValId(3), ValType::V128, Op::Bin(BinOp::F32x4PMax, ValId(0), ValId(1)));
+        b.push_yield(&[ValId(2), ValId(3)]);
+    });
+    let (pvs, _) = eval_region(&m, &reg, &p_reg, &[], heap).unwrap();
+    assert_eq!(
+        pvs[0],
+        Val::V128(pack_u32x4([custom_nan, 1.0f32.to_bits(), 0x8000_0000, 1.0f32.to_bits()]))
+    );
+    assert_eq!(
+        pvs[1],
+        Val::V128(pack_u32x4([custom_nan, 1.0f32.to_bits(), 0x8000_0000, 2.0f32.to_bits()]))
+    );
+
+    // Check i64x2.extend_{low,high}_i32x4_{s,u} (used in S3.4 L2 book notional sweep).
+    let ext_in = pack_u32x4([(-1i32) as u32, 0x7fff_ffff, (-2i32) as u32, 42]);
+    let ext_reg = Region::build(|b| {
+        b.push_let(ValId(0), ValType::V128, Op::ConstV128(ext_in));
+        b.push_let(ValId(1), ValType::V128, Op::Un(UnOp::I64x2ExtendLowI32x4S, ValId(0)));
+        b.push_let(ValId(2), ValType::V128, Op::Un(UnOp::I64x2ExtendLowI32x4U, ValId(0)));
+        b.push_let(ValId(3), ValType::V128, Op::Un(UnOp::I64x2ExtendHighI32x4S, ValId(0)));
+        b.push_let(ValId(4), ValType::V128, Op::Un(UnOp::I64x2ExtendHighI32x4U, ValId(0)));
+        b.push_yield(&[ValId(1), ValId(2), ValId(3), ValId(4)]);
+    });
+    let (evs, _) = eval_region(&m, &reg, &ext_reg, &[], HeapState::from_module(&m, 1000).unwrap()).unwrap();
+    assert_eq!(evs[0], Val::V128(pack_u64x2([(-1i64) as u64, 0x7fff_ffff])));
+    assert_eq!(evs[1], Val::V128(pack_u64x2([0xffff_ffff, 0x7fff_ffff])));
+    assert_eq!(evs[2], Val::V128(pack_u64x2([(-2i64) as u64, 42])));
+    assert_eq!(evs[3], Val::V128(pack_u64x2([0xffff_fffe, 42])));
+
+    // Check Registry rejects invalid lane index and invalid shuffle lane >= 32!
+    let bad_lane = Region::build(|b| {
+        b.push_let(ValId(0), ValType::V128, Op::ConstV128(0));
+        b.push_let(
+            ValId(1),
+            ValType::I32,
+            Op::SimdExtractLane { kind: LaneKind::I32x4, lane: 4, vec: ValId(0) },
+        );
+        b.push_yield(&[ValId(1)]);
+    });
+    assert_eq!(
+        reg.register_candidate_op(StratumOp {
+            id: StratumId(78),
+            name: "bad_lane".into(),
+            layer: 1,
+            params: vec![],
+            results: vec![ValType::I32],
+            body: bad_lane,
+            docstring: String::new(),
+        }),
+        Err(RegistryError::TypeMismatch)
+    );
+
+    let bad_shuf = Region::build(|b| {
+        b.push_let(ValId(0), ValType::V128, Op::ConstV128(0));
+        b.push_let(
+            ValId(1),
+            ValType::V128,
+            Op::SimdShuffle { lhs: ValId(0), rhs: ValId(0), lanes: [32; 16] },
+        );
+        b.push_yield(&[ValId(1)]);
+    });
+    assert_eq!(
+        reg.register_candidate_op(StratumOp {
+            id: StratumId(79),
+            name: "bad_shuf".into(),
+            layer: 1,
+            params: vec![],
+            results: vec![ValType::V128],
+            body: bad_shuf,
+            docstring: String::new(),
+        }),
+        Err(RegistryError::TypeMismatch)
+    );
+}
+
+proptest! {
+    #[test]
+    fn prop_fp_nostd_matches_std_ieee754(a32 in any::<u32>(), a64 in any::<u64>()) {
+        use gnomon_kernel::fp::*;
+        let f32_val = f32::from_bits(a32);
+        prop_assert_eq!(f32_ceil(a32), f32_canon(f32_val.ceil()));
+        prop_assert_eq!(f32_floor(a32), f32_canon(f32_val.floor()));
+        prop_assert_eq!(f32_trunc(a32), f32_canon(f32_val.trunc()));
+        prop_assert_eq!(f32_nearest(a32), f32_canon(f32_val.round_ties_even()));
+        prop_assert_eq!(f32_sqrt(a32), f32_canon(f32_val.sqrt()));
+        prop_assert_eq!(i32_trunc_sat_f32_s(a32), f32_val as i32);
+        prop_assert_eq!(i32_trunc_sat_f32_u(a32) as u32, f32_val as u32);
+        prop_assert_eq!(i64_trunc_sat_f32_s(a32), f32_val as i64);
+        prop_assert_eq!(i64_trunc_sat_f32_u(a32) as u64, f32_val as u64);
+
+        let f64_val = f64::from_bits(a64);
+        prop_assert_eq!(f64_ceil(a64), f64_canon(f64_val.ceil()));
+        prop_assert_eq!(f64_floor(a64), f64_canon(f64_val.floor()));
+        prop_assert_eq!(f64_trunc(a64), f64_canon(f64_val.trunc()));
+        prop_assert_eq!(f64_nearest(a64), f64_canon(f64_val.round_ties_even()));
+        prop_assert_eq!(f64_sqrt(a64), f64_canon(f64_val.sqrt()));
+        prop_assert_eq!(i32_trunc_sat_f64_s(a64), f64_val as i32);
+        prop_assert_eq!(i32_trunc_sat_f64_u(a64) as u32, f64_val as u32);
+        prop_assert_eq!(i64_trunc_sat_f64_s(a64), f64_val as i64);
+        prop_assert_eq!(i64_trunc_sat_f64_u(a64) as u64, f64_val as u64);
+    }
+}

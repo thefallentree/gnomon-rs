@@ -14,7 +14,7 @@ use wasmparser::{
 };
 use wasmtime::{
     Config, Engine, Func, Global, Linker, Memory, Module as WtModule, OptLevel, Store, Trap,
-    TypedFunc, Val as WtVal,
+    TypedFunc, V128 as WtV128, Val as WtVal,
 };
 
 use crate::{Counterexample, ExecOutcome, FuzzConfig, FuzzOutcome, WasmError, emit_wasm, lift_wasm};
@@ -29,6 +29,8 @@ fn shared_engine() -> Result<&'static Engine, WasmError> {
             .wasm_multi_memory(true)
             .wasm_bulk_memory(true)
             .wasm_multi_value(true)
+            .wasm_simd(true)
+            .cranelift_nan_canonicalization(true)
             .wasm_backtrace_max_frames(None)
             .generate_address_map(false)
             .parallel_compilation(false)
@@ -86,6 +88,9 @@ fn convert_wval_type(ty: WValType) -> Result<ValType, WasmError> {
     match ty {
         WValType::I32 => Ok(ValType::I32),
         WValType::I64 => Ok(ValType::I64),
+        WValType::F32 => Ok(ValType::F32),
+        WValType::F64 => Ok(ValType::F64),
+        WValType::V128 => Ok(ValType::V128),
         other => Err(WasmError::UnsupportedFeature(format!(
             "unsupported wasm value type: {other:?}"
         ))),
@@ -102,6 +107,9 @@ fn eval_simple_const_expr(
         match ops.read().map_err(|e| WasmError::ParseError(e.to_string()))? {
             Operator::I32Const { value } => stack.push(Val::I32(value)),
             Operator::I64Const { value } => stack.push(Val::I64(value)),
+            Operator::F32Const { value } => stack.push(Val::F32(value.bits())),
+            Operator::F64Const { value } => stack.push(Val::F64(value.bits())),
+            Operator::V128Const { value } => stack.push(Val::V128(value.i128() as u128)),
             Operator::GlobalGet { global_index } => {
                 let g = globals.get(global_index as usize).ok_or_else(|| {
                     WasmError::ValidationError("const expr unknown global".into())
@@ -209,7 +217,7 @@ fn prepare_module(bytes: &[u8], target: EntryTarget<'_>) -> Result<PreparedModul
                                 .cloned()
                                 .ok_or_else(|| {
                                     WasmError::UnsupportedFeature(
-                                        "host import uses non-i32/i64 signature".into(),
+                                        "host import uses unsupported value type signature".into(),
                                     )
                                 })?;
                             host_imports.push(HostImportInfo {
@@ -289,6 +297,13 @@ fn prepare_module(bytes: &[u8], target: EntryTarget<'_>) -> Result<PreparedModul
                     match ops.read().map_err(|e| WasmError::ParseError(e.to_string()))? {
                         Operator::I32Store { .. }
                         | Operator::I64Store { .. }
+                        | Operator::F32Store { .. }
+                        | Operator::F64Store { .. }
+                        | Operator::V128Store { .. }
+                        | Operator::V128Store8Lane { .. }
+                        | Operator::V128Store16Lane { .. }
+                        | Operator::V128Store32Lane { .. }
+                        | Operator::V128Store64Lane { .. }
                         | Operator::I32Store8 { .. }
                         | Operator::I32Store16 { .. }
                         | Operator::I64Store8 { .. }
@@ -317,9 +332,9 @@ fn prepare_module(bytes: &[u8], target: EntryTarget<'_>) -> Result<PreparedModul
                     {
                         let off = match eval_simple_const_expr(&offset_expr, &globals)? {
                             Val::I32(v) => v as u32,
-                            Val::I64(_) => {
+                            _ => {
                                 return Err(WasmError::UnsupportedFeature(
-                                    "64-bit data offset not supported".into(),
+                                    "non-i32 data offset not supported".into(),
                                 ));
                             }
                         };
@@ -359,7 +374,7 @@ fn prepare_module(bytes: &[u8], target: EntryTarget<'_>) -> Result<PreparedModul
         .and_then(|o| o.as_ref())
         .cloned()
         .ok_or_else(|| {
-            WasmError::UnsupportedFeature("entry function uses unsupported non-i32/i64 types".into())
+            WasmError::UnsupportedFeature("entry function uses unsupported value types".into())
         })?;
 
     let mut used_names: HashSet<String> =
@@ -569,6 +584,9 @@ fn to_wt_val(v: Val) -> WtVal {
     match v {
         Val::I32(x) => WtVal::I32(x),
         Val::I64(x) => WtVal::I64(x),
+        Val::F32(b) => WtVal::F32(b),
+        Val::F64(b) => WtVal::F64(b),
+        Val::V128(b) => WtVal::V128(WtV128::from(b)),
     }
 }
 
@@ -576,9 +594,22 @@ fn from_wt_val(v: &WtVal) -> Result<Val, WasmError> {
     match v {
         WtVal::I32(x) => Ok(Val::I32(*x)),
         WtVal::I64(x) => Ok(Val::I64(*x)),
+        WtVal::F32(b) => Ok(Val::F32(*b)),
+        WtVal::F64(b) => Ok(Val::F64(*b)),
+        WtVal::V128(b) => Ok(Val::V128(b.as_u128())),
         other => Err(WasmError::UnsupportedFeature(format!(
             "unsupported wasmtime result value: {other:?}"
         ))),
+    }
+}
+
+fn to_wt_val_type(t: ValType) -> wasmtime::ValType {
+    match t {
+        ValType::I32 => wasmtime::ValType::I32,
+        ValType::I64 => wasmtime::ValType::I64,
+        ValType::F32 => wasmtime::ValType::F32,
+        ValType::F64 => wasmtime::ValType::F64,
+        ValType::V128 => wasmtime::ValType::V128,
     }
 }
 
@@ -586,7 +617,7 @@ fn map_wasmtime_trap(err: &wasmtime::Error) -> TrapCode {
     if let Some(trap) = err.downcast_ref::<Trap>() {
         match trap {
             Trap::IntegerDivisionByZero => TrapCode::DivByZero,
-            Trap::IntegerOverflow => TrapCode::IntOverflow,
+            Trap::IntegerOverflow | Trap::BadConversionToInteger => TrapCode::IntOverflow,
             Trap::MemoryOutOfBounds => TrapCode::OutOfBoundsMem,
             Trap::OutOfFuel | Trap::StackOverflow => TrapCode::OutOfFuel,
             Trap::UnreachableCodeReached => TrapCode::Unreachable,
@@ -630,24 +661,10 @@ fn instantiate_compiled(engine: &Engine, prep: &PreparedModule, wt_mod: WtModule
         if !seen_imports.insert((hi.module.as_str(), hi.field.as_str())) {
             continue;
         }
-        let wt_params: Vec<wasmtime::ValType> = hi
-            .sig
-            .params
-            .iter()
-            .map(|&t| match t {
-                ValType::I32 => wasmtime::ValType::I32,
-                ValType::I64 => wasmtime::ValType::I64,
-            })
-            .collect();
-        let wt_results: Vec<wasmtime::ValType> = hi
-            .sig
-            .results
-            .iter()
-            .map(|&t| match t {
-                ValType::I32 => wasmtime::ValType::I32,
-                ValType::I64 => wasmtime::ValType::I64,
-            })
-            .collect();
+        let wt_params: Vec<wasmtime::ValType> =
+            hi.sig.params.iter().copied().map(to_wt_val_type).collect();
+        let wt_results: Vec<wasmtime::ValType> =
+            hi.sig.results.iter().copied().map(to_wt_val_type).collect();
         let func_ty = wasmtime::FuncType::new(engine, wt_params, wt_results.clone());
         linker
             .func_new(&hi.module, &hi.field, func_ty, move |_caller, _args, results| {
@@ -655,6 +672,9 @@ fn instantiate_compiled(engine: &Engine, prep: &PreparedModule, wt_mod: WtModule
                     *slot = match ty {
                         wasmtime::ValType::I32 => WtVal::I32(0),
                         wasmtime::ValType::I64 => WtVal::I64(0),
+                        wasmtime::ValType::F32 => WtVal::F32(0),
+                        wasmtime::ValType::F64 => WtVal::F64(0),
+                        wasmtime::ValType::V128 => WtVal::V128(WtV128::from(0)),
                         _ => WtVal::I32(0),
                     };
                 }
@@ -715,9 +735,27 @@ fn instantiate_compiled(engine: &Engine, prep: &PreparedModule, wt_mod: WtModule
         }
     }
 
-    let params_buf = vec![WtVal::I32(0); prep.sig.params.len()];
-    let results_buf = vec![WtVal::I32(0); prep.sig.results.len()];
-    let out_vals_buf = vec![Val::I32(0); prep.sig.results.len()];
+    let params_buf: Vec<WtVal> = prep
+        .sig
+        .params
+        .iter()
+        .copied()
+        .map(|t| to_wt_val(Val::default_for(t)))
+        .collect();
+    let results_buf: Vec<WtVal> = prep
+        .sig
+        .results
+        .iter()
+        .copied()
+        .map(|t| to_wt_val(Val::default_for(t)))
+        .collect();
+    let out_vals_buf: Vec<Val> = prep
+        .sig
+        .results
+        .iter()
+        .copied()
+        .map(Val::default_for)
+        .collect();
 
     Ok(CompiledInstance {
         module: wt_mod,
@@ -1026,6 +1064,152 @@ const I64_BOUNDARIES: &[i64] = &[
     -(1i64 << 62),
 ];
 
+const F32_BOUNDARIES: &[u32] = &[
+    0x0000_0000, // +0.0
+    0x8000_0000, // -0.0
+    0x0000_0001, // +subnormal_min
+    0x8000_0001, // -subnormal_min
+    0x007f_ffff, // +subnormal_max
+    0x807f_ffff, // -subnormal_max
+    0x0080_0000, // +normal_min
+    0x8080_0000, // -normal_min
+    0x3e80_0000, // +0.25
+    0xbe80_0000, // -0.25
+    0x3f00_0000, // +0.5
+    0xbf00_0000, // -0.5
+    0x3f40_0000, // +0.75
+    0xbf40_0000, // -0.75
+    0x3f7f_ffff, // next_down(1.0)
+    0xbf7f_ffff, // next_up(-1.0)
+    0x3f80_0000, // +1.0
+    0xbf80_0000, // -1.0
+    0x3fc0_0000, // +1.5
+    0xbfc0_0000, // -1.5
+    0x4000_0000, // +2.0
+    0xc000_0000, // -2.0
+    0x4020_0000, // +2.5
+    0xc020_0000, // -2.5
+    0x4060_0000, // +3.5
+    0xc060_0000, // -3.5
+    0x4b00_0000, // +2^23
+    0xcb00_0000, // -2^23
+    0x4eff_ffff, // largest f32 < 2^31 (2147483520.0)
+    0x4f00_0000, // +2^31 (2147483648.0)
+    0xcf00_0000, // -2^31 (i32::MIN as f32)
+    0xcf00_0001, // next_down(-2^31)
+    0x4f7f_ffff, // largest f32 < 2^32 (4294967040.0)
+    0x4f80_0000, // +2^32 (4294967296.0)
+    0x5eff_ffff, // largest f32 < 2^63
+    0x5f00_0000, // +2^63
+    0xdf00_0000, // -2^63 (i64::MIN as f32)
+    0xdf00_0001, // next_down(-2^63)
+    0x5f7f_ffff, // largest f32 < 2^64
+    0x5f80_0000, // +2^64
+    0x7f7f_ffff, // +f32::MAX
+    0xff7f_ffff, // -f32::MAX
+    0x7f80_0000, // +Inf
+    0xff80_0000, // -Inf
+    0x7fc0_0000, // canonical qNaN
+    0xffc0_0000, // negative canonical qNaN
+    0x7fc0_0001, // non-canonical qNaN
+    0xffc0_1234, // negative non-canonical qNaN
+    0x7f80_0001, // positive sNaN
+    0xff80_0001, // negative sNaN
+];
+
+const F64_BOUNDARIES: &[u64] = &[
+    0x0000_0000_0000_0000, // +0.0
+    0x8000_0000_0000_0000, // -0.0
+    0x0000_0000_0000_0001, // +subnormal_min
+    0x8000_0000_0000_0001, // -subnormal_min
+    0x000f_ffff_ffff_ffff, // +subnormal_max
+    0x800f_ffff_ffff_ffff, // -subnormal_max
+    0x0010_0000_0000_0000, // +normal_min
+    0x8010_0000_0000_0000, // -normal_min
+    0x3fe0_0000_0000_0000, // +0.5
+    0xbfe0_0000_0000_0000, // -0.5
+    0x3fef_ffff_ffff_ffff, // next_down(1.0)
+    0xbfef_ffff_ffff_ffff, // next_up(-1.0)
+    0x3ff0_0000_0000_0000, // +1.0
+    0xbff0_0000_0000_0000, // -1.0
+    0x3ff8_0000_0000_0000, // +1.5
+    0xbff8_0000_0000_0000, // -1.5
+    0x4000_0000_0000_0000, // +2.0
+    0xc000_0000_0000_0000, // -2.0
+    0x4004_0000_0000_0000, // +2.5
+    0xc004_0000_0000_0000, // -2.5
+    0x41df_ffff_ffc0_0000, // i32::MAX as f64 (2147483647.0)
+    0x41df_ffff_ffff_ffff, // next_down(2^31) (2147483647.9999998)
+    0x41e0_0000_0000_0000, // +2^31 (2147483648.0)
+    0xc1e0_0000_0000_0000, // -2^31 (-2147483648.0)
+    0xc1e0_0000_001c_cccc, // ~-2147483648.9 (valid for i32.trunc_f64_s!)
+    0xc1e0_0000_0020_0000, // -2^31 - 1 (-2147483649.0, traps i32.trunc_f64_s!)
+    0x41ef_ffff_ffe0_0000, // u32::MAX as f64
+    0x41ef_ffff_ffff_ffff, // next_down(2^32)
+    0x41f0_0000_0000_0000, // +2^32
+    0x4330_0000_0000_0000, // +2^52
+    0xc330_0000_0000_0000, // -2^52
+    0x43df_ffff_ffff_ffff, // largest f64 < 2^63
+    0x43e0_0000_0000_0000, // +2^63
+    0xc3e0_0000_0000_0000, // -2^63 (i64::MIN as f64)
+    0xc3e0_0000_0000_0001, // next_down(-2^63)
+    0x43ef_ffff_ffff_ffff, // largest f64 < 2^64
+    0x43f0_0000_0000_0000, // +2^64
+    0x47ef_ffff_e000_0000, // +f32::MAX as f64
+    0xc7ef_ffff_e000_0000, // -f32::MAX as f64
+    0x7fef_ffff_ffff_ffff, // +f64::MAX
+    0xffef_ffff_ffff_ffff, // -f64::MAX
+    0x7ff0_0000_0000_0000, // +Inf
+    0xfff0_0000_0000_0000, // -Inf
+    0x7ff8_0000_0000_0000, // canonical qNaN
+    0xfff8_0000_0000_0000, // negative canonical qNaN
+    0x7ff8_0000_0000_0001, // non-canonical qNaN
+    0xfff8_1234_5678_9abc, // negative non-canonical qNaN
+    0x7ff0_0000_0000_0001, // positive sNaN
+    0xfff0_0000_0000_0001, // negative sNaN
+];
+
+const fn pack_u32x4(a: u32, b: u32, c: u32, d: u32) -> u128 {
+    (a as u128) | ((b as u128) << 32) | ((c as u128) << 64) | ((d as u128) << 96)
+}
+
+const fn pack_u64x2(a: u64, b: u64) -> u128 {
+    (a as u128) | ((b as u128) << 64)
+}
+
+const V128_BOUNDARIES: &[u128] = &[
+    0u128,
+    u128::MAX,
+    0x5555_5555_5555_5555_5555_5555_5555_5555u128,
+    0xAAAA_AAAA_AAAA_AAAA_AAAA_AAAA_AAAA_AAAAu128,
+    u128::from_le_bytes([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]),
+    u128::from_le_bytes([15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0]),
+    u128::from_le_bytes([0, 15, 16, 17, 31, 32, 127, 128, 255, 1, 2, 3, 14, 15, 16, 200]),
+    pack_u32x4(0, 1, u32::MAX, 0x8000_0000),
+    pack_u32x4(0x7fff_ffff, 0x8000_0000, u32::MAX, 0),
+    pack_u32x4(0x8000_0000, 0x8000_0000, 0x7fff_ffff, 0x7fff_ffff),
+    pack_u64x2(0, u64::MAX),
+    pack_u64x2(0x8000_0000_0000_0000, 0x7fff_ffff_ffff_ffff),
+    pack_u64x2(0x7fff_ffff_ffff_ffff, 0x8000_0000_0000_0000),
+    // f32x4 edge patterns
+    pack_u32x4(0x0000_0000, 0x8000_0000, 0x3f80_0000, 0xbf80_0000), // [+0.0, -0.0, +1.0, -1.0]
+    pack_u32x4(0x8000_0000, 0x0000_0000, 0xbf80_0000, 0x3f80_0000), // [-0.0, +0.0, -1.0, +1.0]
+    pack_u32x4(0x7f80_0000, 0xff80_0000, 0x7fc0_0000, 0x7f80_0001), // [+Inf, -Inf, qNaN, sNaN]
+    pack_u32x4(0x7fc0_0001, 0xffc0_1234, 0xff80_0001, 0x3f00_0000), // [non-canon qNaNs, -sNaN, +0.5]
+    pack_u32x4(0x0000_0001, 0x8000_0001, 0x7f7f_ffff, 0xff7f_ffff), // [±subnormal_min, ±f32::MAX]
+    pack_u32x4(0xbf00_0000, 0x3f00_0000, 0x3fc0_0000, 0x4020_0000), // [-0.5, +0.5, +1.5, +2.5]
+    pack_u32x4(0xcf00_0000, 0x4f00_0000, 0xbf80_0000, 0x4f80_0000), // [-2^31, 2^31, -1.0, 2^32]
+    // f64x2 edge patterns
+    pack_u64x2(0x0000_0000_0000_0000, 0x8000_0000_0000_0000), // [+0.0, -0.0]
+    pack_u64x2(0x8000_0000_0000_0000, 0x0000_0000_0000_0000), // [-0.0, +0.0]
+    pack_u64x2(0x7ff0_0000_0000_0000, 0xfff0_0000_0000_0000), // [+Inf, -Inf]
+    pack_u64x2(0x7ff8_0000_0000_0000, 0x7ff0_0000_0000_0001), // [qNaN, sNaN]
+    pack_u64x2(0x7ff8_0000_0000_0001, 0xfff8_1234_5678_9abc), // [non-canon qNaNs]
+    pack_u64x2(0x0000_0000_0000_0001, 0x8000_0000_0000_0001), // [±subnormal_min]
+    pack_u64x2(0xbfe0_0000_0000_0000, 0x4004_0000_0000_0000), // [-0.5, +2.5]
+    pack_u64x2(0x7fef_ffff_ffff_ffff, 0xffef_ffff_ffff_ffff), // [±f64::MAX]
+];
+
 struct VectorGen<'a> {
     params: &'a [ValType],
     total: usize,
@@ -1058,6 +1242,9 @@ impl<'a> VectorGen<'a> {
         match ty {
             ValType::I32 => Val::I32(I32_BOUNDARIES[idx % I32_BOUNDARIES.len()]),
             ValType::I64 => Val::I64(I64_BOUNDARIES[idx % I64_BOUNDARIES.len()]),
+            ValType::F32 => Val::F32(F32_BOUNDARIES[idx % F32_BOUNDARIES.len()]),
+            ValType::F64 => Val::F64(F64_BOUNDARIES[idx % F64_BOUNDARIES.len()]),
+            ValType::V128 => Val::V128(V128_BOUNDARIES[idx % V128_BOUNDARIES.len()]),
         }
     }
 
@@ -1078,6 +1265,59 @@ impl<'a> VectorGen<'a> {
                     Val::I64(r as i64)
                 }
             }
+            ValType::F32 => match r & 3 {
+                0 => Self::boundary_val(ValType::F32, (r >> 8) as usize),
+                1 => {
+                    // Structured finite / subnormal / special float bit pattern
+                    let sign = ((r >> 2) as u32 & 1) << 31;
+                    let exp = match (r >> 3) & 3 {
+                        0 => 0u32,                              // subnormal / zero
+                        1 => 127u32.wrapping_add(((r >> 8) & 15) as u32).wrapping_sub(7), // near 1.0
+                        2 => 0xff,                              // Inf / NaN
+                        _ => ((r >> 8) as u32) & 0xff,
+                    };
+                    let frac = ((r >> 16) as u32) & 0x007f_ffff;
+                    Val::F32(sign | (exp << 23) | frac)
+                }
+                _ => Val::F32((r ^ (r >> 32)) as u32),
+            },
+            ValType::F64 => match r & 3 {
+                0 => Self::boundary_val(ValType::F64, (r >> 8) as usize),
+                1 => {
+                    let sign = ((r >> 2) & 1) << 63;
+                    let exp = match (r >> 3) & 3 {
+                        0 => 0u64,
+                        1 => 1023u64.wrapping_add((r >> 8) & 31).wrapping_sub(15),
+                        2 => 0x7ff,
+                        _ => (r >> 8) & 0x7ff,
+                    };
+                    let frac = self.rng.next() & 0x000f_ffff_ffff_ffff;
+                    Val::F64(sign | (exp << 52) | frac)
+                }
+                _ => Val::F64(r),
+            },
+            ValType::V128 => match r & 3 {
+                0 => Self::boundary_val(ValType::V128, (r >> 8) as usize),
+                1 => {
+                    // Compose 4 f32/i32 edge lanes or 2 f64 edge lanes
+                    let r2 = self.rng.next();
+                    if (r & 4) == 0 {
+                        let a = F32_BOUNDARIES[(r >> 8) as usize % F32_BOUNDARIES.len()];
+                        let b = F32_BOUNDARIES[(r >> 24) as usize % F32_BOUNDARIES.len()];
+                        let c = F32_BOUNDARIES[(r2 >> 8) as usize % F32_BOUNDARIES.len()];
+                        let d = F32_BOUNDARIES[(r2 >> 24) as usize % F32_BOUNDARIES.len()];
+                        Val::V128(pack_u32x4(a, b, c, d))
+                    } else {
+                        let a = F64_BOUNDARIES[(r >> 8) as usize % F64_BOUNDARIES.len()];
+                        let b = F64_BOUNDARIES[(r2 >> 8) as usize % F64_BOUNDARIES.len()];
+                        Val::V128(pack_u64x2(a, b))
+                    }
+                }
+                _ => {
+                    let hi = self.rng.next();
+                    Val::V128((r as u128) | ((hi as u128) << 64))
+                }
+            },
         }
     }
 
@@ -1095,6 +1335,9 @@ impl<'a> VectorGen<'a> {
             let max_b = match self.params[0] {
                 ValType::I32 => I32_BOUNDARIES.len(),
                 ValType::I64 => I64_BOUNDARIES.len(),
+                ValType::F32 => F32_BOUNDARIES.len(),
+                ValType::F64 => F64_BOUNDARIES.len(),
+                ValType::V128 => V128_BOUNDARIES.len(),
             };
             if self.idx_a < max_b {
                 out[0] = Self::boundary_val(self.params[0], self.idx_a);
@@ -1111,7 +1354,13 @@ impl<'a> VectorGen<'a> {
                 *slot = Self::boundary_val(ty, self.idx_a);
             }
             self.idx_a += 1;
-            if self.idx_a >= I32_BOUNDARIES.len().max(I64_BOUNDARIES.len()) {
+            let max_diag = I32_BOUNDARIES
+                .len()
+                .max(I64_BOUNDARIES.len())
+                .max(F32_BOUNDARIES.len())
+                .max(F64_BOUNDARIES.len())
+                .max(V128_BOUNDARIES.len());
+            if self.idx_a >= max_diag {
                 self.phase = 1;
                 self.idx_a = 0;
                 self.idx_b = 0;
@@ -1207,7 +1456,13 @@ fn fuzz_prepared(
 
     let start = Instant::now();
     let mut vec_gen = VectorGen::new(&lhs_prep.sig.params, cfg);
-    let mut inputs = vec![Val::I32(0); lhs_prep.sig.params.len()];
+    let mut inputs: Vec<Val> = lhs_prep
+        .sig
+        .params
+        .iter()
+        .copied()
+        .map(Val::default_for)
+        .collect();
     let mut tested = 0usize;
 
     while vec_gen.next_into(&mut inputs) {

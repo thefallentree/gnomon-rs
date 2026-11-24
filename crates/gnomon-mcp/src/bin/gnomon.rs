@@ -327,10 +327,13 @@ const IR_SCHEMA_DOC: &str = r#"{
       ]
     }
   },
+  "val_types": ["i32", "i64", "f32", "f64", "v128"],
+  "vals": ["{\"ty\":\"i32\",\"val\":1}", "{\"ty\":\"i64\",\"val\":1}", "{\"ty\":\"f32\",\"val\":1065353216}", "{\"ty\":\"f64\",\"val\":4607182418800017408}", "{\"ty\":\"v128\",\"val\":[0,0]}"],
   "nodes": ["block { stmts }", "if_else { cond, then_region, else_region, results }", "bounded_loop { max_iters, init_vars, state_vars, body }", "invariant_loop { init_vars, state_vars, cond, invariant_pred, fuel_measure, body }"],
   "stmts": ["let { dst, ty, op }", "effect { effect }", "region { results, region }", "call { results, target: {kind: func|host|stratum, id}, args }", "yield { vals }", "break { depth, cond?, values }", "continue { depth, cond?, values }", "return { vals }"],
-  "ops": ["const_i32 { val }", "const_i64 { val }", "copy { src }", "un { unop, arg }", "bin { binop, lhs, rhs }", "select { cond, true_val, false_val }", "load { mem, addr, offset, width: b1|b2|b4|b8, signed, result_ty }", "global_get { id }", "memory_size { mem }", "memory_grow { mem, delta }"],
-  "effects": ["store { mem, addr, offset, width, val }", "memory_copy { dst_mem, src_mem, dst, src, len }", "memory_fill { mem, dst, val, len }", "global_set { id, val }", "trap { code }", "nop"],
+  "ops": ["const_i32 { val }", "const_i64 { val }", "const_f32 { bits }", "const_f64 { bits }", "const_v128 { bits: [lo, hi] }", "copy { src }", "un { unop, arg }", "bin { binop, lhs, rhs }", "select { cond, true_val, false_val }", "load { mem, addr, offset, width: b1|b2|b4|b8|b16, signed, result_ty }", "global_get { id }", "memory_size { mem }", "memory_grow { mem, delta }", "simd_extract_lane { kind, lane, vec }", "simd_replace_lane { kind, lane, vec, val }", "simd_bitselect { a, b, mask }", "simd_shuffle { lhs, rhs, lanes }"],
+  "effects": ["store { mem, addr, offset, width: b1|b2|b4|b8|b16, val }", "memory_copy { dst_mem, src_mem, dst, src, len }", "memory_fill { mem, dst, val, len }", "global_set { id, val }", "trap { code }", "nop"],
+  "lane_kinds": ["i8x16_s","i8x16_u","i16x8_s","i16x8_u","i32x4","i64x2","f32x4","f64x2"],
   "binops_i32": ["i32_eq","i32_ne","i32_lt_s","i32_lt_u","i32_gt_s","i32_gt_u","i32_le_s","i32_le_u","i32_ge_s","i32_ge_u","i32_add","i32_sub","i32_mul","i32_div_s","i32_div_u","i32_rem_s","i32_rem_u","i32_and","i32_or","i32_xor","i32_shl","i32_shr_s","i32_shr_u","i32_rotl","i32_rotr"],
   "binops_i64": ["i64_eq","i64_ne","i64_lt_s","i64_lt_u","i64_gt_s","i64_gt_u","i64_le_s","i64_le_u","i64_ge_s","i64_ge_u","i64_add","i64_sub","i64_mul","i64_div_s","i64_div_u","i64_rem_s","i64_rem_u","i64_and","i64_or","i64_xor","i64_shl","i64_shr_s","i64_shr_u","i64_rotl","i64_rotr"],
   "unops": ["i32_eqz","i64_eqz","i32_clz","i32_ctz","i32_popcnt","i64_clz","i64_ctz","i64_popcnt","i32_wrap_i64","i64_extend_i32_s","i64_extend_i32_u","i32_extend8_s","i32_extend16_s","i64_extend8_s","i64_extend16_s","i64_extend32_s"]

@@ -5,7 +5,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt::Write as _;
 
 use gnomon_kernel::{
-    BinOp, CallTarget, EffectOp, Law, LawKind, LawList, MemWidth, Op, Region, RegionNode,
+    BinOp, CallTarget, EffectOp, LaneKind, Law, LawKind, LawList, MemWidth, Op, Region, RegionNode,
     RegionRef, Span, Stmt, Stratum, StratumId, StratumOp, StratumRegistry, TrapCode, UnOp, ValId,
     ValType,
 };
@@ -905,7 +905,17 @@ fn encode_block(
 fn op_may_trap_or_mutate(op: Op) -> bool {
     matches!(
         op,
-        Op::Bin(
+        Op::Un(
+            UnOp::I32TruncF32S
+                | UnOp::I32TruncF32U
+                | UnOp::I32TruncF64S
+                | UnOp::I32TruncF64U
+                | UnOp::I64TruncF32S
+                | UnOp::I64TruncF32U
+                | UnOp::I64TruncF64S
+                | UnOp::I64TruncF64U,
+            _
+        ) | Op::Bin(
             BinOp::I32DivS
                 | BinOp::I32DivU
                 | BinOp::I32RemS
@@ -921,10 +931,26 @@ fn op_may_trap_or_mutate(op: Op) -> bool {
     )
 }
 
+fn lane_kind_tag(k: LaneKind) -> &'static str {
+    match k {
+        LaneKind::I8x16S => "i8x16_s",
+        LaneKind::I8x16U => "i8x16_u",
+        LaneKind::I16x8S => "i16x8_s",
+        LaneKind::I16x8U => "i16x8_u",
+        LaneKind::I32x4 => "i32x4",
+        LaneKind::I64x2 => "i64x2",
+        LaneKind::F32x4 => "f32x4",
+        LaneKind::F64x2 => "f64x2",
+    }
+}
+
 fn encode_op(op: Op, env: &HashMap<ValId, Expr>) -> Expr {
     match op {
         Op::ConstI32(c) => prim(&format!("i32.const_{c}")),
         Op::ConstI64(c) => prim(&format!("i64.const_{c}")),
+        Op::ConstF32(bits) => prim(&format!("f32.const_{bits:08x}")),
+        Op::ConstF64(bits) => prim(&format!("f64.const_{bits:016x}")),
+        Op::ConstV128(bits) => prim(&format!("v128.const_{bits:032x}")),
         Op::Copy(v) => lookup_val(env, v),
         Op::Un(u, a) => Expr::app(prim(unop_tag(u)), lookup_val(env, a)),
         Op::Bin(b, l, r) => app2(prim(binop_tag(b)), lookup_val(env, l), lookup_val(env, r)),
@@ -949,6 +975,28 @@ fn encode_op(op: Op, env: &HashMap<ValId, Expr>) -> Expr {
         Op::MemorySize(m) => prim(&format!("mem.size_{}", m.0)),
         Op::MemoryGrow { mem, delta } => {
             Expr::app(prim(&format!("mem.grow_{}", mem.0)), lookup_val(env, delta))
+        }
+        Op::SimdExtractLane { kind, lane, vec } => Expr::app(
+            prim(&format!("{}.extract_lane_{lane}", lane_kind_tag(kind))),
+            lookup_val(env, vec),
+        ),
+        Op::SimdReplaceLane { kind, lane, vec, val } => app2(
+            prim(&format!("{}.replace_lane_{lane}", lane_kind_tag(kind))),
+            lookup_val(env, vec),
+            lookup_val(env, val),
+        ),
+        Op::SimdBitselect { a, b, mask } => app3(
+            prim("v128.bitselect"),
+            lookup_val(env, a),
+            lookup_val(env, b),
+            lookup_val(env, mask),
+        ),
+        Op::SimdShuffle { lhs, rhs, lanes } => {
+            let mut tag = String::from("i8x16.shuffle");
+            for l in lanes {
+                let _ = write!(tag, "_{l}");
+            }
+            app2(prim(&tag), lookup_val(env, lhs), lookup_val(env, rhs))
         }
     }
 }
@@ -1166,6 +1214,9 @@ fn ty_str(ty: ValType) -> &'static str {
     match ty {
         ValType::I32 => "i32",
         ValType::I64 => "i64",
+        ValType::F32 => "f32",
+        ValType::F64 => "f64",
+        ValType::V128 => "v128",
     }
 }
 
@@ -1175,6 +1226,7 @@ fn width_tag(w: MemWidth) -> &'static str {
         MemWidth::B2 => "b2",
         MemWidth::B4 => "b4",
         MemWidth::B8 => "b8",
+        MemWidth::B16 => "b16",
     }
 }
 
@@ -1207,6 +1259,90 @@ fn unop_tag(u: UnOp) -> &'static str {
         UnOp::I64Extend8S => "i64.extend8_s",
         UnOp::I64Extend16S => "i64.extend16_s",
         UnOp::I64Extend32S => "i64.extend32_s",
+        UnOp::F32Abs => "f32.abs",
+        UnOp::F32Neg => "f32.neg",
+        UnOp::F32Ceil => "f32.ceil",
+        UnOp::F32Floor => "f32.floor",
+        UnOp::F32Trunc => "f32.trunc",
+        UnOp::F32Nearest => "f32.nearest",
+        UnOp::F32Sqrt => "f32.sqrt",
+        UnOp::F64Abs => "f64.abs",
+        UnOp::F64Neg => "f64.neg",
+        UnOp::F64Ceil => "f64.ceil",
+        UnOp::F64Floor => "f64.floor",
+        UnOp::F64Trunc => "f64.trunc",
+        UnOp::F64Nearest => "f64.nearest",
+        UnOp::F64Sqrt => "f64.sqrt",
+        UnOp::I32TruncF32S => "i32.trunc_f32_s",
+        UnOp::I32TruncF32U => "i32.trunc_f32_u",
+        UnOp::I32TruncF64S => "i32.trunc_f64_s",
+        UnOp::I32TruncF64U => "i32.trunc_f64_u",
+        UnOp::I64TruncF32S => "i64.trunc_f32_s",
+        UnOp::I64TruncF32U => "i64.trunc_f32_u",
+        UnOp::I64TruncF64S => "i64.trunc_f64_s",
+        UnOp::I64TruncF64U => "i64.trunc_f64_u",
+        UnOp::I32TruncSatF32S => "i32.trunc_sat_f32_s",
+        UnOp::I32TruncSatF32U => "i32.trunc_sat_f32_u",
+        UnOp::I32TruncSatF64S => "i32.trunc_sat_f64_s",
+        UnOp::I32TruncSatF64U => "i32.trunc_sat_f64_u",
+        UnOp::I64TruncSatF32S => "i64.trunc_sat_f32_s",
+        UnOp::I64TruncSatF32U => "i64.trunc_sat_f32_u",
+        UnOp::I64TruncSatF64S => "i64.trunc_sat_f64_s",
+        UnOp::I64TruncSatF64U => "i64.trunc_sat_f64_u",
+        UnOp::F32ConvertI32S => "f32.convert_i32_s",
+        UnOp::F32ConvertI32U => "f32.convert_i32_u",
+        UnOp::F32ConvertI64S => "f32.convert_i64_s",
+        UnOp::F32ConvertI64U => "f32.convert_i64_u",
+        UnOp::F64ConvertI32S => "f64.convert_i32_s",
+        UnOp::F64ConvertI32U => "f64.convert_i32_u",
+        UnOp::F64ConvertI64S => "f64.convert_i64_s",
+        UnOp::F64ConvertI64U => "f64.convert_i64_u",
+        UnOp::F32DemoteF64 => "f32.demote_f64",
+        UnOp::F64PromoteF32 => "f64.promote_f32",
+        UnOp::I32ReinterpretF32 => "i32.reinterpret_f32",
+        UnOp::I64ReinterpretF64 => "i64.reinterpret_f64",
+        UnOp::F32ReinterpretI32 => "f32.reinterpret_i32",
+        UnOp::F64ReinterpretI64 => "f64.reinterpret_i64",
+        UnOp::V128Not => "v128.not",
+        UnOp::V128AnyTrue => "v128.any_true",
+        UnOp::I8x16Splat => "i8x16.splat",
+        UnOp::I16x8Splat => "i16x8.splat",
+        UnOp::I32x4Splat => "i32x4.splat",
+        UnOp::I64x2Splat => "i64x2.splat",
+        UnOp::F32x4Splat => "f32x4.splat",
+        UnOp::F64x2Splat => "f64x2.splat",
+        UnOp::I8x16Bitmask => "i8x16.bitmask",
+        UnOp::I16x8Bitmask => "i16x8.bitmask",
+        UnOp::I32x4Bitmask => "i32x4.bitmask",
+        UnOp::I64x2Bitmask => "i64x2.bitmask",
+        UnOp::I32x4AllTrue => "i32x4.all_true",
+        UnOp::I64x2AllTrue => "i64x2.all_true",
+        UnOp::I32x4Abs => "i32x4.abs",
+        UnOp::I32x4Neg => "i32x4.neg",
+        UnOp::I64x2Abs => "i64x2.abs",
+        UnOp::I64x2Neg => "i64x2.neg",
+        UnOp::F32x4Abs => "f32x4.abs",
+        UnOp::F32x4Neg => "f32x4.neg",
+        UnOp::F32x4Sqrt => "f32x4.sqrt",
+        UnOp::F32x4Ceil => "f32x4.ceil",
+        UnOp::F32x4Floor => "f32x4.floor",
+        UnOp::F32x4Trunc => "f32x4.trunc",
+        UnOp::F32x4Nearest => "f32x4.nearest",
+        UnOp::F64x2Abs => "f64x2.abs",
+        UnOp::F64x2Neg => "f64x2.neg",
+        UnOp::F64x2Sqrt => "f64x2.sqrt",
+        UnOp::F64x2Ceil => "f64x2.ceil",
+        UnOp::F64x2Floor => "f64x2.floor",
+        UnOp::F64x2Trunc => "f64x2.trunc",
+        UnOp::F64x2Nearest => "f64x2.nearest",
+        UnOp::I32x4TruncSatF32x4S => "i32x4.trunc_sat_f32x4_s",
+        UnOp::I32x4TruncSatF32x4U => "i32x4.trunc_sat_f32x4_u",
+        UnOp::F32x4ConvertI32x4S => "f32x4.convert_i32x4_s",
+        UnOp::F32x4ConvertI32x4U => "f32x4.convert_i32x4_u",
+        UnOp::I64x2ExtendLowI32x4S => "i64x2.extend_low_i32x4_s",
+        UnOp::I64x2ExtendLowI32x4U => "i64x2.extend_low_i32x4_u",
+        UnOp::I64x2ExtendHighI32x4S => "i64x2.extend_high_i32x4_s",
+        UnOp::I64x2ExtendHighI32x4U => "i64x2.extend_high_i32x4_u",
     }
 }
 
@@ -1262,5 +1398,96 @@ fn binop_tag(b: BinOp) -> &'static str {
         BinOp::I64ShrU => "i64.shr_u",
         BinOp::I64Rotl => "i64.rotl",
         BinOp::I64Rotr => "i64.rotr",
+        BinOp::F32Add => "f32.add",
+        BinOp::F32Sub => "f32.sub",
+        BinOp::F32Mul => "f32.mul",
+        BinOp::F32Div => "f32.div",
+        BinOp::F32Min => "f32.min",
+        BinOp::F32Max => "f32.max",
+        BinOp::F32Copysign => "f32.copysign",
+        BinOp::F32Eq => "f32.eq",
+        BinOp::F32Ne => "f32.ne",
+        BinOp::F32Lt => "f32.lt",
+        BinOp::F32Gt => "f32.gt",
+        BinOp::F32Le => "f32.le",
+        BinOp::F32Ge => "f32.ge",
+        BinOp::F64Add => "f64.add",
+        BinOp::F64Sub => "f64.sub",
+        BinOp::F64Mul => "f64.mul",
+        BinOp::F64Div => "f64.div",
+        BinOp::F64Min => "f64.min",
+        BinOp::F64Max => "f64.max",
+        BinOp::F64Copysign => "f64.copysign",
+        BinOp::F64Eq => "f64.eq",
+        BinOp::F64Ne => "f64.ne",
+        BinOp::F64Lt => "f64.lt",
+        BinOp::F64Gt => "f64.gt",
+        BinOp::F64Le => "f64.le",
+        BinOp::F64Ge => "f64.ge",
+        BinOp::V128And => "v128.and",
+        BinOp::V128AndNot => "v128.andnot",
+        BinOp::V128Or => "v128.or",
+        BinOp::V128Xor => "v128.xor",
+        BinOp::I8x16Swizzle => "i8x16.swizzle",
+        BinOp::I32x4Add => "i32x4.add",
+        BinOp::I32x4Sub => "i32x4.sub",
+        BinOp::I32x4Mul => "i32x4.mul",
+        BinOp::I32x4MinS => "i32x4.min_s",
+        BinOp::I32x4MinU => "i32x4.min_u",
+        BinOp::I32x4MaxS => "i32x4.max_s",
+        BinOp::I32x4MaxU => "i32x4.max_u",
+        BinOp::I32x4Eq => "i32x4.eq",
+        BinOp::I32x4Ne => "i32x4.ne",
+        BinOp::I32x4LtS => "i32x4.lt_s",
+        BinOp::I32x4LtU => "i32x4.lt_u",
+        BinOp::I32x4GtS => "i32x4.gt_s",
+        BinOp::I32x4GtU => "i32x4.gt_u",
+        BinOp::I32x4LeS => "i32x4.le_s",
+        BinOp::I32x4LeU => "i32x4.le_u",
+        BinOp::I32x4GeS => "i32x4.ge_s",
+        BinOp::I32x4GeU => "i32x4.ge_u",
+        BinOp::I32x4Shl => "i32x4.shl",
+        BinOp::I32x4ShrS => "i32x4.shr_s",
+        BinOp::I32x4ShrU => "i32x4.shr_u",
+        BinOp::I64x2Add => "i64x2.add",
+        BinOp::I64x2Sub => "i64x2.sub",
+        BinOp::I64x2Mul => "i64x2.mul",
+        BinOp::I64x2Eq => "i64x2.eq",
+        BinOp::I64x2Ne => "i64x2.ne",
+        BinOp::I64x2LtS => "i64x2.lt_s",
+        BinOp::I64x2GtS => "i64x2.gt_s",
+        BinOp::I64x2LeS => "i64x2.le_s",
+        BinOp::I64x2GeS => "i64x2.ge_s",
+        BinOp::I64x2Shl => "i64x2.shl",
+        BinOp::I64x2ShrS => "i64x2.shr_s",
+        BinOp::I64x2ShrU => "i64x2.shr_u",
+        BinOp::F32x4Add => "f32x4.add",
+        BinOp::F32x4Sub => "f32x4.sub",
+        BinOp::F32x4Mul => "f32x4.mul",
+        BinOp::F32x4Div => "f32x4.div",
+        BinOp::F32x4Min => "f32x4.min",
+        BinOp::F32x4Max => "f32x4.max",
+        BinOp::F32x4PMin => "f32x4.pmin",
+        BinOp::F32x4PMax => "f32x4.pmax",
+        BinOp::F32x4Eq => "f32x4.eq",
+        BinOp::F32x4Ne => "f32x4.ne",
+        BinOp::F32x4Lt => "f32x4.lt",
+        BinOp::F32x4Gt => "f32x4.gt",
+        BinOp::F32x4Le => "f32x4.le",
+        BinOp::F32x4Ge => "f32x4.ge",
+        BinOp::F64x2Add => "f64x2.add",
+        BinOp::F64x2Sub => "f64x2.sub",
+        BinOp::F64x2Mul => "f64x2.mul",
+        BinOp::F64x2Div => "f64x2.div",
+        BinOp::F64x2Min => "f64x2.min",
+        BinOp::F64x2Max => "f64x2.max",
+        BinOp::F64x2PMin => "f64x2.pmin",
+        BinOp::F64x2PMax => "f64x2.pmax",
+        BinOp::F64x2Eq => "f64x2.eq",
+        BinOp::F64x2Ne => "f64x2.ne",
+        BinOp::F64x2Lt => "f64x2.lt",
+        BinOp::F64x2Gt => "f64x2.gt",
+        BinOp::F64x2Le => "f64x2.le",
+        BinOp::F64x2Ge => "f64x2.ge",
     }
 }

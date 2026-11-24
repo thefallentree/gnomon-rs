@@ -216,6 +216,8 @@ fn compile_rust_internal(
             "-O",
             "-C",
             "panic=abort",
+            "-C",
+            "target-feature=+simd128",
         ])
         .arg(&input_rs)
         .arg("-o")
@@ -586,6 +588,9 @@ fn rust_val_type(ty: ValType) -> &'static str {
     match ty {
         ValType::I32 => "i32",
         ValType::I64 => "i64",
+        ValType::F32 => "f32",
+        ValType::F64 => "f64",
+        ValType::V128 => "core::arch::wasm32::v128",
     }
 }
 
@@ -696,6 +701,12 @@ pub fn generate_strata_rs(registry: &StratumRegistry, include_candidates: bool) 
             _ => unreachable!(),
         };
 
+        let uses_v128 = op.params.iter().any(|&(_, ty)| ty == ValType::V128)
+            || op.results.contains(&ValType::V128);
+
+        if uses_v128 {
+            let _ = writeln!(ffi_decls, "        #[cfg(gnomon_simd_ffi)]");
+        }
         if ident != op.name {
             let _ = writeln!(ffi_decls, "        #[link_name = {:?}]", op.name);
         }
@@ -714,6 +725,13 @@ pub fn generate_strata_rs(registry: &StratumRegistry, include_candidates: bool) 
         }
         if !entry.law_names.is_empty() {
             let _ = writeln!(wrappers, "/// Proved laws: {}", entry.law_names.join(", "));
+        }
+        if uses_v128 {
+            let _ = writeln!(
+                wrappers,
+                "/// Requires nightly `#![feature(simd_ffi)]` and `--cfg gnomon_simd_ffi`."
+            );
+            let _ = writeln!(wrappers, "#[cfg(gnomon_simd_ffi)]");
         }
         let _ = writeln!(wrappers, "#[inline(always)]");
         let _ = writeln!(wrappers, "pub fn {ident}({param_sig}){ret_sig} {{");

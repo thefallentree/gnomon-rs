@@ -335,13 +335,13 @@ pub(crate) fn max_val_id_in_region(region: &Region) -> u32 {
             TAG_STMT_LET => {
                 bump_id(ValId(slot.w0), &mut max);
                 match slot.sub {
-                    OP_COPY | OP_UN => bump_id(ValId(slot.w1), &mut max),
-                    OP_SELECT => {
+                    OP_COPY | OP_UN | OP_SIMD_EXTRACT_LANE => bump_id(ValId(slot.w1), &mut max),
+                    OP_SELECT | OP_SIMD_BITSELECT => {
                         bump_id(ValId(slot.w1), &mut max);
                         bump_id(ValId(slot.w2), &mut max);
                         bump_id(ValId(slot.w3), &mut max);
                     }
-                    OP_BIN => {
+                    OP_BIN | OP_SIMD_REPLACE_LANE | OP_SIMD_SHUFFLE => {
                         bump_id(ValId(slot.w1), &mut max);
                         bump_id(ValId(slot.w2), &mut max);
                     }
@@ -753,11 +753,25 @@ impl ExactPool {
         if stmts.is_empty() {
             return Span::EMPTY;
         }
-        let start = self.len as u32;
+        let aux_base = self.len as u32;
         let mut i = 0;
         while i < stmts.len() {
-            self.push(IrSlot::from_stmt(stmts[i]));
+            if let Stmt::Let { op: Op::SimdShuffle { lanes, .. }, .. } = stmts[i] {
+                self.push(IrSlot::node_aux_shuffle(lanes));
+            }
             i += 1;
+        }
+        let start = self.len as u32;
+        let mut aux_k = 0u32;
+        let mut j = 0;
+        while j < stmts.len() {
+            if let Stmt::Let { dst, ty, op: Op::SimdShuffle { lhs, rhs, .. } } = stmts[j] {
+                self.push(IrSlot::let_simd_shuffle(dst, ty, lhs, rhs, aux_base + aux_k));
+                aux_k += 1;
+            } else {
+                self.push(IrSlot::from_stmt(stmts[j]));
+            }
+            j += 1;
         }
         Span { start, len: stmts.len() as u32 }
     }
@@ -855,6 +869,25 @@ fn remap_leaf_stmt(
                 Op::MemoryGrow { mem, delta } => {
                     Op::MemoryGrow { mem, delta: scope.lookup(delta) }
                 }
+                Op::SimdExtractLane { kind, lane, vec } => {
+                    Op::SimdExtractLane { kind, lane, vec: scope.lookup(vec) }
+                }
+                Op::SimdReplaceLane { kind, lane, vec, val } => Op::SimdReplaceLane {
+                    kind,
+                    lane,
+                    vec: scope.lookup(vec),
+                    val: scope.lookup(val),
+                },
+                Op::SimdBitselect { a, b, mask } => Op::SimdBitselect {
+                    a: scope.lookup(a),
+                    b: scope.lookup(b),
+                    mask: scope.lookup(mask),
+                },
+                Op::SimdShuffle { lhs, rhs, lanes } => Op::SimdShuffle {
+                    lhs: scope.lookup(lhs),
+                    rhs: scope.lookup(rhs),
+                    lanes,
+                },
                 other => other,
             };
             Stmt::Let { dst: scope.fresh(dst, next), ty, op: new_op }

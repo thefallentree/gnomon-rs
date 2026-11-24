@@ -1655,10 +1655,7 @@ fn smt_model_to_contract_cex(
             .iter()
             .find(|(id, _)| *id == vid)
             .map(|(_, v)| *v)
-            .unwrap_or(match ty {
-                ValType::I32 => Val::I32(0),
-                ValType::I64 => Val::I64(0),
-            });
+            .unwrap_or(Val::default_for(ty));
         scalar_values.push((vid.0, val.into()));
     }
     for &(vid, val) in &model.scalar_values {
@@ -1858,10 +1855,7 @@ fn model_to_counterexample(
             .iter()
             .find(|(id, _)| *id == vid)
             .map(|(_, v)| *v)
-            .unwrap_or(match ty {
-                ValType::I32 => Val::I32(0),
-                ValType::I64 => Val::I64(0),
-            });
+            .unwrap_or(Val::default_for(ty));
         bindings.push((vid, val));
     }
     for &(vid, val) in &model.scalar_values {
@@ -2012,7 +2006,7 @@ fn compute_law_digest(
     }
     for &(vid, ty) in params {
         hasher.update(vid.0.to_le_bytes());
-        hasher.update([matches!(ty, ValType::I64) as u8]);
+        hasher.update([ty.to_u8()]);
     }
     if let Ok(s) = serde_json::to_vec(&IrRegion::from_kernel(pre)) {
         hasher.update(&s);
@@ -2088,13 +2082,29 @@ fn max_val_in_region(region: &Region) -> u32 {
                             Stmt::Let { dst, op, .. } => {
                                 m = m.max(dst.0);
                                 match op {
-                                    Op::Copy(a) | Op::Un(_, a) | Op::Load { addr: a, .. }
-                                    | Op::MemoryGrow { delta: a, .. } => m = m.max(a.0),
-                                    Op::Bin(_, a, b) => m = m.max(a.0).max(b.0),
+                                    Op::ConstI32(_)
+                                    | Op::ConstI64(_)
+                                    | Op::ConstF32(_)
+                                    | Op::ConstF64(_)
+                                    | Op::ConstV128(_)
+                                    | Op::GlobalGet(_)
+                                    | Op::MemorySize(_) => {}
+                                    Op::Copy(a)
+                                    | Op::Un(_, a)
+                                    | Op::Load { addr: a, .. }
+                                    | Op::MemoryGrow { delta: a, .. }
+                                    | Op::SimdExtractLane { vec: a, .. } => m = m.max(a.0),
+                                    Op::Bin(_, a, b)
+                                    | Op::SimdReplaceLane { vec: a, val: b, .. }
+                                    | Op::SimdShuffle { lhs: a, rhs: b, .. } => {
+                                        m = m.max(a.0).max(b.0);
+                                    }
                                     Op::Select { cond, true_val, false_val } => {
                                         m = m.max(cond.0).max(true_val.0).max(false_val.0);
                                     }
-                                    _ => {}
+                                    Op::SimdBitselect { a, b, mask } => {
+                                        m = m.max(a.0).max(b.0).max(mask.0);
+                                    }
                                 }
                             }
                             Stmt::Call { results, args, .. } => {

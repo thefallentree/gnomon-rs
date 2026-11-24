@@ -8,6 +8,7 @@
 extern crate alloc;
 
 pub mod eval;
+pub mod fp;
 pub mod ir;
 #[cfg(kani)]
 mod kani_proofs;

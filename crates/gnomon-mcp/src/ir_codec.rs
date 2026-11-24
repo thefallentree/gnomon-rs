@@ -6,7 +6,7 @@ use std::path::Path;
 use base64::Engine as _;
 use gnomon_kernel::{
     BinOp, CallTarget, EffectOp, FuncDef, FuncId, GlobalDef, GlobalId, HostCallId, HostContract,
-    Law, LawKind, LawList, MemId, MemWidth, MemoryDef, Module, OffsetRange, Op, Region,
+    LaneKind, Law, LawKind, LawList, MemId, MemWidth, MemoryDef, Module, OffsetRange, Op, Region,
     RegionBuilder, RegionNode, RegionRef, SliceBound, Span, Stmt, Stratum, StratumId, StratumOp,
     StratumRegistry, TrapCode, UnOp, Val, ValId, ValType,
 };
@@ -362,6 +362,9 @@ impl IrDocument {
 pub enum IrValType {
     I32,
     I64,
+    F32,
+    F64,
+    V128,
 }
 
 impl From<ValType> for IrValType {
@@ -369,6 +372,9 @@ impl From<ValType> for IrValType {
         match v {
             ValType::I32 => IrValType::I32,
             ValType::I64 => IrValType::I64,
+            ValType::F32 => IrValType::F32,
+            ValType::F64 => IrValType::F64,
+            ValType::V128 => IrValType::V128,
         }
     }
 }
@@ -378,15 +384,23 @@ impl From<IrValType> for ValType {
         match v {
             IrValType::I32 => ValType::I32,
             IrValType::I64 => ValType::I64,
+            IrValType::F32 => ValType::F32,
+            IrValType::F64 => ValType::F64,
+            IrValType::V128 => ValType::V128,
         }
     }
 }
 
+/// Lossless JSON value DTO: two's-complement `i32`/`i64`, raw IEEE-754 bit patterns
+/// `u32`/`u64` for `f32`/`f64`, and little-endian `[lo, hi]` (`[u64; 2]`) for `v128`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(tag = "ty", content = "val", rename_all = "lowercase")]
 pub enum IrVal {
     I32(i32),
     I64(i64),
+    F32(u32),
+    F64(u64),
+    V128([u64; 2]),
 }
 
 impl From<Val> for IrVal {
@@ -394,6 +408,9 @@ impl From<Val> for IrVal {
         match v {
             Val::I32(x) => IrVal::I32(x),
             Val::I64(x) => IrVal::I64(x),
+            Val::F32(bits) => IrVal::F32(bits),
+            Val::F64(bits) => IrVal::F64(bits),
+            Val::V128(bits) => IrVal::V128([bits as u64, (bits >> 64) as u64]),
         }
     }
 }
@@ -403,6 +420,9 @@ impl From<IrVal> for Val {
         match v {
             IrVal::I32(x) => Val::I32(x),
             IrVal::I64(x) => Val::I64(x),
+            IrVal::F32(bits) => Val::F32(bits),
+            IrVal::F64(bits) => Val::F64(bits),
+            IrVal::V128([lo, hi]) => Val::V128((lo as u128) | ((hi as u128) << 64)),
         }
     }
 }
@@ -585,6 +605,9 @@ pub enum IrCallTarget {
 pub enum IrOp {
     ConstI32 { val: i32 },
     ConstI64 { val: i64 },
+    ConstF32 { bits: u32 },
+    ConstF64 { bits: u64 },
+    ConstV128 { bits: [u64; 2] },
     Copy { src: u32 },
     Un { unop: IrUnOp, arg: u32 },
     Bin { binop: IrBinOp, lhs: u32, rhs: u32 },
@@ -600,6 +623,10 @@ pub enum IrOp {
     GlobalGet { id: u32 },
     MemorySize { mem: u16 },
     MemoryGrow { mem: u16, delta: u32 },
+    SimdExtractLane { kind: IrLaneKind, lane: u8, vec: u32 },
+    SimdReplaceLane { kind: IrLaneKind, lane: u8, vec: u32, val: u32 },
+    SimdBitselect { a: u32, b: u32, mask: u32 },
+    SimdShuffle { lhs: u32, rhs: u32, lanes: [u8; 16] },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -620,6 +647,7 @@ pub enum IrMemWidth {
     B2,
     B4,
     B8,
+    B16,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
@@ -633,9 +661,45 @@ pub enum IrTrapCode {
     Unreachable,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum IrUnOp {
+macro_rules! mirror_ir_enum {
+    ($ir_ty:ident <-> $kernel_ty:ident { $($variant:ident),+ $(,)? }) => {
+        #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+        #[serde(rename_all = "snake_case")]
+        pub enum $ir_ty {
+            $($variant,)+
+        }
+
+        impl From<$kernel_ty> for $ir_ty {
+            fn from(v: $kernel_ty) -> Self {
+                match v {
+                    $($kernel_ty::$variant => $ir_ty::$variant,)+
+                }
+            }
+        }
+
+        impl From<$ir_ty> for $kernel_ty {
+            fn from(v: $ir_ty) -> Self {
+                match v {
+                    $($ir_ty::$variant => $kernel_ty::$variant,)+
+                }
+            }
+        }
+    };
+}
+
+mirror_ir_enum!(IrLaneKind <-> LaneKind {
+    I8x16S,
+    I8x16U,
+    I16x8S,
+    I16x8U,
+    I32x4,
+    I64x2,
+    F32x4,
+    F64x2,
+});
+
+mirror_ir_enum!(IrUnOp <-> UnOp {
+    // Integer unary (0..=15)
     I32Eqz,
     I64Eqz,
     I32Clz,
@@ -652,11 +716,100 @@ pub enum IrUnOp {
     I64Extend8S,
     I64Extend16S,
     I64Extend32S,
-}
+    // Scalar FP unary (16..=29)
+    F32Abs,
+    F32Neg,
+    F32Ceil,
+    F32Floor,
+    F32Trunc,
+    F32Nearest,
+    F32Sqrt,
+    F64Abs,
+    F64Neg,
+    F64Ceil,
+    F64Floor,
+    F64Trunc,
+    F64Nearest,
+    F64Sqrt,
+    // Trapping float-to-int truncations (30..=37)
+    I32TruncF32S,
+    I32TruncF32U,
+    I32TruncF64S,
+    I32TruncF64U,
+    I64TruncF32S,
+    I64TruncF32U,
+    I64TruncF64S,
+    I64TruncF64U,
+    // Saturating float-to-int truncations (38..=45)
+    I32TruncSatF32S,
+    I32TruncSatF32U,
+    I32TruncSatF64S,
+    I32TruncSatF64U,
+    I64TruncSatF32S,
+    I64TruncSatF32U,
+    I64TruncSatF64S,
+    I64TruncSatF64U,
+    // Int-to-float conversions (46..=53)
+    F32ConvertI32S,
+    F32ConvertI32U,
+    F32ConvertI64S,
+    F32ConvertI64U,
+    F64ConvertI32S,
+    F64ConvertI32U,
+    F64ConvertI64S,
+    F64ConvertI64U,
+    // Demote / Promote / Reinterpret (54..=59)
+    F32DemoteF64,
+    F64PromoteF32,
+    I32ReinterpretF32,
+    I64ReinterpretF64,
+    F32ReinterpretI32,
+    F64ReinterpretI64,
+    // v128 unary / splat / bitmask / lane-convert (60..=99)
+    V128Not,
+    V128AnyTrue,
+    I8x16Splat,
+    I16x8Splat,
+    I32x4Splat,
+    I64x2Splat,
+    F32x4Splat,
+    F64x2Splat,
+    I8x16Bitmask,
+    I16x8Bitmask,
+    I32x4Bitmask,
+    I64x2Bitmask,
+    I32x4AllTrue,
+    I64x2AllTrue,
+    I32x4Abs,
+    I32x4Neg,
+    I64x2Abs,
+    I64x2Neg,
+    F32x4Abs,
+    F32x4Neg,
+    F32x4Sqrt,
+    F32x4Ceil,
+    F32x4Floor,
+    F32x4Trunc,
+    F32x4Nearest,
+    F64x2Abs,
+    F64x2Neg,
+    F64x2Sqrt,
+    F64x2Ceil,
+    F64x2Floor,
+    F64x2Trunc,
+    F64x2Nearest,
+    I32x4TruncSatF32x4S,
+    I32x4TruncSatF32x4U,
+    F32x4ConvertI32x4S,
+    F32x4ConvertI32x4U,
+    I64x2ExtendLowI32x4S,
+    I64x2ExtendLowI32x4U,
+    I64x2ExtendHighI32x4S,
+    I64x2ExtendHighI32x4U,
+});
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum IrBinOp {
+mirror_ir_enum!(IrBinOp <-> BinOp {
+    // Integer binary (0..=49)
     I32Eq,
     I32Ne,
     I32LtS,
@@ -707,7 +860,104 @@ pub enum IrBinOp {
     I64ShrU,
     I64Rotl,
     I64Rotr,
-}
+    // Scalar FP binary (50..=75)
+    F32Add,
+    F32Sub,
+    F32Mul,
+    F32Div,
+    F32Min,
+    F32Max,
+    F32Copysign,
+    F32Eq,
+    F32Ne,
+    F32Lt,
+    F32Gt,
+    F32Le,
+    F32Ge,
+    F64Add,
+    F64Sub,
+    F64Mul,
+    F64Div,
+    F64Min,
+    F64Max,
+    F64Copysign,
+    F64Eq,
+    F64Ne,
+    F64Lt,
+    F64Gt,
+    F64Le,
+    F64Ge,
+    // v128 bitwise & swizzle (76..=80)
+    V128And,
+    V128AndNot,
+    V128Or,
+    V128Xor,
+    I8x16Swizzle,
+    // i32x4 lane binary (81..=100)
+    I32x4Add,
+    I32x4Sub,
+    I32x4Mul,
+    I32x4MinS,
+    I32x4MinU,
+    I32x4MaxS,
+    I32x4MaxU,
+    I32x4Eq,
+    I32x4Ne,
+    I32x4LtS,
+    I32x4LtU,
+    I32x4GtS,
+    I32x4GtU,
+    I32x4LeS,
+    I32x4LeU,
+    I32x4GeS,
+    I32x4GeU,
+    I32x4Shl,
+    I32x4ShrS,
+    I32x4ShrU,
+    // i64x2 lane binary (101..=112)
+    I64x2Add,
+    I64x2Sub,
+    I64x2Mul,
+    I64x2Eq,
+    I64x2Ne,
+    I64x2LtS,
+    I64x2GtS,
+    I64x2LeS,
+    I64x2GeS,
+    I64x2Shl,
+    I64x2ShrS,
+    I64x2ShrU,
+    // f32x4 lane binary (113..=126)
+    F32x4Add,
+    F32x4Sub,
+    F32x4Mul,
+    F32x4Div,
+    F32x4Min,
+    F32x4Max,
+    F32x4PMin,
+    F32x4PMax,
+    F32x4Eq,
+    F32x4Ne,
+    F32x4Lt,
+    F32x4Gt,
+    F32x4Le,
+    F32x4Ge,
+    // f64x2 lane binary (127..=140)
+    F64x2Add,
+    F64x2Sub,
+    F64x2Mul,
+    F64x2Div,
+    F64x2Min,
+    F64x2Max,
+    F64x2PMin,
+    F64x2PMax,
+    F64x2Eq,
+    F64x2Ne,
+    F64x2Lt,
+    F64x2Gt,
+    F64x2Le,
+    F64x2Ge,
+});
 
 // ===========================================================================
 // Persistent Stratum / Law DTOs (for `--state` JSON persistence)
@@ -1217,6 +1467,7 @@ impl From<MemWidth> for IrMemWidth {
             MemWidth::B2 => IrMemWidth::B2,
             MemWidth::B4 => IrMemWidth::B4,
             MemWidth::B8 => IrMemWidth::B8,
+            MemWidth::B16 => IrMemWidth::B16,
         }
     }
 }
@@ -1228,6 +1479,7 @@ impl From<IrMemWidth> for MemWidth {
             IrMemWidth::B2 => MemWidth::B2,
             IrMemWidth::B4 => MemWidth::B4,
             IrMemWidth::B8 => MemWidth::B8,
+            IrMemWidth::B16 => MemWidth::B16,
         }
     }
 }
@@ -1263,6 +1515,9 @@ impl From<Op> for IrOp {
         match op {
             Op::ConstI32(val) => IrOp::ConstI32 { val },
             Op::ConstI64(val) => IrOp::ConstI64 { val },
+            Op::ConstF32(bits) => IrOp::ConstF32 { bits },
+            Op::ConstF64(bits) => IrOp::ConstF64 { bits },
+            Op::ConstV128(bits) => IrOp::ConstV128 { bits: [bits as u64, (bits >> 64) as u64] },
             Op::Copy(src) => IrOp::Copy { src: src.0 },
             Op::Un(unop, arg) => IrOp::Un { unop: unop.into(), arg: arg.0 },
             Op::Bin(binop, lhs, rhs) => IrOp::Bin { binop: binop.into(), lhs: lhs.0, rhs: rhs.0 },
@@ -1282,6 +1537,27 @@ impl From<Op> for IrOp {
             Op::GlobalGet(id) => IrOp::GlobalGet { id: id.0 },
             Op::MemorySize(mem) => IrOp::MemorySize { mem: mem.0 },
             Op::MemoryGrow { mem, delta } => IrOp::MemoryGrow { mem: mem.0, delta: delta.0 },
+            Op::SimdExtractLane { kind, lane, vec } => IrOp::SimdExtractLane {
+                kind: kind.into(),
+                lane,
+                vec: vec.0,
+            },
+            Op::SimdReplaceLane { kind, lane, vec, val } => IrOp::SimdReplaceLane {
+                kind: kind.into(),
+                lane,
+                vec: vec.0,
+                val: val.0,
+            },
+            Op::SimdBitselect { a, b, mask } => IrOp::SimdBitselect {
+                a: a.0,
+                b: b.0,
+                mask: mask.0,
+            },
+            Op::SimdShuffle { lhs, rhs, lanes } => IrOp::SimdShuffle {
+                lhs: lhs.0,
+                rhs: rhs.0,
+                lanes,
+            },
         }
     }
 }
@@ -1291,6 +1567,11 @@ impl From<IrOp> for Op {
         match op {
             IrOp::ConstI32 { val } => Op::ConstI32(val),
             IrOp::ConstI64 { val } => Op::ConstI64(val),
+            IrOp::ConstF32 { bits } => Op::ConstF32(bits),
+            IrOp::ConstF64 { bits } => Op::ConstF64(bits),
+            IrOp::ConstV128 { bits: [lo, hi] } => {
+                Op::ConstV128((lo as u128) | ((hi as u128) << 64))
+            }
             IrOp::Copy { src } => Op::Copy(ValId(src)),
             IrOp::Un { unop, arg } => Op::Un(unop.into(), ValId(arg)),
             IrOp::Bin { binop, lhs, rhs } => Op::Bin(binop.into(), ValId(lhs), ValId(rhs)),
@@ -1312,6 +1593,27 @@ impl From<IrOp> for Op {
             IrOp::MemoryGrow { mem, delta } => {
                 Op::MemoryGrow { mem: MemId(mem), delta: ValId(delta) }
             }
+            IrOp::SimdExtractLane { kind, lane, vec } => Op::SimdExtractLane {
+                kind: kind.into(),
+                lane,
+                vec: ValId(vec),
+            },
+            IrOp::SimdReplaceLane { kind, lane, vec, val } => Op::SimdReplaceLane {
+                kind: kind.into(),
+                lane,
+                vec: ValId(vec),
+                val: ValId(val),
+            },
+            IrOp::SimdBitselect { a, b, mask } => Op::SimdBitselect {
+                a: ValId(a),
+                b: ValId(b),
+                mask: ValId(mask),
+            },
+            IrOp::SimdShuffle { lhs, rhs, lanes } => Op::SimdShuffle {
+                lhs: ValId(lhs),
+                rhs: ValId(rhs),
+                lanes,
+            },
         }
     }
 }
@@ -1374,166 +1676,6 @@ impl From<IrEffectOp> for EffectOp {
             }
             IrEffectOp::Trap { code } => EffectOp::Trap(code.into()),
             IrEffectOp::Nop => EffectOp::Nop,
-        }
-    }
-}
-
-impl From<UnOp> for IrUnOp {
-    fn from(u: UnOp) -> Self {
-        match u {
-            UnOp::I32Eqz => IrUnOp::I32Eqz,
-            UnOp::I64Eqz => IrUnOp::I64Eqz,
-            UnOp::I32Clz => IrUnOp::I32Clz,
-            UnOp::I32Ctz => IrUnOp::I32Ctz,
-            UnOp::I32Popcnt => IrUnOp::I32Popcnt,
-            UnOp::I64Clz => IrUnOp::I64Clz,
-            UnOp::I64Ctz => IrUnOp::I64Ctz,
-            UnOp::I64Popcnt => IrUnOp::I64Popcnt,
-            UnOp::I32WrapI64 => IrUnOp::I32WrapI64,
-            UnOp::I64ExtendI32S => IrUnOp::I64ExtendI32S,
-            UnOp::I64ExtendI32U => IrUnOp::I64ExtendI32U,
-            UnOp::I32Extend8S => IrUnOp::I32Extend8S,
-            UnOp::I32Extend16S => IrUnOp::I32Extend16S,
-            UnOp::I64Extend8S => IrUnOp::I64Extend8S,
-            UnOp::I64Extend16S => IrUnOp::I64Extend16S,
-            UnOp::I64Extend32S => IrUnOp::I64Extend32S,
-        }
-    }
-}
-
-impl From<IrUnOp> for UnOp {
-    fn from(u: IrUnOp) -> Self {
-        match u {
-            IrUnOp::I32Eqz => UnOp::I32Eqz,
-            IrUnOp::I64Eqz => UnOp::I64Eqz,
-            IrUnOp::I32Clz => UnOp::I32Clz,
-            IrUnOp::I32Ctz => UnOp::I32Ctz,
-            IrUnOp::I32Popcnt => UnOp::I32Popcnt,
-            IrUnOp::I64Clz => UnOp::I64Clz,
-            IrUnOp::I64Ctz => UnOp::I64Ctz,
-            IrUnOp::I64Popcnt => UnOp::I64Popcnt,
-            IrUnOp::I32WrapI64 => UnOp::I32WrapI64,
-            IrUnOp::I64ExtendI32S => UnOp::I64ExtendI32S,
-            IrUnOp::I64ExtendI32U => UnOp::I64ExtendI32U,
-            IrUnOp::I32Extend8S => UnOp::I32Extend8S,
-            IrUnOp::I32Extend16S => UnOp::I32Extend16S,
-            IrUnOp::I64Extend8S => UnOp::I64Extend8S,
-            IrUnOp::I64Extend16S => UnOp::I64Extend16S,
-            IrUnOp::I64Extend32S => UnOp::I64Extend32S,
-        }
-    }
-}
-
-impl From<BinOp> for IrBinOp {
-    fn from(b: BinOp) -> Self {
-        match b {
-            BinOp::I32Eq => IrBinOp::I32Eq,
-            BinOp::I32Ne => IrBinOp::I32Ne,
-            BinOp::I32LtS => IrBinOp::I32LtS,
-            BinOp::I32LtU => IrBinOp::I32LtU,
-            BinOp::I32GtS => IrBinOp::I32GtS,
-            BinOp::I32GtU => IrBinOp::I32GtU,
-            BinOp::I32LeS => IrBinOp::I32LeS,
-            BinOp::I32LeU => IrBinOp::I32LeU,
-            BinOp::I32GeS => IrBinOp::I32GeS,
-            BinOp::I32GeU => IrBinOp::I32GeU,
-            BinOp::I64Eq => IrBinOp::I64Eq,
-            BinOp::I64Ne => IrBinOp::I64Ne,
-            BinOp::I64LtS => IrBinOp::I64LtS,
-            BinOp::I64LtU => IrBinOp::I64LtU,
-            BinOp::I64GtS => IrBinOp::I64GtS,
-            BinOp::I64GtU => IrBinOp::I64GtU,
-            BinOp::I64LeS => IrBinOp::I64LeS,
-            BinOp::I64LeU => IrBinOp::I64LeU,
-            BinOp::I64GeS => IrBinOp::I64GeS,
-            BinOp::I64GeU => IrBinOp::I64GeU,
-            BinOp::I32Add => IrBinOp::I32Add,
-            BinOp::I32Sub => IrBinOp::I32Sub,
-            BinOp::I32Mul => IrBinOp::I32Mul,
-            BinOp::I32DivS => IrBinOp::I32DivS,
-            BinOp::I32DivU => IrBinOp::I32DivU,
-            BinOp::I32RemS => IrBinOp::I32RemS,
-            BinOp::I32RemU => IrBinOp::I32RemU,
-            BinOp::I64Add => IrBinOp::I64Add,
-            BinOp::I64Sub => IrBinOp::I64Sub,
-            BinOp::I64Mul => IrBinOp::I64Mul,
-            BinOp::I64DivS => IrBinOp::I64DivS,
-            BinOp::I64DivU => IrBinOp::I64DivU,
-            BinOp::I64RemS => IrBinOp::I64RemS,
-            BinOp::I64RemU => IrBinOp::I64RemU,
-            BinOp::I32And => IrBinOp::I32And,
-            BinOp::I32Or => IrBinOp::I32Or,
-            BinOp::I32Xor => IrBinOp::I32Xor,
-            BinOp::I32Shl => IrBinOp::I32Shl,
-            BinOp::I32ShrS => IrBinOp::I32ShrS,
-            BinOp::I32ShrU => IrBinOp::I32ShrU,
-            BinOp::I32Rotl => IrBinOp::I32Rotl,
-            BinOp::I32Rotr => IrBinOp::I32Rotr,
-            BinOp::I64And => IrBinOp::I64And,
-            BinOp::I64Or => IrBinOp::I64Or,
-            BinOp::I64Xor => IrBinOp::I64Xor,
-            BinOp::I64Shl => IrBinOp::I64Shl,
-            BinOp::I64ShrS => IrBinOp::I64ShrS,
-            BinOp::I64ShrU => IrBinOp::I64ShrU,
-            BinOp::I64Rotl => IrBinOp::I64Rotl,
-            BinOp::I64Rotr => IrBinOp::I64Rotr,
-        }
-    }
-}
-
-impl From<IrBinOp> for BinOp {
-    fn from(b: IrBinOp) -> Self {
-        match b {
-            IrBinOp::I32Eq => BinOp::I32Eq,
-            IrBinOp::I32Ne => BinOp::I32Ne,
-            IrBinOp::I32LtS => BinOp::I32LtS,
-            IrBinOp::I32LtU => BinOp::I32LtU,
-            IrBinOp::I32GtS => BinOp::I32GtS,
-            IrBinOp::I32GtU => BinOp::I32GtU,
-            IrBinOp::I32LeS => BinOp::I32LeS,
-            IrBinOp::I32LeU => BinOp::I32LeU,
-            IrBinOp::I32GeS => BinOp::I32GeS,
-            IrBinOp::I32GeU => BinOp::I32GeU,
-            IrBinOp::I64Eq => BinOp::I64Eq,
-            IrBinOp::I64Ne => BinOp::I64Ne,
-            IrBinOp::I64LtS => BinOp::I64LtS,
-            IrBinOp::I64LtU => BinOp::I64LtU,
-            IrBinOp::I64GtS => BinOp::I64GtS,
-            IrBinOp::I64GtU => BinOp::I64GtU,
-            IrBinOp::I64LeS => BinOp::I64LeS,
-            IrBinOp::I64LeU => BinOp::I64LeU,
-            IrBinOp::I64GeS => BinOp::I64GeS,
-            IrBinOp::I64GeU => BinOp::I64GeU,
-            IrBinOp::I32Add => BinOp::I32Add,
-            IrBinOp::I32Sub => BinOp::I32Sub,
-            IrBinOp::I32Mul => BinOp::I32Mul,
-            IrBinOp::I32DivS => BinOp::I32DivS,
-            IrBinOp::I32DivU => BinOp::I32DivU,
-            IrBinOp::I32RemS => BinOp::I32RemS,
-            IrBinOp::I32RemU => BinOp::I32RemU,
-            IrBinOp::I64Add => BinOp::I64Add,
-            IrBinOp::I64Sub => BinOp::I64Sub,
-            IrBinOp::I64Mul => BinOp::I64Mul,
-            IrBinOp::I64DivS => BinOp::I64DivS,
-            IrBinOp::I64DivU => BinOp::I64DivU,
-            IrBinOp::I64RemS => BinOp::I64RemS,
-            IrBinOp::I64RemU => BinOp::I64RemU,
-            IrBinOp::I32And => BinOp::I32And,
-            IrBinOp::I32Or => BinOp::I32Or,
-            IrBinOp::I32Xor => BinOp::I32Xor,
-            IrBinOp::I32Shl => BinOp::I32Shl,
-            IrBinOp::I32ShrS => BinOp::I32ShrS,
-            IrBinOp::I32ShrU => BinOp::I32ShrU,
-            IrBinOp::I32Rotl => BinOp::I32Rotl,
-            IrBinOp::I32Rotr => BinOp::I32Rotr,
-            IrBinOp::I64And => BinOp::I64And,
-            IrBinOp::I64Or => BinOp::I64Or,
-            IrBinOp::I64Xor => BinOp::I64Xor,
-            IrBinOp::I64Shl => BinOp::I64Shl,
-            IrBinOp::I64ShrS => BinOp::I64ShrS,
-            IrBinOp::I64ShrU => BinOp::I64ShrU,
-            IrBinOp::I64Rotl => BinOp::I64Rotl,
-            IrBinOp::I64Rotr => BinOp::I64Rotr,
         }
     }
 }

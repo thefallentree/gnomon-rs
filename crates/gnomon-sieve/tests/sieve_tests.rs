@@ -1,9 +1,9 @@
 use gnomon_kernel::{
     BinOp, CallTarget, EffectOp, FuncDef, FuncId, GlobalDef, GlobalId, HeapState, HostCallId,
-    HostContract, Law, LawKind, LawList, MemId, MemWidth, MemoryDef, Module, OffsetRange, Op,
-    Region, RegionBuilder, RegionList, RegionNode, SliceBound, Stratum, StratumId, StratumOp,
+    HostContract, LaneKind, Law, LawKind, LawList, MemId, MemWidth, MemoryDef, Module, OffsetRange,
+    Op, Region, RegionBuilder, RegionList, RegionNode, SliceBound, Stratum, StratumId, StratumOp,
     StratumRegistry, TrapCode, UnOp, Val, ValId, ValType, VcKind, VcObligation, WASM_PAGE_SIZE,
-    eval_region, split_invariant_loop,
+    eval_region, fp, split_invariant_loop,
 };
 use gnomon_sieve::{
     BitwuzlaNativeBackend, BitwuzlaPipeBackend, CliffLevel, ContractSpec, EgglogSimplifier,
@@ -3592,5 +3592,1043 @@ fn test_smt_sequential_ifs_after_load_no_oom_blowup() {
             elapsed_ms < 200,
             "[{name}] sim_body with 25 sequential IfElses took {elapsed_ms} ms (must be < 200 ms)"
         );
+    });
+}
+
+#[test]
+fn test_ieee754_corner_cases_both_backends() {
+    let module = Module::default();
+    let reg = StratumRegistry::new();
+
+    // 1. -0.0 vs +0.0: f32.eq(-0.0, +0.0) == 1 (proved UNSAT), while structural F32 equivalence
+    //    between `x + +0.0` and `x` is FALSIFIED on x = -0.0 (or non-canonical NaN)!
+    let pre_neg_pos_zero = Region::build(|b| {
+        b.push_let(ValId(10), ValType::F32, Op::ConstF32(0x8000_0000)); // -0.0
+        b.push_let(ValId(11), ValType::F32, Op::ConstF32(0x0000_0000)); // +0.0
+        b.push_let(ValId(12), ValType::I32, Op::Un(UnOp::I32ReinterpretF32, ValId(0)));
+        b.push_let(ValId(13), ValType::I32, Op::Un(UnOp::I32ReinterpretF32, ValId(10)));
+        b.push_let(ValId(14), ValType::I32, Op::Bin(BinOp::I32Eq, ValId(12), ValId(13)));
+        b.push_let(ValId(15), ValType::I32, Op::Un(UnOp::I32ReinterpretF32, ValId(1)));
+        b.push_let(ValId(16), ValType::I32, Op::Un(UnOp::I32ReinterpretF32, ValId(11)));
+        b.push_let(ValId(17), ValType::I32, Op::Bin(BinOp::I32Eq, ValId(15), ValId(16)));
+        b.push_let(ValId(18), ValType::I32, Op::Bin(BinOp::I32And, ValId(14), ValId(17)));
+        b.push_yield(&[ValId(18)]);
+    });
+    let eq_ab = Region::build(|b| {
+        b.push_let(ValId(2), ValType::I32, Op::Bin(BinOp::F32Eq, ValId(0), ValId(1)));
+        b.push_yield(&[ValId(2)]);
+    });
+    let const_1 = Region::build(|b| {
+        b.push_let(ValId(2), ValType::I32, Op::ConstI32(1));
+        b.push_yield(&[ValId(2)]);
+    });
+    let min_ab = Region::build(|b| {
+        b.push_let(ValId(2), ValType::F32, Op::Bin(BinOp::F32Min, ValId(0), ValId(1)));
+        b.push_yield(&[ValId(2)]);
+    });
+    let max_ab = Region::build(|b| {
+        b.push_let(ValId(2), ValType::F32, Op::Bin(BinOp::F32Max, ValId(0), ValId(1)));
+        b.push_yield(&[ValId(2)]);
+    });
+    let const_neg_zero = Region::build(|b| {
+        b.push_let(ValId(2), ValType::F32, Op::ConstF32(0x8000_0000));
+        b.push_yield(&[ValId(2)]);
+    });
+    let const_pos_zero = Region::build(|b| {
+        b.push_let(ValId(2), ValType::F32, Op::ConstF32(0x0000_0000));
+        b.push_yield(&[ValId(2)]);
+    });
+    let add_pos_zero = Region::build(|b| {
+        b.push_let(ValId(2), ValType::F32, Op::ConstF32(0x0000_0000));
+        b.push_let(ValId(3), ValType::F32, Op::Bin(BinOp::F32Add, ValId(0), ValId(2)));
+        b.push_yield(&[ValId(3)]);
+    });
+    let id_x = Region::build(|b| {
+        b.push_let(ValId(2), ValType::F32, Op::Copy(ValId(0)));
+        b.push_yield(&[ValId(2)]);
+    });
+
+    // 2. min(NaN, 1.0) == F32_CANON_NAN (for ANY NaN payload!)
+    let pre_a_nan = Region::build(|b| {
+        b.push_let(ValId(10), ValType::I32, Op::Bin(BinOp::F32Ne, ValId(0), ValId(0)));
+        b.push_yield(&[ValId(10)]);
+    });
+    let min_a_one = Region::build(|b| {
+        b.push_let(ValId(2), ValType::F32, Op::ConstF32(1.0f32.to_bits()));
+        b.push_let(ValId(3), ValType::F32, Op::Bin(BinOp::F32Min, ValId(0), ValId(2)));
+        b.push_yield(&[ValId(3)]);
+    });
+    let canon_nan_f32 = Region::build(|b| {
+        b.push_let(ValId(2), ValType::F32, Op::ConstF32(fp::F32_CANON_NAN));
+        b.push_yield(&[ValId(2)]);
+    });
+
+    // 3. pmin / pmax exact bit preservation (non-canonical NaN payload preserved verbatim!).
+    let pmin_nan_lhs = Region::build(|b| {
+        b.push_let(ValId(2), ValType::V128, Op::Un(UnOp::F32x4Splat, ValId(0)));
+        b.push_let(ValId(3), ValType::F32, Op::ConstF32(1.0f32.to_bits()));
+        b.push_let(ValId(4), ValType::V128, Op::Un(UnOp::F32x4Splat, ValId(3)));
+        b.push_let(ValId(5), ValType::V128, Op::Bin(BinOp::F32x4PMin, ValId(2), ValId(4)));
+        b.push_let(
+            ValId(6),
+            ValType::F32,
+            Op::SimdExtractLane { kind: LaneKind::F32x4, lane: 0, vec: ValId(5) },
+        );
+        b.push_yield(&[ValId(6)]);
+    });
+    let pmax_nan_lhs = Region::build(|b| {
+        b.push_let(ValId(2), ValType::V128, Op::Un(UnOp::F32x4Splat, ValId(0)));
+        b.push_let(ValId(3), ValType::F32, Op::ConstF32(1.0f32.to_bits()));
+        b.push_let(ValId(4), ValType::V128, Op::Un(UnOp::F32x4Splat, ValId(3)));
+        b.push_let(ValId(5), ValType::V128, Op::Bin(BinOp::F32x4PMax, ValId(2), ValId(4)));
+        b.push_let(
+            ValId(6),
+            ValType::F32,
+            Op::SimdExtractLane { kind: LaneKind::F32x4, lane: 0, vec: ValId(5) },
+        );
+        b.push_yield(&[ValId(6)]);
+    });
+
+    // 4. Rounding ops on symbolic x == -0.5: ceil(-0.5) = -0.0, floor(-0.5) = -1.0,
+    //    trunc(-0.5) = -0.0, nearest(-0.5) = -0.0 (RNE!).
+    let pre_neg_half = Region::build(|b| {
+        b.push_let(ValId(10), ValType::F32, Op::ConstF32((-0.5f32).to_bits()));
+        b.push_let(ValId(11), ValType::I32, Op::Bin(BinOp::F32Eq, ValId(0), ValId(10)));
+        b.push_yield(&[ValId(11)]);
+    });
+    let round_ops_vec = Region::build(|b| {
+        b.push_let(ValId(2), ValType::F32, Op::Un(UnOp::F32Ceil, ValId(0)));
+        b.push_let(ValId(3), ValType::F32, Op::Un(UnOp::F32Floor, ValId(0)));
+        b.push_let(ValId(4), ValType::F32, Op::Un(UnOp::F32Trunc, ValId(0)));
+        b.push_let(ValId(5), ValType::F32, Op::Un(UnOp::F32Nearest, ValId(0)));
+        b.push_yield(&[ValId(2), ValId(3), ValId(4), ValId(5)]);
+    });
+    let round_ops_expected = Region::build(|b| {
+        b.push_let(ValId(2), ValType::F32, Op::ConstF32((-0.0f32).to_bits()));
+        b.push_let(ValId(3), ValType::F32, Op::ConstF32((-1.0f32).to_bits()));
+        b.push_let(ValId(4), ValType::F32, Op::ConstF32((-0.0f32).to_bits()));
+        b.push_let(ValId(5), ValType::F32, Op::ConstF32((-0.0f32).to_bits()));
+        b.push_yield(&[ValId(2), ValId(3), ValId(4), ValId(5)]);
+    });
+
+    // 5. f32.sqrt on -0.0 -> -0.0 and on -1.0 -> F32_CANON_NAN, plus sqrt(4.0) == 2.0.
+    let sqrt_x = Region::build(|b| {
+        b.push_let(ValId(2), ValType::F32, Op::Un(UnOp::F32Sqrt, ValId(0)));
+        b.push_yield(&[ValId(2)]);
+    });
+    let pre_neg_one = Region::build(|b| {
+        b.push_let(ValId(10), ValType::F32, Op::ConstF32((-1.0f32).to_bits()));
+        b.push_let(ValId(11), ValType::I32, Op::Bin(BinOp::F32Eq, ValId(0), ValId(10)));
+        b.push_yield(&[ValId(11)]);
+    });
+    let pre_four = Region::build(|b| {
+        b.push_let(ValId(10), ValType::F32, Op::ConstF32(4.0f32.to_bits()));
+        b.push_let(ValId(11), ValType::I32, Op::Bin(BinOp::F32Eq, ValId(0), ValId(10)));
+        b.push_yield(&[ValId(11)]);
+    });
+    let const_two = Region::build(|b| {
+        b.push_let(ValId(2), ValType::F32, Op::ConstF32(2.0f32.to_bits()));
+        b.push_yield(&[ValId(2)]);
+    });
+
+    // 6. trunc (trapping IntOverflow) vs trunc_sat (never traps, NaN->0, clamps MIN/MAX)
+    //    AND exact f64 -> i32_s boundary (-2147483648.9 -> i32::MIN vs -2147483649.0 -> Trap)!
+    let trunc_f32_s = Region::build(|b| {
+        b.push_let(ValId(2), ValType::I32, Op::Un(UnOp::I32TruncF32S, ValId(0)));
+        b.push_yield(&[ValId(2)]);
+    });
+    let trunc_sat_f32_s = Region::build(|b| {
+        b.push_let(ValId(2), ValType::I32, Op::Un(UnOp::I32TruncSatF32S, ValId(0)));
+        b.push_yield(&[ValId(2)]);
+    });
+    let trap_overflow = Region::build(|b| {
+        b.push_effect(EffectOp::Trap(TrapCode::IntOverflow));
+        b.push_let(ValId(2), ValType::I32, Op::ConstI32(0));
+        b.push_yield(&[ValId(2)]);
+    });
+    let const_zero_i32 = Region::build(|b| {
+        b.push_let(ValId(2), ValType::I32, Op::ConstI32(0));
+        b.push_yield(&[ValId(2)]);
+    });
+    let trunc_f64_s = Region::build(|b| {
+        b.push_let(ValId(2), ValType::I32, Op::Un(UnOp::I32TruncF64S, ValId(0)));
+        b.push_yield(&[ValId(2)]);
+    });
+    let pre_f64_just_valid = Region::build(|b| {
+        b.push_let(ValId(10), ValType::F64, Op::ConstF64((-2147483648.9f64).to_bits()));
+        b.push_let(ValId(11), ValType::I32, Op::Bin(BinOp::F64Eq, ValId(0), ValId(10)));
+        b.push_yield(&[ValId(11)]);
+    });
+    let pre_f64_just_oob = Region::build(|b| {
+        b.push_let(ValId(10), ValType::F64, Op::ConstF64((-2147483649.0f64).to_bits()));
+        b.push_let(ValId(11), ValType::I32, Op::Bin(BinOp::F64Eq, ValId(0), ValId(10)));
+        b.push_yield(&[ValId(11)]);
+    });
+    let const_i32_min = Region::build(|b| {
+        b.push_let(ValId(2), ValType::I32, Op::ConstI32(i32::MIN));
+        b.push_yield(&[ValId(2)]);
+    });
+    let trunc_f32_u = Region::build(|b| {
+        b.push_let(ValId(2), ValType::I32, Op::Un(UnOp::I32TruncF32U, ValId(0)));
+        b.push_yield(&[ValId(2)]);
+    });
+
+    with_both_backends(|backend, name| {
+        assert_eq!(
+            backend.check_equivalence(&module, &reg, &eq_ab, &const_1, Some(&pre_neg_pos_zero)).unwrap(),
+            SmtResult::Unsat,
+            "[{name}] f32.eq(-0.0, +0.0) must be 1"
+        );
+        assert_eq!(
+            backend.check_equivalence(&module, &reg, &min_ab, &const_neg_zero, Some(&pre_neg_pos_zero)).unwrap(),
+            SmtResult::Unsat,
+            "[{name}] f32.min(-0.0, +0.0) must be -0.0"
+        );
+        assert_eq!(
+            backend.check_equivalence(&module, &reg, &max_ab, &const_pos_zero, Some(&pre_neg_pos_zero)).unwrap(),
+            SmtResult::Unsat,
+            "[{name}] f32.max(-0.0, +0.0) must be +0.0"
+        );
+        // Structural difference: `x + +0.0 != x` on x = -0.0 (or non-canonical NaN).
+        match backend.check_equivalence(&module, &reg, &add_pos_zero, &id_x, None).unwrap() {
+            SmtResult::Sat(model) => {
+                let heap = HeapState::from_module(&module, 1000).unwrap();
+                let l = eval_region(&module, &reg, &add_pos_zero, &model.scalar_values, heap.clone());
+                let r = eval_region(&module, &reg, &id_x, &model.scalar_values, heap);
+                assert_ne!(l, r, "[{name}] counterexample for x + +0.0 != x must replay in kernel");
+            }
+            other => panic!("[{name}] expected Sat for x + +0.0 != x, got {other:?}"),
+        }
+        assert_eq!(
+            backend.check_equivalence(&module, &reg, &min_a_one, &canon_nan_f32, Some(&pre_a_nan)).unwrap(),
+            SmtResult::Unsat,
+            "[{name}] f32.min(NaN, 1.0) must be canonical quiet NaN"
+        );
+        assert_eq!(
+            backend.check_equivalence(&module, &reg, &pmin_nan_lhs, &id_x, Some(&pre_a_nan)).unwrap(),
+            SmtResult::Unsat,
+            "[{name}] f32x4.pmin(NaN_payload, 1.0) must preserve exact NaN payload bits"
+        );
+        assert_eq!(
+            backend.check_equivalence(&module, &reg, &pmax_nan_lhs, &id_x, Some(&pre_a_nan)).unwrap(),
+            SmtResult::Unsat,
+            "[{name}] f32x4.pmax(NaN_payload, 1.0) must preserve exact NaN payload bits"
+        );
+        assert_eq!(
+            backend.check_equivalence(&module, &reg, &round_ops_vec, &round_ops_expected, Some(&pre_neg_half)).unwrap(),
+            SmtResult::Unsat,
+            "[{name}] ceil/floor/trunc/nearest on -0.5 must preserve -0.0 and RNE"
+        );
+        assert_eq!(
+            backend.check_equivalence(&module, &reg, &sqrt_x, &const_neg_zero, Some(&pre_neg_pos_zero)).unwrap(),
+            SmtResult::Unsat,
+            "[{name}] f32.sqrt(-0.0) must preserve -0.0"
+        );
+        assert_eq!(
+            backend.check_equivalence(&module, &reg, &sqrt_x, &canon_nan_f32, Some(&pre_neg_one)).unwrap(),
+            SmtResult::Unsat,
+            "[{name}] f32.sqrt(-1.0) must be canonical quiet NaN"
+        );
+        assert_eq!(
+            backend.check_equivalence(&module, &reg, &sqrt_x, &const_two, Some(&pre_four)).unwrap(),
+            SmtResult::Unsat,
+            "[{name}] f32.sqrt(4.0) must be 2.0"
+        );
+        assert_eq!(
+            backend.check_equivalence(&module, &reg, &trunc_f32_s, &trap_overflow, Some(&pre_a_nan)).unwrap(),
+            SmtResult::Unsat,
+            "[{name}] i32.trunc_f32_s(NaN) must trap IntOverflow"
+        );
+        assert_eq!(
+            backend.check_equivalence(&module, &reg, &trunc_sat_f32_s, &const_zero_i32, Some(&pre_a_nan)).unwrap(),
+            SmtResult::Unsat,
+            "[{name}] i32.trunc_sat_f32_s(NaN) must return 0 without trapping"
+        );
+        assert_eq!(
+            backend.check_equivalence(&module, &reg, &trunc_f64_s, &const_i32_min, Some(&pre_f64_just_valid)).unwrap(),
+            SmtResult::Unsat,
+            "[{name}] i32.trunc_f64_s(-2147483648.9) must succeed with i32::MIN"
+        );
+        assert_eq!(
+            backend.check_equivalence(&module, &reg, &trunc_f64_s, &trap_overflow, Some(&pre_f64_just_oob)).unwrap(),
+            SmtResult::Unsat,
+            "[{name}] i32.trunc_f64_s(-2147483649.0) must trap IntOverflow"
+        );
+        assert_eq!(
+            backend.check_equivalence(&module, &reg, &trunc_f32_u, &const_zero_i32, Some(&pre_neg_half)).unwrap(),
+            SmtResult::Unsat,
+            "[{name}] i32.trunc_f32_u(-0.5) must truncate to 0 without trapping"
+        );
+        assert_eq!(
+            backend.check_equivalence(&module, &reg, &trunc_f32_u, &trap_overflow, Some(&pre_neg_one)).unwrap(),
+            SmtResult::Unsat,
+            "[{name}] i32.trunc_f32_u(-1.0) must trap IntOverflow"
+        );
+    });
+}
+
+#[test]
+fn test_v128_simd_equivalence_and_mem16_both_backends() {
+    let module = mod_with_mems(&[(0, 1, Some(1))]);
+    let reg = StratumRegistry::new();
+
+    // 1. i32x4 lane arithmetic + bitmask + bitselect + shuffle + B16 load/store vs scalar lane-by-lane.
+    let simd_mem_roundtrip = Region::build(|b| {
+        b.push_let(ValId(10), ValType::I32, Op::ConstI32(16));
+        b.push_let(ValId(11), ValType::V128, Op::Bin(BinOp::I32x4Add, ValId(0), ValId(1)));
+        b.push_let(ValId(12), ValType::V128, Op::Bin(BinOp::I32x4GtS, ValId(0), ValId(1)));
+        b.push_let(
+            ValId(13),
+            ValType::V128,
+            Op::SimdBitselect { a: ValId(11), b: ValId(1), mask: ValId(12) },
+        );
+        // Shuffle: swap low 8 bytes with high 8 bytes of ValId(13).
+        b.push_let(
+            ValId(14),
+            ValType::V128,
+            Op::SimdShuffle {
+                lhs: ValId(13),
+                rhs: ValId(13),
+                lanes: [8, 9, 10, 11, 12, 13, 14, 15, 0, 1, 2, 3, 4, 5, 6, 7],
+            },
+        );
+        b.push_effect(EffectOp::Store {
+            mem: MemId(0),
+            addr: ValId(10),
+            offset: 0,
+            width: MemWidth::B16,
+            val: ValId(14),
+        });
+        b.push_let(
+            ValId(15),
+            ValType::V128,
+            Op::Load {
+                mem: MemId(0),
+                addr: ValId(10),
+                offset: 0,
+                width: MemWidth::B16,
+                signed: false,
+                result_ty: ValType::V128,
+            },
+        );
+        b.push_let(ValId(16), ValType::I32, Op::Un(UnOp::I32x4Bitmask, ValId(15)));
+        b.push_yield(&[ValId(15), ValId(16)]);
+    });
+
+    let scalar_mem_roundtrip = Region::build(|b| {
+        let mut next = 100u32;
+        let mut fresh = || {
+            let id = ValId(next);
+            next += 1;
+            id
+        };
+        let mut lanes_out = [ValId(0); 4];
+        for lane in 0..4u8 {
+            let a_l = fresh();
+            let b_l = fresh();
+            let sum_l = fresh();
+            let gt_l = fresh();
+            let sel_l = fresh();
+            b.push_let(
+                a_l,
+                ValType::I32,
+                Op::SimdExtractLane { kind: LaneKind::I32x4, lane, vec: ValId(0) },
+            );
+            b.push_let(
+                b_l,
+                ValType::I32,
+                Op::SimdExtractLane { kind: LaneKind::I32x4, lane, vec: ValId(1) },
+            );
+            b.push_let(sum_l, ValType::I32, Op::Bin(BinOp::I32Add, a_l, b_l));
+            b.push_let(gt_l, ValType::I32, Op::Bin(BinOp::I32GtS, a_l, b_l));
+            b.push_let(
+                sel_l,
+                ValType::I32,
+                Op::Select { cond: gt_l, true_val: sum_l, false_val: b_l },
+            );
+            lanes_out[lane as usize] = sel_l;
+        }
+        // Swapped order: [lane2, lane3, lane0, lane1]
+        let swapped = [lanes_out[2], lanes_out[3], lanes_out[0], lanes_out[1]];
+        let mut v = fresh();
+        b.push_let(v, ValType::V128, Op::ConstV128(0));
+        let mut mask_acc = fresh();
+        b.push_let(mask_acc, ValType::I32, Op::ConstI32(0));
+        let sh31 = fresh();
+        b.push_let(sh31, ValType::I32, Op::ConstI32(31));
+        for (i, &val_id) in swapped.iter().enumerate() {
+            let v_next = fresh();
+            b.push_let(
+                v_next,
+                ValType::V128,
+                Op::SimdReplaceLane { kind: LaneKind::I32x4, lane: i as u8, vec: v, val: val_id },
+            );
+            v = v_next;
+
+            let addr_i = fresh();
+            b.push_let(addr_i, ValType::I32, Op::ConstI32(16 + (i as i32) * 4));
+            b.push_effect(EffectOp::Store {
+                mem: MemId(0),
+                addr: addr_i,
+                offset: 0,
+                width: MemWidth::B4,
+                val: val_id,
+            });
+
+            let sbit = fresh();
+            let sh_i = fresh();
+            let shifted = fresh();
+            let m_next = fresh();
+            b.push_let(sbit, ValType::I32, Op::Bin(BinOp::I32ShrU, val_id, sh31));
+            b.push_let(sh_i, ValType::I32, Op::ConstI32(i as i32));
+            b.push_let(shifted, ValType::I32, Op::Bin(BinOp::I32Shl, sbit, sh_i));
+            b.push_let(m_next, ValType::I32, Op::Bin(BinOp::I32Or, mask_acc, shifted));
+            mask_acc = m_next;
+        }
+        b.push_yield(&[v, mask_acc]);
+    });
+
+    // 2. f32x4 mul+add vs scalar 4-lane tree equivalence (bit-exact IEEE-754!).
+    let f32x4_fma_like = Region::build(|b| {
+        b.push_let(ValId(10), ValType::V128, Op::Bin(BinOp::F32x4Mul, ValId(0), ValId(1)));
+        b.push_let(ValId(11), ValType::V128, Op::Bin(BinOp::F32x4Add, ValId(10), ValId(2)));
+        b.push_yield(&[ValId(11)]);
+    });
+    let scalar_f32_4lane = Region::build(|b| {
+        let mut next = 200u32;
+        let mut fresh = || {
+            let id = ValId(next);
+            next += 1;
+            id
+        };
+        let mut acc = fresh();
+        b.push_let(acc, ValType::V128, Op::ConstV128(0));
+        for lane in 0..4u8 {
+            let al = fresh();
+            let bl = fresh();
+            let cl = fresh();
+            let prod = fresh();
+            let sum = fresh();
+            let next_v = fresh();
+            b.push_let(
+                al,
+                ValType::F32,
+                Op::SimdExtractLane { kind: LaneKind::F32x4, lane, vec: ValId(0) },
+            );
+            b.push_let(
+                bl,
+                ValType::F32,
+                Op::SimdExtractLane { kind: LaneKind::F32x4, lane, vec: ValId(1) },
+            );
+            b.push_let(
+                cl,
+                ValType::F32,
+                Op::SimdExtractLane { kind: LaneKind::F32x4, lane, vec: ValId(2) },
+            );
+            b.push_let(prod, ValType::F32, Op::Bin(BinOp::F32Mul, al, bl));
+            b.push_let(sum, ValType::F32, Op::Bin(BinOp::F32Add, prod, cl));
+            b.push_let(
+                next_v,
+                ValType::V128,
+                Op::SimdReplaceLane { kind: LaneKind::F32x4, lane, vec: acc, val: sum },
+            );
+            acc = next_v;
+        }
+        b.push_yield(&[acc]);
+    });
+
+    // 3. i64x2.extend_low_i32x4_s + V128 model extraction on a deliberate bug.
+    let extend_low_simd = Region::build(|b| {
+        b.push_let(ValId(10), ValType::V128, Op::Un(UnOp::I64x2ExtendLowI32x4S, ValId(0)));
+        b.push_yield(&[ValId(10)]);
+    });
+    let extend_low_buggy_u = Region::build(|b| {
+        b.push_let(ValId(10), ValType::V128, Op::Un(UnOp::I64x2ExtendLowI32x4U, ValId(0)));
+        b.push_yield(&[ValId(10)]);
+    });
+
+    with_both_backends(|backend, name| {
+        assert_eq!(
+            backend
+                .check_equivalence(&module, &reg, &simd_mem_roundtrip, &scalar_mem_roundtrip, None)
+                .unwrap(),
+            SmtResult::Unsat,
+            "[{name}] i32x4 add/gt_s/bitselect/shuffle/B16-mem/bitmask must match scalar lane tree"
+        );
+        assert_eq!(
+            backend
+                .check_equivalence(&module, &reg, &f32x4_fma_like, &scalar_f32_4lane, None)
+                .unwrap(),
+            SmtResult::Unsat,
+            "[{name}] f32x4 mul+add must match scalar 4-lane IEEE-754 tree bit-for-bit"
+        );
+        match backend
+            .check_equivalence(&module, &reg, &extend_low_simd, &extend_low_buggy_u, None)
+            .unwrap()
+        {
+            SmtResult::Sat(model) => {
+                assert!(
+                    matches!(model.scalar_values.first(), Some((ValId(0), Val::V128(_)))),
+                    "[{name}] expected Val::V128 counterexample, got {:?}",
+                    model.scalar_values
+                );
+                let heap = HeapState::from_module(&module, 1000).unwrap();
+                let l = eval_region(&module, &reg, &extend_low_simd, &model.scalar_values, heap.clone());
+                let r = eval_region(&module, &reg, &extend_low_buggy_u, &model.scalar_values, heap);
+                assert_ne!(l, r, "[{name}] V128 counterexample must replay in kernel");
+            }
+            other => panic!("[{name}] expected Sat for extend_s vs extend_u, got {other:?}"),
+        }
+    });
+}
+
+#[test]
+fn test_fp_contract_quote_ticks_and_nan_negzero_bugs_both_backends() {
+    let module = Module::default();
+    let reg = StratumRegistry::new();
+
+    // 1. Contract check: `quote_ticks(mid: f32, half_spread: f32) -> (bid_tick: i32, ask_tick: i32)`
+    //    `requires`: 10.0 <= mid <= 10000.0 && 0.5 <= half_spread <= 100.0 (excludes NaN/Inf!)
+    //    `entry`: bid = trunc_sat_s(floor(mid - half_spread)), ask = trunc_sat_s(ceil(mid + half_spread))
+    //    `ensures`: bid < ask (never crosses!)
+    let quote_requires = Region::build(|b| {
+        b.push_let(ValId(10), ValType::F32, Op::ConstF32(10.0f32.to_bits()));
+        b.push_let(ValId(11), ValType::F32, Op::ConstF32(10000.0f32.to_bits()));
+        b.push_let(ValId(12), ValType::F32, Op::ConstF32(0.5f32.to_bits()));
+        b.push_let(ValId(13), ValType::F32, Op::ConstF32(100.0f32.to_bits()));
+        b.push_let(ValId(14), ValType::I32, Op::Bin(BinOp::F32Ge, ValId(0), ValId(10)));
+        b.push_let(ValId(15), ValType::I32, Op::Bin(BinOp::F32Le, ValId(0), ValId(11)));
+        b.push_let(ValId(16), ValType::I32, Op::Bin(BinOp::F32Ge, ValId(1), ValId(12)));
+        b.push_let(ValId(17), ValType::I32, Op::Bin(BinOp::F32Le, ValId(1), ValId(13)));
+        b.push_let(ValId(18), ValType::I32, Op::Bin(BinOp::I32And, ValId(14), ValId(15)));
+        b.push_let(ValId(19), ValType::I32, Op::Bin(BinOp::I32And, ValId(16), ValId(17)));
+        b.push_let(ValId(20), ValType::I32, Op::Bin(BinOp::I32And, ValId(18), ValId(19)));
+        b.push_yield(&[ValId(20)]);
+    });
+    let quote_entry = Region::build(|b| {
+        b.push_let(ValId(10), ValType::F32, Op::Bin(BinOp::F32Sub, ValId(0), ValId(1)));
+        b.push_let(ValId(11), ValType::F32, Op::Un(UnOp::F32Floor, ValId(10)));
+        b.push_let(ValId(12), ValType::I32, Op::Un(UnOp::I32TruncSatF32S, ValId(11)));
+        b.push_let(ValId(13), ValType::F32, Op::Bin(BinOp::F32Add, ValId(0), ValId(1)));
+        b.push_let(ValId(14), ValType::F32, Op::Un(UnOp::F32Ceil, ValId(13)));
+        b.push_let(ValId(15), ValType::I32, Op::Un(UnOp::I32TruncSatF32S, ValId(14)));
+        b.push_yield(&[ValId(12), ValId(15)]);
+    });
+    // Default ensures binding: params are ValId(0), ValId(1) -> results are ValId(2)=bid, ValId(3)=ask.
+    let quote_ensures = Region::build(|b| {
+        b.push_let(ValId(10), ValType::I32, Op::Bin(BinOp::I32LtS, ValId(2), ValId(3)));
+        b.push_yield(&[ValId(10)]);
+    });
+    let quote_params = [(ValId(0), ValType::F32), (ValId(1), ValType::F32)];
+    let quote_results = [ValType::I32, ValType::I32];
+    let quote_contract = ContractSpec::new(&quote_params, &quote_results, &quote_entry)
+        .with_requires(&quote_requires)
+        .with_ensures(&quote_ensures);
+
+    // 2. Falsify `0.0 / 0.0 = NaN` bug: requires non-negative sign bits `a, b in [+0.0, 100.0]`
+    //    (excludes `-0.0` so `1.0 / -0.0 = -Inf` cannot occur; ONLY `0.0 / 0.0 = NaN` fails `res >= 0.0`!).
+    let div_requires = Region::build(|b| {
+        b.push_let(ValId(10), ValType::F32, Op::ConstF32(0.0f32.to_bits()));
+        b.push_let(ValId(11), ValType::F32, Op::ConstF32(100.0f32.to_bits()));
+        b.push_let(ValId(12), ValType::I32, Op::Bin(BinOp::F32Ge, ValId(0), ValId(10)));
+        b.push_let(ValId(13), ValType::I32, Op::Bin(BinOp::F32Le, ValId(0), ValId(11)));
+        b.push_let(ValId(14), ValType::I32, Op::Bin(BinOp::F32Ge, ValId(1), ValId(10)));
+        b.push_let(ValId(15), ValType::I32, Op::Bin(BinOp::F32Le, ValId(1), ValId(11)));
+        b.push_let(ValId(16), ValType::I32, Op::Un(UnOp::I32ReinterpretF32, ValId(0)));
+        b.push_let(ValId(17), ValType::I32, Op::Un(UnOp::I32ReinterpretF32, ValId(1)));
+        b.push_let(ValId(18), ValType::I32, Op::ConstI32(0));
+        b.push_let(ValId(19), ValType::I32, Op::Bin(BinOp::I32GeS, ValId(16), ValId(18)));
+        b.push_let(ValId(20), ValType::I32, Op::Bin(BinOp::I32GeS, ValId(17), ValId(18)));
+        b.push_let(ValId(21), ValType::I32, Op::Bin(BinOp::I32And, ValId(12), ValId(13)));
+        b.push_let(ValId(22), ValType::I32, Op::Bin(BinOp::I32And, ValId(14), ValId(15)));
+        b.push_let(ValId(23), ValType::I32, Op::Bin(BinOp::I32And, ValId(19), ValId(20)));
+        b.push_let(ValId(24), ValType::I32, Op::Bin(BinOp::I32And, ValId(21), ValId(22)));
+        b.push_let(ValId(25), ValType::I32, Op::Bin(BinOp::I32And, ValId(24), ValId(23)));
+        b.push_yield(&[ValId(25)]);
+    });
+    let div_entry = Region::build(|b| {
+        b.push_let(ValId(10), ValType::F32, Op::Bin(BinOp::F32Div, ValId(0), ValId(1)));
+        b.push_yield(&[ValId(10)]);
+    });
+    let div_ensures = Region::build(|b| {
+        b.push_let(ValId(10), ValType::F32, Op::ConstF32(0.0f32.to_bits()));
+        b.push_let(ValId(11), ValType::I32, Op::Bin(BinOp::F32Ge, ValId(2), ValId(10)));
+        b.push_yield(&[ValId(11)]);
+    });
+    let div_results = [ValType::F32];
+    let div_contract = ContractSpec::new(&quote_params, &div_results, &div_entry)
+        .with_requires(&div_requires)
+        .with_ensures(&div_ensures);
+
+    // 3. Falsify `-0.0` sign-bit bug: requires `x >= 0.0`, entry checks `i32.reinterpret_f32(x) >= 0`.
+    let negz_requires = Region::build(|b| {
+        b.push_let(ValId(10), ValType::F32, Op::ConstF32(0.0f32.to_bits()));
+        b.push_let(ValId(11), ValType::I32, Op::Bin(BinOp::F32Ge, ValId(0), ValId(10)));
+        b.push_yield(&[ValId(11)]);
+    });
+    let negz_entry = Region::build(|b| {
+        b.push_let(ValId(10), ValType::I32, Op::Un(UnOp::I32ReinterpretF32, ValId(0)));
+        b.push_let(ValId(11), ValType::I32, Op::ConstI32(0));
+        b.push_let(ValId(12), ValType::I32, Op::Bin(BinOp::I32GeS, ValId(10), ValId(11)));
+        b.push_yield(&[ValId(12)]);
+    });
+    let negz_ensures = Region::build(|b| {
+        b.push_let(ValId(10), ValType::I32, Op::Copy(ValId(1)));
+        b.push_yield(&[ValId(10)]);
+    });
+    let negz_params = [(ValId(0), ValType::F32)];
+    let negz_results = [ValType::I32];
+    let negz_contract = ContractSpec::new(&negz_params, &negz_results, &negz_entry)
+        .with_requires(&negz_requires)
+        .with_ensures(&negz_ensures);
+
+    with_both_backends(|backend, name| {
+        assert_eq!(
+            backend.check_contract(&module, &reg, &quote_contract).unwrap(),
+            SmtResult::Unsat,
+            "[{name}] quote_ticks must prove bid < ask without crossing or trapping"
+        );
+
+        match backend.check_contract(&module, &reg, &div_contract).unwrap() {
+            SmtResult::Sat(model) => {
+                let heap = HeapState::from_module(&module, 1000).unwrap();
+                let (pre_vals, _) =
+                    eval_region(&module, &reg, &div_requires, &model.scalar_values, heap.clone())
+                        .unwrap();
+                assert_eq!(pre_vals, vec![Val::I32(1)], "[{name}] 0.0/0.0 cex must satisfy requires");
+                let (out_vals, _) =
+                    eval_region(&module, &reg, &div_entry, &model.scalar_values, heap).unwrap();
+                assert_eq!(
+                    out_vals,
+                    vec![Val::F32(fp::F32_CANON_NAN)],
+                    "[{name}] 0.0/0.0 cex must produce canonical NaN"
+                );
+            }
+            other => panic!("[{name}] expected Sat for 0.0/0.0 NaN bug, got {other:?}"),
+        }
+
+        match backend.check_contract(&module, &reg, &negz_contract).unwrap() {
+            SmtResult::Sat(model) => {
+                assert_eq!(
+                    model.scalar_values,
+                    vec![(ValId(0), Val::F32(0x8000_0000))],
+                    "[{name}] -0.0 sign-bit bug must find exact -0.0 (0x8000_0000)"
+                );
+                let heap = HeapState::from_module(&module, 1000).unwrap();
+                let (out_vals, _) =
+                    eval_region(&module, &reg, &negz_entry, &model.scalar_values, heap).unwrap();
+                assert_eq!(out_vals, vec![Val::I32(0)]);
+            }
+            other => panic!("[{name}] expected Sat for -0.0 sign-bit bug, got {other:?}"),
+        }
+    });
+}
+
+#[test]
+fn test_egglog_ieee_safe_fp_simd_and_cliff_scoring() {
+    let module = mod_with_mems(&[(0, 1, Some(1))]);
+    let reg = StratumRegistry::new();
+    let simplifier = EgglogSimplifier::new(EqSatConfig::default());
+
+    // 1. Strictly IEEE-bit-exact rules fire: neg(neg(x)) == x, abs(neg(x)) == abs(x),
+    //    v128.not(v128.not(v)) == v, reinterpret roundtrip, and F32/V128 store-load forwarding.
+    let exact_fp = Region::build(|b| {
+        b.push_let(ValId(1), ValType::F32, Op::Un(UnOp::F32Neg, ValId(0)));
+        b.push_let(ValId(2), ValType::F32, Op::Un(UnOp::F32Neg, ValId(1)));
+        b.push_let(ValId(3), ValType::I32, Op::Un(UnOp::I32ReinterpretF32, ValId(2)));
+        b.push_let(ValId(4), ValType::F32, Op::Un(UnOp::F32ReinterpretI32, ValId(3)));
+        b.push_yield(&[ValId(4)]);
+    });
+    let (simp_exact, rep_exact) = simplifier.simplify_region(&exact_fp, &reg).unwrap();
+    assert!(rep_exact.nodes_after < rep_exact.nodes_before);
+
+    let exact_v128 = Region::build(|b| {
+        b.push_let(ValId(1), ValType::V128, Op::Un(UnOp::V128Not, ValId(0)));
+        b.push_let(ValId(2), ValType::V128, Op::Un(UnOp::V128Not, ValId(1)));
+        b.push_let(ValId(3), ValType::I32, Op::ConstI32(0));
+        b.push_effect(EffectOp::Store {
+            mem: MemId(0),
+            addr: ValId(3),
+            offset: 0,
+            width: MemWidth::B16,
+            val: ValId(2),
+        });
+        b.push_let(
+            ValId(4),
+            ValType::V128,
+            Op::Load {
+                mem: MemId(0),
+                addr: ValId(3),
+                offset: 0,
+                width: MemWidth::B16,
+                signed: false,
+                result_ty: ValType::V128,
+            },
+        );
+        b.push_yield(&[ValId(4)]);
+    });
+    let (simp_v128, _) = simplifier.simplify_region(&exact_v128, &reg).unwrap();
+
+    // 2. Algebraically-unsound FP expressions MUST NOT be rewritten (x + 0.0, x * 0.0, x - x)
+    //    and dead trapping `i32.trunc_f32_s` MUST NOT be dropped!
+    let unsound_bait = Region::build(|b| {
+        b.push_let(ValId(1), ValType::F32, Op::ConstF32(0.0f32.to_bits()));
+        b.push_let(ValId(2), ValType::F32, Op::Bin(BinOp::F32Add, ValId(0), ValId(1)));
+        b.push_let(ValId(3), ValType::F32, Op::Bin(BinOp::F32Mul, ValId(0), ValId(1)));
+        b.push_let(ValId(4), ValType::F32, Op::Bin(BinOp::F32Sub, ValId(0), ValId(0)));
+        // Dead trapping trunc that must survive simplification!
+        b.push_let(ValId(5), ValType::I32, Op::Un(UnOp::I32TruncF32S, ValId(0)));
+        b.push_yield(&[ValId(2), ValId(3), ValId(4)]);
+    });
+    let (simp_bait, _) = simplifier.simplify_region(&unsound_bait, &reg).unwrap();
+
+    // Concrete spot-check: on NaN, dead trunc MUST still trap!
+    let heap = HeapState::from_module(&module, 1000).unwrap();
+    assert_eq!(
+        eval_region(&module, &reg, &simp_bait, &[(ValId(0), Val::F32(fp::F32_CANON_NAN))], heap),
+        Err(TrapCode::IntOverflow)
+    );
+
+    with_both_backends(|backend, name| {
+        assert_eq!(
+            backend.check_equivalence(&module, &reg, &exact_fp, &simp_exact, None).unwrap(),
+            SmtResult::Unsat,
+            "[{name}] IEEE-exact fp eqsat must be bit-exact"
+        );
+        assert_eq!(
+            backend.check_equivalence(&module, &reg, &exact_v128, &simp_v128, None).unwrap(),
+            SmtResult::Unsat,
+            "[{name}] v128 not-not + B16 store-load forward must be bit-exact"
+        );
+        assert_eq!(
+            backend.check_equivalence(&module, &reg, &unsound_bait, &simp_bait, None).unwrap(),
+            SmtResult::Unsat,
+            "[{name}] egglog must preserve exact IEEE-754 + trap semantics on x+0, x*0, x-x, dead trunc"
+        );
+    });
+
+    // 3. Static SMT-cliff estimator scores FP mul/div/sqrt and f32x4/f64x2 ops!
+    let deep_fp_cliff = Region::build(|b| {
+        b.push_let(ValId(1), ValType::F64, Op::Bin(BinOp::F64Mul, ValId(0), ValId(0)));
+        b.push_let(ValId(2), ValType::F64, Op::Bin(BinOp::F64Div, ValId(1), ValId(0)));
+        b.push_let(ValId(3), ValType::F64, Op::Un(UnOp::F64Sqrt, ValId(2)));
+        b.push_let(ValId(4), ValType::V128, Op::Un(UnOp::F64x2Splat, ValId(3)));
+        b.push_let(ValId(5), ValType::V128, Op::Bin(BinOp::F64x2Mul, ValId(4), ValId(4)));
+        b.push_yield(&[ValId(5)]);
+    });
+    let metrics = estimate_region_cliff(&deep_fp_cliff, &reg);
+    assert_eq!(metrics.level, CliffLevel::High);
+    assert_eq!(metrics.nonlinear64_ops, 5); // 1 (F64Mul) + 1 (F64Div) + 1 (F64Sqrt) + 2 (F64x2Mul)
+    assert!(metrics.max_nonlinear64_chain_depth >= 4);
+    assert!(!metrics.warnings.is_empty());
+}
+
+#[test]
+fn test_b8_only_store_param_not_vacuously_equivalent_both_backends() {
+    let module = mod_with_mems(&[(0, 1, Some(1))]);
+    let reg = StratumRegistry::new();
+
+    // Regression: `ValId(1)` is ONLY stored with `MemWidth::B8` (no other i64/f64 ops).
+    // `FreeVarCollector` must infer `ValType::I64` fallback (not `I32`, which would trap
+    // `!valid_load_store_pair(I32, B8)` on both sides before reaching the differing store!).
+    let lhs = Region::build(|b| {
+        b.push_let(ValId(10), ValType::I32, Op::ConstI32(0));
+        b.push_effect(EffectOp::Store {
+            mem: MemId(0),
+            addr: ValId(10),
+            offset: 0,
+            width: MemWidth::B8,
+            val: ValId(1),
+        });
+        b.push_let(ValId(11), ValType::I32, Op::ConstI32(0x1122_3344));
+        b.push_effect(EffectOp::Store {
+            mem: MemId(0),
+            addr: ValId(10),
+            offset: 8,
+            width: MemWidth::B4,
+            val: ValId(11),
+        });
+        b.push_yield(&[ValId(10)]);
+    });
+    let rhs_buggy = Region::build(|b| {
+        b.push_let(ValId(10), ValType::I32, Op::ConstI32(0));
+        b.push_effect(EffectOp::Store {
+            mem: MemId(0),
+            addr: ValId(10),
+            offset: 0,
+            width: MemWidth::B8,
+            val: ValId(1),
+        });
+        // Different value stored at offset 8 (must NOT vacuously prove equal!).
+        b.push_let(ValId(11), ValType::I32, Op::ConstI32(0x4433_2211));
+        b.push_effect(EffectOp::Store {
+            mem: MemId(0),
+            addr: ValId(10),
+            offset: 8,
+            width: MemWidth::B4,
+            val: ValId(11),
+        });
+        b.push_yield(&[ValId(10)]);
+    });
+
+    // Exact `F64` constraint must override the `B8 -> I64` fallback cleanly without conflict.
+    let f64_store_lhs = Region::build(|b| {
+        b.push_let(ValId(10), ValType::I32, Op::ConstI32(0));
+        b.push_effect(EffectOp::Store {
+            mem: MemId(0),
+            addr: ValId(10),
+            offset: 0,
+            width: MemWidth::B8,
+            val: ValId(1),
+        });
+        b.push_let(ValId(11), ValType::F64, Op::ConstF64(0.0f64.to_bits()));
+        b.push_let(ValId(12), ValType::F64, Op::Bin(BinOp::F64Add, ValId(1), ValId(11)));
+        b.push_yield(&[ValId(12)]);
+    });
+    let f64_store_rhs = f64_store_lhs.clone();
+
+    // Mixed `B4` (truncating i64 store) + `B8` on the same free var must keep `I64` priority
+    // (not downgrade to `I32`), so differing post-stores are caught as `Sat`.
+    let mixed_b4_b8_lhs = Region::build(|b| {
+        b.push_let(ValId(10), ValType::I32, Op::ConstI32(0));
+        b.push_effect(EffectOp::Store {
+            mem: MemId(0),
+            addr: ValId(10),
+            offset: 0,
+            width: MemWidth::B4,
+            val: ValId(1),
+        });
+        b.push_effect(EffectOp::Store {
+            mem: MemId(0),
+            addr: ValId(10),
+            offset: 8,
+            width: MemWidth::B8,
+            val: ValId(1),
+        });
+        b.push_let(ValId(11), ValType::I32, Op::ConstI32(1));
+        b.push_yield(&[ValId(11)]);
+    });
+    let mixed_b4_b8_rhs = Region::build(|b| {
+        b.push_let(ValId(10), ValType::I32, Op::ConstI32(0));
+        b.push_effect(EffectOp::Store {
+            mem: MemId(0),
+            addr: ValId(10),
+            offset: 0,
+            width: MemWidth::B4,
+            val: ValId(1),
+        });
+        b.push_effect(EffectOp::Store {
+            mem: MemId(0),
+            addr: ValId(10),
+            offset: 8,
+            width: MemWidth::B8,
+            val: ValId(1),
+        });
+        b.push_let(ValId(11), ValType::I32, Op::ConstI32(2));
+        b.push_yield(&[ValId(11)]);
+    });
+
+    with_both_backends(|backend, name| {
+        match backend.check_equivalence(&module, &reg, &lhs, &rhs_buggy, None).unwrap() {
+            SmtResult::Sat(_) => {}
+            other => panic!(
+                "[{name}] B8-only i64 param must NOT vacuously prove differing stores equivalent; got {other:?}"
+            ),
+        }
+        assert_eq!(
+            backend
+                .check_equivalence(&module, &reg, &f64_store_lhs, &f64_store_rhs, None)
+                .unwrap(),
+            SmtResult::Unsat,
+            "[{name}] exact F64 op must override B8 I64 fallback without conflict"
+        );
+        match backend
+            .check_equivalence(&module, &reg, &mixed_b4_b8_lhs, &mixed_b4_b8_rhs, None)
+            .unwrap()
+        {
+            SmtResult::Sat(_) => {}
+            other => panic!(
+                "[{name}] mixed B4+B8 free var must infer I64 (not I32 trap); got {other:?}"
+            ),
+        }
+    });
+}
+
+#[test]
+fn test_v128_lanes32_mask_add_and_const_ea_sharing_both_backends() {
+    let module = mod_with_mems(&[(0, 1, Some(1))]);
+    let reg = StratumRegistry::new();
+
+    // 1. Load(B16, 0, 0) + i32x4.gt_s(0) + v128.and + horizontal sum in reversed lane order
+    //    vs 4x Load(B4, 0, 4*k) + scalar select + linear sum.
+    let v128_sum = Region::build(|b| {
+        b.push_let(ValId(10), ValType::I32, Op::ConstI32(0));
+        b.push_let(
+            ValId(11),
+            ValType::V128,
+            Op::Load {
+                mem: MemId(0),
+                addr: ValId(10),
+                offset: 0,
+                width: MemWidth::B16,
+                signed: false,
+                result_ty: ValType::V128,
+            },
+        );
+        b.push_let(ValId(12), ValType::V128, Op::ConstV128(0));
+        b.push_let(ValId(13), ValType::V128, Op::Bin(BinOp::I32x4GtS, ValId(11), ValId(12)));
+        b.push_let(ValId(14), ValType::V128, Op::Bin(BinOp::V128And, ValId(11), ValId(13)));
+        b.push_let(
+            ValId(15),
+            ValType::I32,
+            Op::SimdExtractLane { kind: LaneKind::I32x4, lane: 3, vec: ValId(14) },
+        );
+        b.push_let(
+            ValId(16),
+            ValType::I32,
+            Op::SimdExtractLane { kind: LaneKind::I32x4, lane: 1, vec: ValId(14) },
+        );
+        b.push_let(
+            ValId(17),
+            ValType::I32,
+            Op::SimdExtractLane { kind: LaneKind::I32x4, lane: 2, vec: ValId(14) },
+        );
+        b.push_let(
+            ValId(18),
+            ValType::I32,
+            Op::SimdExtractLane { kind: LaneKind::I32x4, lane: 0, vec: ValId(14) },
+        );
+        b.push_let(ValId(19), ValType::I32, Op::Bin(BinOp::I32Add, ValId(15), ValId(16)));
+        b.push_let(ValId(20), ValType::I32, Op::Bin(BinOp::I32Add, ValId(17), ValId(18)));
+        b.push_let(ValId(21), ValType::I32, Op::Bin(BinOp::I32Add, ValId(19), ValId(20)));
+        b.push_yield(&[ValId(21)]);
+    });
+
+    let scalar_sum = Region::build(|b| {
+        b.push_let(ValId(10), ValType::I32, Op::ConstI32(0));
+        let mut acc = ValId(10);
+        for k in 0u32..4 {
+            let v_id = ValId(100 + k * 4);
+            let gt_id = ValId(101 + k * 4);
+            let sel_id = ValId(102 + k * 4);
+            let next_acc = ValId(103 + k * 4);
+            b.push_let(
+                v_id,
+                ValType::I32,
+                Op::Load {
+                    mem: MemId(0),
+                    addr: ValId(10),
+                    offset: k * 4,
+                    width: MemWidth::B4,
+                    signed: false,
+                    result_ty: ValType::I32,
+                },
+            );
+            b.push_let(gt_id, ValType::I32, Op::Bin(BinOp::I32GtS, v_id, ValId(10)));
+            b.push_let(
+                sel_id,
+                ValType::I32,
+                Op::Select { cond: gt_id, true_val: v_id, false_val: ValId(10) },
+            );
+            b.push_let(next_acc, ValType::I32, Op::Bin(BinOp::I32Add, acc, sel_id));
+            acc = next_acc;
+        }
+        b.push_yield(&[acc]);
+    });
+
+    // 2. f32x4.floor(f32x4.splat(x)) extract lane 0 ≡ f32.floor(x) (dedupes 4 -> 1 fp.rti).
+    let splat_floor_v128 = Region::build(|b| {
+        b.push_let(ValId(1), ValType::V128, Op::Un(UnOp::F32x4Splat, ValId(0)));
+        b.push_let(ValId(2), ValType::V128, Op::Un(UnOp::F32x4Floor, ValId(1)));
+        b.push_let(
+            ValId(3),
+            ValType::F32,
+            Op::SimdExtractLane { kind: LaneKind::F32x4, lane: 0, vec: ValId(2) },
+        );
+        b.push_yield(&[ValId(3)]);
+    });
+    let scalar_floor = Region::build(|b| {
+        b.push_let(ValId(1), ValType::F32, Op::Un(UnOp::F32Floor, ValId(0)));
+        b.push_yield(&[ValId(1)]);
+    });
+
+    // 3. 4-byte-aligned SimdShuffle + SimdBitselect exact equivalence + negative mutant.
+    let bitselect_v128 = Region::build(|b| {
+        b.push_let(ValId(10), ValType::I32, Op::ConstI32(0));
+        b.push_let(ValId(11), ValType::V128, Op::Un(UnOp::I32x4Splat, ValId(0)));
+        b.push_let(
+            ValId(12),
+            ValType::V128,
+            Op::SimdReplaceLane { kind: LaneKind::I32x4, lane: 1, vec: ValId(11), val: ValId(1) },
+        );
+        b.push_let(
+            ValId(13),
+            ValType::V128,
+            Op::SimdShuffle {
+                lhs: ValId(12),
+                rhs: ValId(12),
+                lanes: [4, 5, 6, 7, 0, 1, 2, 3, 4, 5, 6, 7, 0, 1, 2, 3],
+            },
+        );
+        b.push_let(ValId(14), ValType::V128, Op::ConstV128(0));
+        b.push_let(ValId(15), ValType::V128, Op::Bin(BinOp::I32x4GtS, ValId(13), ValId(14)));
+        b.push_let(
+            ValId(16),
+            ValType::V128,
+            Op::SimdBitselect { a: ValId(13), b: ValId(14), mask: ValId(15) },
+        );
+        b.push_let(
+            ValId(17),
+            ValType::I32,
+            Op::SimdExtractLane { kind: LaneKind::I32x4, lane: 0, vec: ValId(16) },
+        );
+        b.push_yield(&[ValId(17)]);
+    });
+    let bitselect_scalar = Region::build(|b| {
+        b.push_let(ValId(10), ValType::I32, Op::ConstI32(0));
+        b.push_let(ValId(11), ValType::I32, Op::Bin(BinOp::I32GtS, ValId(1), ValId(10)));
+        b.push_let(
+            ValId(12),
+            ValType::I32,
+            Op::Select { cond: ValId(11), true_val: ValId(1), false_val: ValId(10) },
+        );
+        b.push_yield(&[ValId(12)]);
+    });
+    let bitselect_buggy = Region::build(|b| {
+        b.push_let(ValId(10), ValType::I32, Op::ConstI32(0));
+        b.push_let(ValId(11), ValType::I32, Op::Bin(BinOp::I32GeS, ValId(1), ValId(10)));
+        // Flipped polarity (buggy): returns 0 when ValId(1) >= 0 instead of ValId(1).
+        b.push_let(
+            ValId(12),
+            ValType::I32,
+            Op::Select { cond: ValId(11), true_val: ValId(10), false_val: ValId(1) },
+        );
+        b.push_yield(&[ValId(12)]);
+    });
+
+    with_both_backends(|backend, name| {
+        assert_eq!(
+            backend.check_equivalence(&module, &reg, &v128_sum, &scalar_sum, None).unwrap(),
+            SmtResult::Unsat,
+            "[{name}] Load(B16) + i32x4 mask + reordered sum must match 4x Load(B4)"
+        );
+        assert_eq!(
+            backend
+                .check_equivalence(&module, &reg, &splat_floor_v128, &scalar_floor, None)
+                .unwrap(),
+            SmtResult::Unsat,
+            "[{name}] f32x4.floor(splat(x))[0] must match f32.floor(x)"
+        );
+        assert_eq!(
+            backend
+                .check_equivalence(&module, &reg, &bitselect_v128, &bitselect_scalar, None)
+                .unwrap(),
+            SmtResult::Unsat,
+            "[{name}] aligned shuffle + bitselect must match scalar select"
+        );
+        match backend.check_equivalence(&module, &reg, &bitselect_v128, &bitselect_buggy, None).unwrap() {
+            SmtResult::Sat(_) => {}
+            other => panic!("[{name}] flipped bitselect mutant must be Sat, got {other:?}"),
+        }
     });
 }

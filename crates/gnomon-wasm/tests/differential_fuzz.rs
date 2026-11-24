@@ -901,10 +901,10 @@ fn test_proptest_and_corpus_over_10000_differential_checks() {
 fn test_error_handling_for_invalid_and_unsupported_wasm() {
     assert!(matches!(lift_wasm(b"not-wasm"), Err(WasmError::ValidationError(_))));
 
-    // Float function should return UnsupportedFeature cleanly
+    // Reference-typed function (`externref`) should return UnsupportedFeature cleanly
     let mut m = WasmModule::new();
     let mut ts = TypeSection::new();
-    ts.ty().function([WVal::F32], [WVal::F32]);
+    ts.ty().function([WVal::EXTERNREF], [WVal::EXTERNREF]);
     m.section(&ts);
     let mut fs = FunctionSection::new();
     fs.function(0);
