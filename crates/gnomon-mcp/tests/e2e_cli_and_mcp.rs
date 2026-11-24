@@ -513,7 +513,7 @@ fn test_cli_e2e_full_sieve_flywheel_workflow() {
 }
 
 #[test]
-fn test_mcp_e2e_stdio_jsonrpc_all_6_tools() {
+fn test_mcp_e2e_stdio_jsonrpc_all_7_tools() {
     let mut child = Command::new(gnomon_bin())
         .arg("mcp")
         .stdin(Stdio::piped())
@@ -567,7 +567,7 @@ fn test_mcp_e2e_stdio_jsonrpc_all_6_tools() {
     .unwrap();
     stdin.flush().unwrap();
 
-    // 3. tools/list -> must expose all 6 exact Gnomon tools
+    // 3. tools/list -> must expose all 7 exact Gnomon tools
     let list_resp = send_recv(
         &mut stdin,
         &mut reader,
@@ -578,7 +578,7 @@ fn test_mcp_e2e_stdio_jsonrpc_all_6_tools() {
     for expected in MCP_TOOL_NAMES {
         assert!(names.contains(&expected), "missing MCP tool '{expected}' in {names:?}");
     }
-    assert_eq!(names.len(), 6);
+    assert_eq!(names.len(), 7);
 
     let call_tool = |stdin: &mut std::process::ChildStdin,
                      reader: &mut BufReader<std::process::ChildStdout>,
@@ -786,6 +786,39 @@ fn test_mcp_e2e_stdio_jsonrpc_all_6_tools() {
     );
     assert_eq!(cons["kept_strata"], json!([1]));
     assert!(cons["autodoc_markdown"].as_str().unwrap().contains("wrap_inc"));
+
+    // 10. gnomon_check_contract on the active lifted div module:
+    //     - Without requires: div(a, b) traps on b == 0 -> FALSIFIED with scalar_values counterexample!
+    //     - With external `.ir` requires (b != 0 && !(a == INT_MIN && b == -1)) -> PROVED!
+    let cc_fail = call_tool(
+        &mut stdin,
+        &mut reader,
+        14,
+        "gnomon_check_contract",
+        json!({ "entry": "entry" }),
+    );
+    assert_eq!(cc_fail["status"], "FALSIFIED");
+    assert_eq!(cc_fail["mode"], "single");
+    assert!(cc_fail["counterexample"]["scalar_values"].is_array());
+
+    let req_safe_div = Region::build(|b| {
+        // b > 0 (prevents both b == 0 and (INT_MIN, -1))
+        b.push_let(ValId(2), ValType::I32, Op::ConstI32(0));
+        b.push_let(ValId(3), ValType::I32, Op::Bin(BinOp::I32GtS, ValId(1), ValId(2)));
+        b.push_yield(&[ValId(3)]);
+    });
+    let cc_ok = call_tool(
+        &mut stdin,
+        &mut reader,
+        15,
+        "gnomon_check_contract",
+        json!({
+            "entry": "entry",
+            "requires_content": region_ir(&params2, &[ValType::I32], &req_safe_div),
+            "input_type": "ir"
+        }),
+    );
+    assert_eq!(cc_ok["status"], "PROVED", "unexpected result: {cc_ok}");
 
     // Clean EOF shutdown.
     drop(stdin);

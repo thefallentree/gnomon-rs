@@ -59,7 +59,7 @@ pub fn find_entry_func<'a>(m: &'a Module, entry: Option<&str>) -> Result<&'a Fun
     if let Some(name) = entry {
         m.funcs
             .iter()
-            .find(|f| f.name == name)
+            .find(|f| f.name == name || f.export_name.as_deref() == Some(name))
             .ok_or_else(|| GnomonError::InvalidInput(format!("entry function '{name}' not found")))
     } else {
         m.funcs

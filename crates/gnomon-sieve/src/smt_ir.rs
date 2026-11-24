@@ -5,13 +5,13 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::rc::Rc;
 
 use gnomon_kernel::{
-    BinOp, CallTarget, EffectOp, GlobalId, HostContract, MAX_CALL_DEPTH, MAX_WASM_PAGES, MemId,
-    MemWidth, Module, Op, Region, RegionNode, RegionRef, SliceBound, Span, Stmt, StratumId,
+    BinOp, CallTarget, EffectOp, FuncId, GlobalId, HostContract, MAX_CALL_DEPTH, MAX_WASM_PAGES,
+    MemId, MemWidth, Module, Op, Region, RegionNode, RegionRef, SliceBound, Span, Stmt, StratumId,
     StratumRegistry, TrapCode, UnOp, Val, ValId, ValType, VcObligation, WASM_PAGE_SIZE,
     validate_read_only_with_registry,
 };
 
-use crate::{SieveError, SmtModel, SmtResult};
+use crate::{ContractSpec, SieveError, SmtModel, SmtResult};
 
 const MAX_CONST_MEM_OP_BYTES: usize = 1024;
 const MAX_SYM_MEM_OP_BYTES: usize = 64;
@@ -122,6 +122,7 @@ pub(crate) trait SmtTarget {
     fn bool_const(&mut self, v: bool) -> Self::Term;
     fn bv_const(&mut self, bits: u8, v: u64) -> Self::Term;
     fn const_array_bool(&mut self, v: bool) -> Self::Term;
+    fn const_array_bv8(&mut self, v: u8) -> Self::Term;
 
     fn fresh_bv(&mut self, name: &str, bits: u8) -> Self::Term;
     fn fresh_mem(&mut self, name: &str) -> Self::Term;
@@ -229,6 +230,11 @@ impl<T: Clone> SymBool<T> {
         }
     }
 
+    fn implies<B: SmtTarget<Term = T>>(&self, b: &mut B, other: &Self) -> Self {
+        let not_self = self.not(b);
+        not_self.or(b, other)
+    }
+
     fn ite<B: SmtTarget<Term = T>>(&self, b: &mut B, t: &Self, f: &Self) -> Self {
         match self.konst {
             Some(true) => t.clone(),
@@ -283,7 +289,9 @@ struct GlobalSym<T> {
 struct ExecState<T> {
     trapped: SymBool<T>,
     trap_code: T,
+    assert_failed: SymBool<T>,
     path_active: SymBool<T>,
+    path_assumptions: SymBool<T>,
     unroll_overflow: SymBool<T>,
     mems: BTreeMap<MemId, MemSym<T>>,
     globals: BTreeMap<GlobalId, GlobalSym<T>>,
@@ -373,6 +381,15 @@ fn merge_outcome<B: SmtTarget>(
 
 impl<T: Clone> ExecState<T> {
     fn from_module<B: SmtTarget<Term = T>>(b: &mut B, module: &Module, prefix: &str) -> Result<Self, SieveError> {
+        Self::from_module_with_mode(b, module, prefix, false)
+    }
+
+    fn from_module_with_mode<B: SmtTarget<Term = T>>(
+        b: &mut B,
+        module: &Module,
+        prefix: &str,
+        use_initial_state: bool,
+    ) -> Result<Self, SieveError> {
         let mut mems = BTreeMap::new();
         for m in &module.memories {
             let limit = m.max_pages.unwrap_or(MAX_WASM_PAGES).min(MAX_WASM_PAGES);
@@ -382,21 +399,64 @@ impl<T: Clone> ExecState<T> {
                     m.id, m.min_pages, limit
                 )));
             }
-            let init_array = b.fresh_mem(&format!("{prefix}_mem_{}", m.id.0));
-            let pages = if m.min_pages == limit {
-                b.bv_const(64, m.min_pages as u64)
+            let (init_array, pages, bytes) = if use_initial_state {
+                let min_bytes = (m.min_pages as u64)
+                    .checked_mul(WASM_PAGE_SIZE as u64)
+                    .ok_or_else(|| {
+                        SieveError::EncodingError(format!(
+                            "memory {:?} min_pages byte size overflow",
+                            m.id
+                        ))
+                    })?;
+                let mut init_bytes_map: BTreeMap<u32, u8> = BTreeMap::new();
+                for (off, data) in &m.init_data {
+                    let end = (*off as u64)
+                        .checked_add(data.len() as u64)
+                        .ok_or_else(|| {
+                            SieveError::EncodingError(format!(
+                                "memory {:?} init_data offset overflow",
+                                m.id
+                            ))
+                        })?;
+                    if end > min_bytes {
+                        return Err(SieveError::EncodingError(format!(
+                            "memory {:?} init_data segment [{}..{}] exceeds min_pages ({} bytes)",
+                            m.id, off, end, min_bytes
+                        )));
+                    }
+                    for (i, &byte) in data.iter().enumerate() {
+                        init_bytes_map.insert(*off + i as u32, byte);
+                    }
+                }
+                let mut arr = b.const_array_bv8(0);
+                for (addr, byte) in init_bytes_map {
+                    if byte != 0 {
+                        let idx = b.bv_const(32, addr as u64);
+                        let val = b.bv_const(8, byte as u64);
+                        arr = b.array_store(&arr, &idx, &val);
+                    }
+                }
+                let pages = b.bv_const(64, m.min_pages as u64);
+                let bytes = b.bv_const(64, min_bytes);
+                (arr, pages, bytes)
             } else {
-                let p = b.fresh_bv(&format!("{prefix}_mem_{}_pages", m.id.0), 64);
-                let min_t = b.bv_const(64, m.min_pages as u64);
-                let max_t = b.bv_const(64, limit as u64);
-                let ge_min = b.bv_uge(64, &p, &min_t);
-                let le_max = b.bv_ule(64, &p, &max_t);
-                b.assert_formula(&ge_min)?;
-                b.assert_formula(&le_max)?;
-                p
+                let init_array = b.fresh_mem(&format!("{prefix}_mem_{}", m.id.0));
+                let pages = if m.min_pages == limit {
+                    b.bv_const(64, m.min_pages as u64)
+                } else {
+                    let p = b.fresh_bv(&format!("{prefix}_mem_{}_pages", m.id.0), 64);
+                    let min_t = b.bv_const(64, m.min_pages as u64);
+                    let max_t = b.bv_const(64, limit as u64);
+                    let ge_min = b.bv_uge(64, &p, &min_t);
+                    let le_max = b.bv_ule(64, &p, &max_t);
+                    b.assert_formula(&ge_min)?;
+                    b.assert_formula(&le_max)?;
+                    p
+                };
+                let page_sz = b.bv_const(64, WASM_PAGE_SIZE as u64);
+                let bytes = b.bv_mul(64, &pages, &page_sz);
+                (init_array, pages, bytes)
             };
-            let page_sz = b.bv_const(64, WASM_PAGE_SIZE as u64);
-            let bytes = b.bv_mul(64, &pages, &page_sz);
             mems.insert(
                 m.id,
                 MemSym {
@@ -416,7 +476,7 @@ impl<T: Clone> ExecState<T> {
 
         let mut globals = BTreeMap::new();
         for g in &module.globals {
-            let val = if g.mutable {
+            let val = if g.mutable && !use_initial_state {
                 let bits = bits_of(g.ty);
                 let term = b.fresh_bv(&format!("{prefix}_g_{}", g.id.0), bits);
                 SymVal { ty: g.ty, term, konst: None }
@@ -440,7 +500,9 @@ impl<T: Clone> ExecState<T> {
         Ok(Self {
             trapped: SymBool::from_const(b, false),
             trap_code: b.bv_const(8, 0),
+            assert_failed: SymBool::from_const(b, false),
             path_active: SymBool::from_const(b, true),
+            path_assumptions: SymBool::from_const(b, true),
             unroll_overflow: SymBool::from_const(b, false),
             mems,
             globals,
@@ -472,8 +534,8 @@ impl<T: Clone> ExecState<T> {
             _ => b.ite(&fire.term, &code_t, &self.trap_code),
         };
         self.trapped = self.trapped.or(b, &fire);
-        let not_fire = fire.not(b);
-        self.path_active = self.path_active.and(b, &not_fire);
+        let not_cond = cond.not(b);
+        self.path_active = self.path_active.and(b, &not_cond);
     }
 
     fn get_val(&self, id: ValId) -> Result<SymVal<T>, SieveError> {
@@ -520,6 +582,9 @@ impl<T: Clone> ExecState<T> {
             Some(false) => else_state.trap_code,
             None => b.ite(&cond.term, &then_state.trap_code, &else_state.trap_code),
         };
+        self.assert_failed = cond.ite(b, &then_state.assert_failed, &else_state.assert_failed);
+        self.path_assumptions =
+            cond.ite(b, &then_state.path_assumptions, &else_state.path_assumptions);
         self.unroll_overflow = cond.ite(b, &then_state.unroll_overflow, &else_state.unroll_overflow);
 
         for (mid, mem_acc) in &mut self.mems {
@@ -1472,6 +1537,31 @@ fn eval_body<B: SmtTarget>(
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GnomonIntrinsic {
+    Assume,
+    Assert,
+}
+
+fn classify_gnomon_intrinsic(hc: &HostContract) -> Option<GnomonIntrinsic> {
+    if hc.params.len() != 1 || hc.params[0].1 != ValType::I32 || !hc.results.is_empty() {
+        return None;
+    }
+    let m = hc.module_name.as_str();
+    let f = hc.field_name.as_str();
+    if (m == "gnomon" && matches!(f, "assume" | "gnomon_assume"))
+        || matches!(f, "gnomon::assume" | "gnomon_assume" | "assume")
+    {
+        return Some(GnomonIntrinsic::Assume);
+    }
+    if (m == "gnomon" && matches!(f, "assert" | "gnomon_assert"))
+        || matches!(f, "gnomon::assert" | "gnomon_assert" | "assert")
+    {
+        return Some(GnomonIntrinsic::Assert);
+    }
+    None
+}
+
 fn eval_host_call<B: SmtTarget>(
     b: &mut B,
     module: &Module,
@@ -1481,6 +1571,36 @@ fn eval_host_call<B: SmtTarget>(
     args: &[SymVal<B::Term>],
     depth: u32,
 ) -> Result<Vec<SymVal<B::Term>>, SieveError> {
+    if let Some(intrinsic) = classify_gnomon_intrinsic(hc) {
+        if args.len() != 1 || args[0].ty != ValType::I32 {
+            let t = SymBool::from_const(b, true);
+            state.trap_if(b, &t, TrapCode::HostContractViolation);
+            return Ok(Vec::new());
+        }
+        let arg_nz = state.is_nonzero(b, &args[0]);
+        let not_trapped = state.trapped.not(b);
+        match intrinsic {
+            GnomonIntrinsic::Assume => {
+                // Soundness: guard with `path_active && !trapped && !unroll_overflow` so an
+                // `assume(false)` after an earlier trap or unroll overflow can never mask it.
+                let not_overflow = state.unroll_overflow.not(b);
+                let active_clean = state
+                    .path_active
+                    .and(b, &not_trapped)
+                    .and(b, &not_overflow);
+                let assume_cond = active_clean.implies(b, &arg_nz);
+                state.path_assumptions = state.path_assumptions.and(b, &assume_cond);
+            }
+            GnomonIntrinsic::Assert => {
+                let is_zero = arg_nz.not(b);
+                let fire = state.path_active.and(b, &not_trapped).and(b, &is_zero);
+                state.assert_failed = state.assert_failed.or(b, &fire);
+                state.trap_if(b, &is_zero, TrapCode::HostContractViolation);
+            }
+        }
+        return Ok(Vec::new());
+    }
+
     if !validate_read_only_with_registry(&hc.precondition, registry)
         || !validate_read_only_with_registry(&hc.postcondition, registry)
     {
@@ -1620,8 +1740,8 @@ fn eval_host_call<B: SmtTarget>(
 
         let expected_tys: Vec<ValType> = hc.results.iter().map(|&(_, t)| t).collect();
         if !matches!(state.path_active.konst, Some(false)) && !check_result_types(&combined.values, &expected_tys) {
-            let active = state.path_active.clone();
-            state.trap_if(b, &active, TrapCode::HostContractViolation);
+            let t = SymBool::from_const(b, true);
+            state.trap_if(b, &t, TrapCode::HostContractViolation);
             expected_tys
                 .into_iter()
                 .map(|ty| SymVal { ty, term: b.bv_const(bits_of(ty), 0), konst: Some(0) })
@@ -1706,8 +1826,8 @@ fn eval_block_stmts_raw<B: SmtTarget>(
             Stmt::Let { dst, ty, op } => {
                 let val = eval_op(b, state, &op)?;
                 if val.ty != ty {
-                    let active = state.path_active.clone();
-                    state.trap_if(b, &active, TrapCode::Unreachable);
+                    let t = SymBool::from_const(b, true);
+                    state.trap_if(b, &t, TrapCode::Unreachable);
                 } else {
                     state.env.insert(dst, val);
                 }
@@ -1717,8 +1837,8 @@ fn eval_block_stmts_raw<B: SmtTarget>(
             }
             Stmt::Region { results, region } => {
                 let Some(sub_r) = r.child(region) else {
-                    let active = state.path_active.clone();
-                    state.trap_if(b, &active, TrapCode::Unreachable);
+                    let t = SymBool::from_const(b, true);
+                    state.trap_if(b, &t, TrapCode::Unreachable);
                     break;
                 };
                 let res_vars = r.region.vars_vec(results);
@@ -1747,18 +1867,19 @@ fn eval_block_stmts_raw<B: SmtTarget>(
                     .map(|id| state.get_val(id))
                     .collect::<Result<_, _>>()?;
                 let res_vars = r.region.vars_vec(results);
-                let active_before = state.path_active.clone();
                 let res_vals = match target {
                     CallTarget::Func(fid) => {
                         let Some(f) = module.func(fid) else {
-                            state.trap_if(b, &active_before, TrapCode::Unreachable);
+                            let t = SymBool::from_const(b, true);
+                            state.trap_if(b, &t, TrapCode::Unreachable);
                             continue;
                         };
                         eval_body(b, module, registry, state, &f.params, &f.results, &f.body, &arg_vals, depth + 1)?
                     }
                     CallTarget::Stratum(sid) => {
                         let Some(op) = registry.get_op(sid) else {
-                            state.trap_if(b, &active_before, TrapCode::Unreachable);
+                            let t = SymBool::from_const(b, true);
+                            state.trap_if(b, &t, TrapCode::Unreachable);
                             continue;
                         };
                         let use_uf = state.uf_table.as_ref().is_some_and(|rc| {
@@ -1774,7 +1895,8 @@ fn eval_block_stmts_raw<B: SmtTarget>(
                     }
                     CallTarget::Host(hid) => {
                         let Some(hc) = module.host_contract(hid) else {
-                            state.trap_if(b, &active_before, TrapCode::HostContractViolation);
+                            let t = SymBool::from_const(b, true);
+                            state.trap_if(b, &t, TrapCode::HostContractViolation);
                             continue;
                         };
                         eval_host_call(b, module, registry, state, hc, &arg_vals, depth)?
@@ -1884,8 +2006,8 @@ fn eval_region_flow<B: SmtTarget>(
         }
         RegionNode::IfElse { cond, then_region, else_region, results } => {
             let (Some(then_r), Some(else_r)) = (region.child(then_region), region.child(else_region)) else {
-                let active = state.path_active.clone();
-                state.trap_if(b, &active, TrapCode::Unreachable);
+                let t = SymBool::from_const(b, true);
+                state.trap_if(b, &t, TrapCode::Unreachable);
                 return Ok(FlowTargets::empty(b));
             };
             let res_tys = region.region.tys_vec(results);
@@ -1957,8 +2079,8 @@ fn eval_region_flow<B: SmtTarget>(
         }
         RegionNode::BoundedLoop { max_iters, init_vars, state_vars, body } => {
             let Some(body_r) = region.child(body) else {
-                let active = state.path_active.clone();
-                state.trap_if(b, &active, TrapCode::Unreachable);
+                let t = SymBool::from_const(b, true);
+                state.trap_if(b, &t, TrapCode::Unreachable);
                 return Ok(FlowTargets::empty(b));
             };
             let state_var_defs = region.region.vars_vec(state_vars);
@@ -1969,8 +2091,8 @@ fn eval_region_flow<B: SmtTarget>(
             if loop_state.len() != state_var_defs.len()
                 || loop_state.iter().zip(&state_var_defs).any(|(v, &(_, t))| v.ty != t)
             {
-                let active = state.path_active.clone();
-                state.trap_if(b, &active, TrapCode::Unreachable);
+                let t = SymBool::from_const(b, true);
+                state.trap_if(b, &t, TrapCode::Unreachable);
                 return Ok(FlowTargets::empty(b));
             }
 
@@ -2013,7 +2135,8 @@ fn eval_region_flow<B: SmtTarget>(
                             || ct.values.iter().zip(&state_var_defs).any(|(v, &(_, t))| v.ty != t)
                         {
                             state.path_active = ct.active.clone();
-                            state.trap_if(b, &ct.active, TrapCode::Unreachable);
+                            let t = SymBool::from_const(b, true);
+                            state.trap_if(b, &t, TrapCode::Unreachable);
                         } else {
                             loop_state = ct.values;
                             next_active = ct.active;
@@ -2029,7 +2152,8 @@ fn eval_region_flow<B: SmtTarget>(
             if !matches!(iter_active.konst, Some(false)) {
                 if max_iters <= MAX_SMT_LOOP_UNROLL {
                     state.path_active = iter_active.clone();
-                    state.trap_if(b, &iter_active, TrapCode::OutOfFuel);
+                    let t = SymBool::from_const(b, true);
+                    state.trap_if(b, &t, TrapCode::OutOfFuel);
                 } else {
                     state.unroll_overflow = state.unroll_overflow.or(b, &iter_active);
                     state.path_active = SymBool::from_const(b, false);
@@ -2350,16 +2474,33 @@ struct MemExtraction<'a, T> {
 fn extract_model<B: SmtTarget>(
     b: &mut B,
     param_syms: &[(ValId, SymVal<B::Term>)],
+    global_syms: &[(GlobalId, SymVal<B::Term>)],
     mem_extractions: &[MemExtraction<'_, B::Term>],
 ) -> Result<SmtModel, SieveError> {
     let mut scalar_values = Vec::with_capacity(param_syms.len());
     for (id, sv) in param_syms {
-        let raw = b.get_bv_u64(&sv.term, bits_of(sv.ty))?;
+        let raw = match sv.konst {
+            Some(k) => k,
+            None => b.get_bv_u64(&sv.term, bits_of(sv.ty))?,
+        };
         let val = match sv.ty {
             ValType::I32 => Val::I32(raw as u32 as i32),
             ValType::I64 => Val::I64(raw as i64),
         };
         scalar_values.push((*id, val));
+    }
+
+    let mut global_values = Vec::with_capacity(global_syms.len());
+    for (gid, sv) in global_syms {
+        let raw = match sv.konst {
+            Some(k) => k,
+            None => b.get_bv_u64(&sv.term, bits_of(sv.ty))?,
+        };
+        let val = match sv.ty {
+            ValType::I32 => Val::I32(raw as u32 as i32),
+            ValType::I64 => Val::I64(raw as i64),
+        };
+        global_values.push((*gid, val));
     }
 
     let mut memory_bytes = Vec::new();
@@ -2396,7 +2537,7 @@ fn extract_model<B: SmtTarget>(
         }
     }
 
-    Ok(SmtModel { scalar_values, memory_bytes })
+    Ok(SmtModel { scalar_values, global_values, memory_bytes })
 }
 
 fn solve_with_overflow_guard<B: SmtTarget>(
@@ -2404,13 +2545,16 @@ fn solve_with_overflow_guard<B: SmtTarget>(
     goal_assertion: &B::Term,
     overflow_flag: &SymBool<B::Term>,
     param_syms: &[(ValId, SymVal<B::Term>)],
+    global_syms: &[(GlobalId, SymVal<B::Term>)],
     mem_extractions: &[MemExtraction<'_, B::Term>],
 ) -> Result<SmtResult, SieveError> {
     if matches!(overflow_flag.konst, Some(false)) {
         b.assert_formula(goal_assertion)?;
         return match b.check_sat()? {
             RawSat::Unsat => Ok(SmtResult::Unsat),
-            RawSat::Sat => Ok(SmtResult::Sat(extract_model(b, param_syms, mem_extractions)?)),
+            RawSat::Sat => {
+                Ok(SmtResult::Sat(extract_model(b, param_syms, global_syms, mem_extractions)?))
+            }
             RawSat::Unknown(msg) => Ok(SmtResult::Unknown(msg)),
         };
     }
@@ -2422,7 +2566,7 @@ fn solve_with_overflow_guard<B: SmtTarget>(
     b.assert_formula(&no_over.term)?;
     let res1 = b.check_sat()?;
     if res1 == RawSat::Sat {
-        let model = extract_model(b, param_syms, mem_extractions)?;
+        let model = extract_model(b, param_syms, global_syms, mem_extractions)?;
         b.pop()?;
         return Ok(SmtResult::Sat(model));
     }
@@ -2454,6 +2598,8 @@ pub(crate) fn run_check_vc<B: SmtTarget>(
     query_prefix: &str,
 ) -> Result<SmtResult, SieveError> {
     let mut base_state = ExecState::from_module(b, module, query_prefix)?;
+    let global_syms: Vec<(GlobalId, SymVal<B::Term>)> =
+        base_state.globals.iter().map(|(&gid, g)| (gid, g.val.clone())).collect();
     let mut param_syms = Vec::with_capacity(vc.params.len());
     for &(id, ty) in &vc.params {
         let term = b.fresh_bv(&format!("{query_prefix}_v_{}", id.0), bits_of(ty));
@@ -2480,12 +2626,17 @@ pub(crate) fn run_check_vc<B: SmtTarget>(
             }
             _ => SymBool::from_const(b, false),
         };
-        b.assert_formula(&ok.term)?;
+        let ok_or_over = a_state.unroll_overflow.or(b, &ok);
+        let guarded = a_state.path_assumptions.and(b, &ok_or_over);
+        b.assert_formula(&guarded.term)?;
     }
 
     let mut g_state = base_state;
     let g_vals = eval_top_region(b, module, registry, &mut g_state, &vc.goal)?;
     overflow = overflow.or(b, &g_state.unroll_overflow);
+    if !matches!(g_state.path_assumptions.konst, Some(true)) {
+        b.assert_formula(&g_state.path_assumptions.term)?;
+    }
     for (mid, mem) in &mut g_state.mems {
         if let Some(extra) = all_reads.remove(mid) {
             mem.read_addrs.extend(extra);
@@ -2508,7 +2659,14 @@ pub(crate) fn run_check_vc<B: SmtTarget>(
         .map(|(&id, mem)| MemExtraction { id, mem, witness: None })
         .collect();
 
-    solve_with_overflow_guard(b, &violated.term, &overflow, &param_syms, &mem_extractions)
+    solve_with_overflow_guard(
+        b,
+        &violated.term,
+        &overflow,
+        &param_syms,
+        &global_syms,
+        &mem_extractions,
+    )
 }
 
 fn is_pure_total_region(r: RegionRef<'_>, registry: &StratumRegistry, depth: u32) -> bool {
@@ -2594,8 +2752,20 @@ fn is_pure_total_stratum(sid: StratumId, registry: &StratumRegistry, depth: u32)
     is_pure_total_region(op.body.as_ref(), registry, depth + 1)
 }
 
-fn collect_pure_total_strata(region: &Region, registry: &StratumRegistry, out: &mut BTreeSet<StratumId>) {
-    fn walk(r: RegionRef<'_>, registry: &StratumRegistry, out: &mut BTreeSet<StratumId>, depth: u32) {
+fn collect_pure_total_strata_in_module(
+    module: &Module,
+    region: &Region,
+    registry: &StratumRegistry,
+    out: &mut BTreeSet<StratumId>,
+) {
+    fn walk(
+        module: &Module,
+        r: RegionRef<'_>,
+        registry: &StratumRegistry,
+        out: &mut BTreeSet<StratumId>,
+        visited_funcs: &mut BTreeSet<FuncId>,
+        depth: u32,
+    ) {
         if depth > MAX_CALL_DEPTH {
             return;
         }
@@ -2608,12 +2778,19 @@ fn collect_pure_total_strata(region: &Region, registry: &StratumRegistry, out: &
                                 if is_pure_total_stratum(sid, registry, 0) {
                                     out.insert(sid);
                                 } else if let Some(op) = registry.get_op(sid) {
-                                    walk(op.body.as_ref(), registry, out, depth + 1);
+                                    walk(module, op.body.as_ref(), registry, out, visited_funcs, depth + 1);
+                                }
+                            }
+                            Stmt::Call { target: CallTarget::Func(fid), .. } => {
+                                if visited_funcs.insert(fid)
+                                    && let Some(f) = module.func(fid)
+                                {
+                                    walk(module, f.body.as_ref(), registry, out, visited_funcs, depth + 1);
                                 }
                             }
                             Stmt::Region { region, .. } => {
                                 if let Some(sub) = r.child(region) {
-                                    walk(sub, registry, out, depth + 1);
+                                    walk(module, sub, registry, out, visited_funcs, depth + 1);
                                 }
                             }
                             _ => {}
@@ -2623,27 +2800,28 @@ fn collect_pure_total_strata(region: &Region, registry: &StratumRegistry, out: &
             }
             RegionNode::IfElse { then_region, else_region, .. } => {
                 if let Some(s) = r.child(then_region) {
-                    walk(s, registry, out, depth + 1);
+                    walk(module, s, registry, out, visited_funcs, depth + 1);
                 }
                 if let Some(s) = r.child(else_region) {
-                    walk(s, registry, out, depth + 1);
+                    walk(module, s, registry, out, visited_funcs, depth + 1);
                 }
             }
             RegionNode::BoundedLoop { body, .. } => {
                 if let Some(s) = r.child(body) {
-                    walk(s, registry, out, depth + 1);
+                    walk(module, s, registry, out, visited_funcs, depth + 1);
                 }
             }
             RegionNode::InvariantLoop { cond, invariant_pred, fuel_measure, body, .. } => {
                 for id in [cond, invariant_pred, fuel_measure, body] {
                     if let Some(s) = r.child(id) {
-                        walk(s, registry, out, depth + 1);
+                        walk(module, s, registry, out, visited_funcs, depth + 1);
                     }
                 }
             }
         }
     }
-    walk(region.as_ref(), registry, out, 0);
+    let mut visited_funcs = BTreeSet::new();
+    walk(module, region.as_ref(), registry, out, &mut visited_funcs, 0);
 }
 
 pub(crate) fn run_check_equivalence<B: SmtTarget>(
@@ -2660,8 +2838,8 @@ pub(crate) fn run_check_equivalence<B: SmtTarget>(
     // if SAT or Unknown (possibly spurious), pop and fall back to exact Layer-0 inlining.
     let mut lhs_pure = BTreeSet::new();
     let mut rhs_pure = BTreeSet::new();
-    collect_pure_total_strata(lhs, registry, &mut lhs_pure);
-    collect_pure_total_strata(rhs, registry, &mut rhs_pure);
+    collect_pure_total_strata_in_module(module, lhs, registry, &mut lhs_pure);
+    collect_pure_total_strata_in_module(module, rhs, registry, &mut rhs_pure);
     let shared_uf: BTreeSet<StratumId> = lhs_pure.intersection(&rhs_pure).copied().collect();
 
     if !shared_uf.is_empty() {
@@ -2699,6 +2877,8 @@ fn run_check_equivalence_inner<B: SmtTarget>(
 ) -> Result<SmtResult, SieveError> {
     let params = infer_equiv_params(module, registry, lhs, rhs, precondition)?;
     let mut base_state = ExecState::from_module(b, module, query_prefix)?;
+    let global_syms: Vec<(GlobalId, SymVal<B::Term>)> =
+        base_state.globals.iter().map(|(&gid, g)| (gid, g.val.clone())).collect();
     let uf_table = uf_strata.map(|set| UfTable::new(set, query_prefix.to_string()));
     base_state.uf_table = uf_table.clone();
     let mut param_syms = Vec::with_capacity(params.len());
@@ -2721,7 +2901,9 @@ fn run_check_equivalence_inner<B: SmtTarget>(
             }
             None => SymBool::from_const(b, false),
         };
-        b.assert_formula(&ok.term)?;
+        let ok_or_over = p_state.unroll_overflow.or(b, &ok);
+        let guarded = p_state.path_assumptions.and(b, &ok_or_over);
+        b.assert_formula(&guarded.term)?;
     }
 
     let mut lhs_state = base_state.clone();
@@ -2730,6 +2912,12 @@ fn run_check_equivalence_inner<B: SmtTarget>(
     let rhs_vals = eval_top_region(b, module, registry, &mut rhs_state, rhs)?;
 
     overflow = overflow.or(b, &lhs_state.unroll_overflow).or(b, &rhs_state.unroll_overflow);
+    if !matches!(lhs_state.path_assumptions.konst, Some(true)) {
+        b.assert_formula(&lhs_state.path_assumptions.term)?;
+    }
+    if !matches!(rhs_state.path_assumptions.konst, Some(true)) {
+        b.assert_formula(&rhs_state.path_assumptions.term)?;
+    }
 
     // Build discrepancy formula:
     // (lhs.trapped != rhs.trapped)
@@ -2839,5 +3027,325 @@ fn run_check_equivalence_inner<B: SmtTarget>(
         tbl.assert_congruence_axioms(b)?;
     }
 
-    solve_with_overflow_guard(b, &diff.term, &overflow, &param_syms, &refs)
+    solve_with_overflow_guard(b, &diff.term, &overflow, &param_syms, &global_syms, &refs)
+}
+
+fn validate_contract_spec(contract: &ContractSpec<'_>) -> Result<(), SieveError> {
+    if let Some(req_params) = contract.requires_params
+        && (req_params.len() != contract.params.len()
+            || req_params.iter().zip(contract.params).any(|(a, b)| a.1 != b.1))
+    {
+        return Err(SieveError::EncodingError(format!(
+            "requires_params signature {:?} does not match entry params {:?}",
+            req_params.iter().map(|&(_, t)| t).collect::<Vec<_>>(),
+            contract.params.iter().map(|&(_, t)| t).collect::<Vec<_>>()
+        )));
+    }
+    if let Some(ens_params) = contract.ensures_params {
+        let total = contract.params.len() + contract.results.len();
+        if ens_params.len() == total {
+            let expected = contract
+                .params
+                .iter()
+                .map(|&(_, t)| t)
+                .chain(contract.results.iter().copied());
+            if ens_params.iter().map(|&(_, t)| t).ne(expected) {
+                return Err(SieveError::EncodingError(
+                    "ensures_params types do not match (entry_params..., entry_results...)".into(),
+                ));
+            }
+        } else if ens_params.len() == contract.results.len() {
+            if ens_params.iter().map(|&(_, t)| t).ne(contract.results.iter().copied()) {
+                return Err(SieveError::EncodingError(
+                    "ensures_params types do not match entry_results".into(),
+                ));
+            }
+        } else if !ens_params.is_empty() {
+            return Err(SieveError::EncodingError(format!(
+                "ensures_params arity {} does not match params+results ({}), results ({}), or 0",
+                ens_params.len(),
+                total,
+                contract.results.len()
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn eval_contract_pred<B: SmtTarget>(
+    b: &mut B,
+    module: &Module,
+    registry: &StratumRegistry,
+    state: &mut ExecState<B::Term>,
+    pred: &Region,
+    role: &str,
+) -> Result<SymBool<B::Term>, SieveError> {
+    let vals = eval_top_region(b, module, registry, state, pred)?;
+    let reachable = !matches!(state.path_active.konst, Some(false))
+        && !matches!(state.trapped.konst, Some(true));
+    if reachable && (vals.len() != 1 || vals[0].ty != ValType::I32) {
+        return Err(SieveError::EncodingError(format!(
+            "contract {role} predicate must yield a single I32, got {:?}",
+            vals.iter().map(|v| v.ty).collect::<Vec<_>>()
+        )));
+    }
+    Ok(match vals.first() {
+        Some(v) if v.ty == ValType::I32 => {
+            let nz = state.is_nonzero(b, v);
+            state.trapped.not(b).and(b, &state.path_active).and(b, &nz)
+        }
+        _ => SymBool::from_const(b, false),
+    })
+}
+
+pub(crate) fn run_check_contract<B: SmtTarget>(
+    b: &mut B,
+    module: &Module,
+    registry: &StratumRegistry,
+    contract: &ContractSpec<'_>,
+    query_prefix: &str,
+) -> Result<SmtResult, SieveError> {
+    validate_contract_spec(contract)?;
+
+    // Stage 2a (CEGAR): attempt Ackermann UF abstraction for pure-total Strata referenced
+    // across entry/requires/ensures/invariant first. UNSAT under UF strictly implies UNSAT
+    // under exact Layer-0 inlining; SAT/Unknown pops and falls back to exact Layer-0.
+    let mut pure_strata = BTreeSet::new();
+    collect_pure_total_strata_in_module(module, contract.entry, registry, &mut pure_strata);
+    if let Some(req) = contract.requires {
+        collect_pure_total_strata_in_module(module, req, registry, &mut pure_strata);
+    }
+    if let Some(ens) = contract.ensures {
+        collect_pure_total_strata_in_module(module, ens, registry, &mut pure_strata);
+    }
+    if let Some(inv) = contract.invariant {
+        collect_pure_total_strata_in_module(module, inv, registry, &mut pure_strata);
+    }
+
+    if !pure_strata.is_empty() {
+        b.push()?;
+        let uf_prefix = format!("{query_prefix}_uf");
+        let uf_res = run_check_contract_inner(
+            b,
+            module,
+            registry,
+            contract,
+            &uf_prefix,
+            Some(pure_strata),
+        );
+        b.pop()?;
+        if let Ok(SmtResult::Unsat) = uf_res {
+            return Ok(SmtResult::Unsat);
+        }
+    }
+
+    run_check_contract_inner(b, module, registry, contract, query_prefix, None)
+}
+
+fn run_check_contract_inner<B: SmtTarget>(
+    b: &mut B,
+    module: &Module,
+    registry: &StratumRegistry,
+    contract: &ContractSpec<'_>,
+    query_prefix: &str,
+    uf_strata: Option<BTreeSet<StratumId>>,
+) -> Result<SmtResult, SieveError> {
+    let mut base_state =
+        ExecState::from_module_with_mode(b, module, query_prefix, contract.use_initial_state)?;
+    let global_syms: Vec<(GlobalId, SymVal<B::Term>)> =
+        base_state.globals.iter().map(|(&gid, g)| (gid, g.val.clone())).collect();
+    let uf_table = uf_strata.map(|set| UfTable::new(set, query_prefix.to_string()));
+    base_state.uf_table = uf_table.clone();
+
+    let mut param_syms = Vec::with_capacity(contract.params.len());
+    for &(id, ty) in contract.params {
+        let term = b.fresh_bv(&format!("{query_prefix}_v_{}", id.0), bits_of(ty));
+        let sv = SymVal { ty, term, konst: None };
+        base_state.env.insert(id, sv.clone());
+        param_syms.push((id, sv));
+    }
+
+    let mut overflow = SymBool::from_const(b, false);
+    let mut all_reads: BTreeMap<MemId, Vec<(B::Term, MemWidth)>> = BTreeMap::new();
+    let merge_reads = |state: &ExecState<B::Term>,
+                       dst: &mut BTreeMap<MemId, Vec<(B::Term, MemWidth)>>| {
+        for (mid, mem) in &state.mems {
+            if !mem.read_addrs.is_empty() {
+                dst.entry(*mid).or_default().extend(mem.read_addrs.iter().cloned());
+            }
+        }
+    };
+
+    // 1. Pre-state invariant (assumed ONLY for inductive checks, i.e., !use_initial_state).
+    if !contract.use_initial_state
+        && let Some(inv) = contract.invariant
+    {
+        let mut inv_pre = base_state.clone();
+        inv_pre.env.clear();
+        let inv_ok = eval_contract_pred(b, module, registry, &mut inv_pre, inv, "invariant(pre)")?;
+        overflow = overflow.or(b, &inv_pre.unroll_overflow);
+        merge_reads(&inv_pre, &mut all_reads);
+        // Guard with `unroll_overflow || inv_ok` so Phase 1 (!overflow) strictly enforces `inv_ok`
+        // while Phase 2 (overflow) still catches reachable unroll overflow inside `invariant(pre)`.
+        let inv_or_over = inv_pre.unroll_overflow.or(b, &inv_ok);
+        let pre_cond = inv_pre.path_assumptions.and(b, &inv_or_over);
+        b.assert_formula(&pre_cond.term)?;
+    }
+
+    // 2. Pre-state `requires` (assumed on pre_state).
+    if let Some(req) = contract.requires {
+        let mut req_state = base_state.clone();
+        if let Some(req_params) = contract.requires_params {
+            req_state.env.clear();
+            for (&(id, _), (_, sv)) in req_params.iter().zip(&param_syms) {
+                req_state.env.insert(id, sv.clone());
+            }
+        }
+        let req_ok = eval_contract_pred(b, module, registry, &mut req_state, req, "requires")?;
+        overflow = overflow.or(b, &req_state.unroll_overflow);
+        merge_reads(&req_state, &mut all_reads);
+        let req_or_over = req_state.unroll_overflow.or(b, &req_ok);
+        let req_cond = req_state.path_assumptions.and(b, &req_or_over);
+        b.assert_formula(&req_cond.term)?;
+    }
+
+    // 3. Execute `entry` from pre_state -> post_state.
+    let mut entry_state = base_state;
+    let entry_vals = eval_top_region(b, module, registry, &mut entry_state, contract.entry)?;
+    overflow = overflow.or(b, &entry_state.unroll_overflow);
+    if !matches!(entry_state.path_assumptions.konst, Some(true)) {
+        b.assert_formula(&entry_state.path_assumptions.term)?;
+    }
+
+    let entry_clean = entry_state.trapped.not(b).and(b, &entry_state.path_active);
+    let entry_reachable = !matches!(entry_clean.konst, Some(false));
+    let entry_res_vals = if entry_reachable {
+        if !check_result_types(&entry_vals, contract.results) {
+            return Err(SieveError::EncodingError(format!(
+                "contract entry result signature mismatch: expected {:?}, got {:?}",
+                contract.results,
+                entry_vals.iter().map(|v| v.ty).collect::<Vec<_>>()
+            )));
+        }
+        entry_vals
+    } else {
+        contract
+            .results
+            .iter()
+            .map(|&ty| SymVal { ty, term: b.bv_const(bits_of(ty), 0), konst: Some(0) })
+            .collect()
+    };
+
+    // 4. Evaluate post-state obligations (`invariant(post)` and `ensures`) on clean paths.
+    let mut post_ok = SymBool::from_const(b, true);
+    if entry_reachable {
+        if let Some(inv) = contract.invariant {
+            let mut inv_post = entry_state.clone();
+            inv_post.env.clear();
+            inv_post.trapped = SymBool::from_const(b, false);
+            inv_post.trap_code = b.bv_const(8, 0);
+            inv_post.assert_failed = SymBool::from_const(b, false);
+            inv_post.path_active = entry_clean.clone();
+            inv_post.path_assumptions = SymBool::from_const(b, true);
+            for mem in inv_post.mems.values_mut() {
+                mem.read_addrs.clear();
+            }
+            let inv_ok =
+                eval_contract_pred(b, module, registry, &mut inv_post, inv, "invariant(post)")?;
+            overflow = overflow.or(b, &inv_post.unroll_overflow);
+            merge_reads(&inv_post, &mut all_reads);
+            if !matches!(inv_post.path_assumptions.konst, Some(true)) {
+                b.assert_formula(&inv_post.path_assumptions.term)?;
+            }
+            post_ok = post_ok.and(b, &inv_ok);
+        }
+
+        if let Some(ens) = contract.ensures {
+            let mut ens_state = entry_state.clone();
+            ens_state.env.clear();
+            if let Some(ens_params) = contract.ensures_params {
+                if ens_params.len() == contract.params.len() + contract.results.len() {
+                    for (&(id, _), (_, sv)) in ens_params.iter().zip(&param_syms) {
+                        ens_state.env.insert(id, sv.clone());
+                    }
+                    for (&(id, _), rv) in
+                        ens_params[contract.params.len()..].iter().zip(&entry_res_vals)
+                    {
+                        ens_state.env.insert(id, rv.clone());
+                    }
+                } else if ens_params.len() == contract.results.len() {
+                    for (&(id, _), rv) in ens_params.iter().zip(&entry_res_vals) {
+                        ens_state.env.insert(id, rv.clone());
+                    }
+                }
+            } else {
+                for (id, sv) in &param_syms {
+                    ens_state.env.insert(*id, sv.clone());
+                }
+                let base = contract
+                    .params
+                    .iter()
+                    .map(|(v, _)| v.0.saturating_add(1))
+                    .max()
+                    .unwrap_or(0);
+                for (i, rv) in entry_res_vals.iter().enumerate() {
+                    ens_state.env.insert(ValId(base + i as u32), rv.clone());
+                }
+            }
+            ens_state.trapped = SymBool::from_const(b, false);
+            ens_state.trap_code = b.bv_const(8, 0);
+            ens_state.assert_failed = SymBool::from_const(b, false);
+            ens_state.path_active = entry_clean.clone();
+            ens_state.path_assumptions = SymBool::from_const(b, true);
+            for mem in ens_state.mems.values_mut() {
+                mem.read_addrs.clear();
+            }
+            let ens_ok = eval_contract_pred(b, module, registry, &mut ens_state, ens, "ensures")?;
+            overflow = overflow.or(b, &ens_state.unroll_overflow);
+            merge_reads(&ens_state, &mut all_reads);
+            if !matches!(ens_state.path_assumptions.konst, Some(true)) {
+                b.assert_formula(&ens_state.path_assumptions.term)?;
+            }
+            post_ok = post_ok.and(b, &ens_ok);
+        }
+    }
+
+    let holds = if contract.check_trap_free {
+        entry_clean.and(b, &post_ok)
+    } else {
+        // Explicit inline `gnomon_assert(0)` violations must NEVER be masked by `check_trap_free: false`.
+        let no_assert_fail = entry_state.assert_failed.not(b);
+        let partial_ok = entry_clean.implies(b, &post_ok);
+        no_assert_fail.and(b, &partial_ok)
+    };
+    let violated = holds.not(b);
+
+    for (mid, mem) in &mut entry_state.mems {
+        if let Some(extra) = all_reads.remove(mid) {
+            mem.read_addrs.extend(extra);
+        }
+    }
+    let mem_extractions: Vec<MemExtraction<'_, B::Term>> = entry_state
+        .mems
+        .iter()
+        .filter(|(_, m)| !m.read_addrs.is_empty())
+        .map(|(&id, mem)| MemExtraction { id, mem, witness: None })
+        .collect();
+
+    if let Some(ref rc) = uf_table {
+        let tbl = rc.borrow();
+        if tbl.overflow {
+            return Ok(SmtResult::Unknown("uf call cap exceeded".into()));
+        }
+        tbl.assert_congruence_axioms(b)?;
+    }
+
+    solve_with_overflow_guard(
+        b,
+        &violated.term,
+        &overflow,
+        &param_syms,
+        &global_syms,
+        &mem_extractions,
+    )
 }

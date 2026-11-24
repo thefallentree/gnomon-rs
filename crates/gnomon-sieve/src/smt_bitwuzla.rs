@@ -3,8 +3,8 @@
 use bitwuzla::{Bitwuzla, Kind, Opt, Options, SatResult, Sort, Term, TermManager};
 use gnomon_kernel::{Module, Region, StratumRegistry, VcObligation};
 
-use crate::smt_ir::{RawSat, SmtTarget, run_check_equivalence, run_check_vc};
-use crate::{SieveError, SmtBackend, SmtResult};
+use crate::smt_ir::{RawSat, SmtTarget, run_check_contract, run_check_equivalence, run_check_vc};
+use crate::{ContractSpec, SieveError, SmtBackend, SmtResult};
 
 /// Native in-process Bitwuzla `QF_ABV` solver backend.
 #[derive(Clone, Debug, Default)]
@@ -70,6 +70,16 @@ impl SmtBackend for BitwuzlaNativeBackend {
         let (mut session, prefix) = self.new_session()?;
         run_check_equivalence(&mut session, module, registry, lhs, rhs, precondition, &prefix)
     }
+
+    fn check_contract(
+        &mut self,
+        module: &Module,
+        registry: &StratumRegistry,
+        contract: &ContractSpec<'_>,
+    ) -> Result<SmtResult, SieveError> {
+        let (mut session, prefix) = self.new_session()?;
+        run_check_contract(&mut session, module, registry, contract, &prefix)
+    }
 }
 
 struct NativeSession {
@@ -112,6 +122,11 @@ impl SmtTarget for NativeSession {
     fn const_array_bool(&mut self, v: bool) -> Term {
         let val = self.bool_const(v);
         self.tm.mk_const_array(&self.written_sort, &val)
+    }
+
+    fn const_array_bv8(&mut self, v: u8) -> Term {
+        let val = self.bv_const(8, v as u64);
+        self.tm.mk_const_array(&self.mem_sort, &val)
     }
 
     fn fresh_bv(&mut self, name: &str, bits: u8) -> Term {

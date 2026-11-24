@@ -1,12 +1,13 @@
 use gnomon_kernel::{
-    BinOp, CallTarget, EffectOp, GlobalDef, GlobalId, HeapState, HostCallId, HostContract,
-    Law, LawKind, LawList, MemId, MemWidth, MemoryDef, Module, OffsetRange, Op, Region, SliceBound,
-    Stratum, StratumId, StratumOp, StratumRegistry, TrapCode, UnOp, Val, ValId, ValType,
-    WASM_PAGE_SIZE, eval_region, split_invariant_loop,
+    BinOp, CallTarget, EffectOp, FuncDef, FuncId, GlobalDef, GlobalId, HeapState, HostCallId,
+    HostContract, Law, LawKind, LawList, MemId, MemWidth, MemoryDef, Module, OffsetRange, Op,
+    Region, RegionBuilder, RegionList, RegionNode, SliceBound, Stratum, StratumId, StratumOp,
+    StratumRegistry, TrapCode, UnOp, Val, ValId, ValType, VcKind, VcObligation, WASM_PAGE_SIZE,
+    eval_region, split_invariant_loop,
 };
 use gnomon_sieve::{
-    BitwuzlaNativeBackend, BitwuzlaPipeBackend, EgglogSimplifier, EqSatConfig, SmtBackend,
-    SmtResult,
+    BitwuzlaNativeBackend, BitwuzlaPipeBackend, ContractSpec, EgglogSimplifier, EqSatConfig,
+    SieveError, SmtBackend, SmtResult,
 };
 
 fn mod_with_mems(mems: &[(u16, u32, Option<u32>)]) -> Module {
@@ -1232,4 +1233,917 @@ fn test_uf_congruence_cegar_soundness_and_speed() {
     });
     let sat_res = native.check_equivalence(&module, &reg, &buggy, &ok_1, None).unwrap();
     assert!(matches!(sat_res, SmtResult::Sat(_)), "expected concrete SAT counterexample, got {sat_res:?}");
+}
+
+fn make_intrinsic_host(id: u32, module_name: &str, field_name: &str) -> HostContract {
+    let true_pred = Region::build(|b| {
+        b.push_let(ValId(0), ValType::I32, Op::ConstI32(1));
+        b.push_yield(&[ValId(0)]);
+    });
+    HostContract {
+        id: HostCallId(id),
+        module_name: module_name.into(),
+        field_name: field_name.into(),
+        params: vec![(ValId(0), ValType::I32)],
+        results: vec![],
+        precondition: true_pred.clone(),
+        read_footprints: vec![],
+        write_footprints: vec![],
+        postcondition: true_pred,
+        sim_body: None,
+    }
+}
+
+#[test]
+fn test_contract_pure_pre_post_and_ensures_binding_both_backends() {
+    let module = Module::default();
+    let reg = StratumRegistry::new();
+
+    // entry(x: i32, y: i32) -> i32 { x + y }
+    let entry = FuncDef {
+        id: FuncId(0),
+        name: "add_pair".into(),
+        export_name: Some("add_pair".into()),
+        params: vec![(ValId(0), ValType::I32), (ValId(1), ValType::I32)],
+        results: vec![ValType::I32],
+        body: Region::build(|b| {
+            b.push_let(ValId(2), ValType::I32, Op::Bin(BinOp::I32Add, ValId(0), ValId(1)));
+            b.push_yield(&[ValId(2)]);
+        }),
+    };
+    // requires(x, y): 0 <= x <= 1000 && 0 <= y <= 1000
+    let req = Region::build(|b| {
+        b.push_let(ValId(10), ValType::I32, Op::ConstI32(0));
+        b.push_let(ValId(11), ValType::I32, Op::ConstI32(1000));
+        b.push_let(ValId(12), ValType::I32, Op::Bin(BinOp::I32GeS, ValId(0), ValId(10)));
+        b.push_let(ValId(13), ValType::I32, Op::Bin(BinOp::I32LeS, ValId(0), ValId(11)));
+        b.push_let(ValId(14), ValType::I32, Op::Bin(BinOp::I32GeS, ValId(1), ValId(10)));
+        b.push_let(ValId(15), ValType::I32, Op::Bin(BinOp::I32LeS, ValId(1), ValId(11)));
+        b.push_let(ValId(16), ValType::I32, Op::Bin(BinOp::I32And, ValId(12), ValId(13)));
+        b.push_let(ValId(17), ValType::I32, Op::Bin(BinOp::I32And, ValId(14), ValId(15)));
+        b.push_let(ValId(18), ValType::I32, Op::Bin(BinOp::I32And, ValId(16), ValId(17)));
+        b.push_yield(&[ValId(18)]);
+    });
+    // ensures_valid(x: ValId(0), y: ValId(1), ret: ValId(2)): ret >= x && ret <= 2000
+    let ens_valid = Region::build(|b| {
+        b.push_let(ValId(10), ValType::I32, Op::ConstI32(2000));
+        b.push_let(ValId(11), ValType::I32, Op::Bin(BinOp::I32GeS, ValId(2), ValId(0)));
+        b.push_let(ValId(12), ValType::I32, Op::Bin(BinOp::I32LeS, ValId(2), ValId(10)));
+        b.push_let(ValId(13), ValType::I32, Op::Bin(BinOp::I32And, ValId(11), ValId(12)));
+        b.push_yield(&[ValId(13)]);
+    });
+    // ensures_false(x, y, ret): ret <= 1500
+    let ens_false = Region::build(|b| {
+        b.push_let(ValId(10), ValType::I32, Op::ConstI32(1500));
+        b.push_let(ValId(11), ValType::I32, Op::Bin(BinOp::I32LeS, ValId(2), ValId(10)));
+        b.push_yield(&[ValId(11)]);
+    });
+    // ensures_ret_only(ret: ValId(0)): ret >= 0 && ret <= 2000
+    let ens_ret_only = FuncDef {
+        id: FuncId(1),
+        name: "ens_ret_only".into(),
+        export_name: None,
+        params: vec![(ValId(0), ValType::I32)],
+        results: vec![ValType::I32],
+        body: Region::build(|b| {
+            b.push_let(ValId(10), ValType::I32, Op::ConstI32(0));
+            b.push_let(ValId(11), ValType::I32, Op::ConstI32(2000));
+            b.push_let(ValId(12), ValType::I32, Op::Bin(BinOp::I32GeS, ValId(0), ValId(10)));
+            b.push_let(ValId(13), ValType::I32, Op::Bin(BinOp::I32LeS, ValId(0), ValId(11)));
+            b.push_let(ValId(14), ValType::I32, Op::Bin(BinOp::I32And, ValId(12), ValId(13)));
+            b.push_yield(&[ValId(14)]);
+        }),
+    };
+
+    with_both_backends(|backend, name| {
+        let valid_spec = ContractSpec::from_func(&entry).with_requires(&req).with_ensures(&ens_valid);
+        assert_eq!(
+            backend.check_contract(&module, &reg, &valid_spec).unwrap(),
+            SmtResult::Unsat,
+            "{name}: valid pre/post contract must be UNSAT"
+        );
+
+        let ret_only_spec = ContractSpec::from_func(&entry)
+            .with_requires(&req)
+            .with_ensures_func(&ens_ret_only);
+        assert_eq!(
+            backend.check_contract(&module, &reg, &ret_only_spec).unwrap(),
+            SmtResult::Unsat,
+            "{name}: ret-only ensures_func must be UNSAT"
+        );
+
+        let false_spec = ContractSpec::from_func(&entry).with_requires(&req).with_ensures(&ens_false);
+        match backend.check_contract(&module, &reg, &false_spec).unwrap() {
+            SmtResult::Sat(model) => {
+                let x = model
+                    .scalar_values
+                    .iter()
+                    .find(|(id, _)| *id == ValId(0))
+                    .unwrap()
+                    .1
+                    .as_i32()
+                    .unwrap();
+                let y = model
+                    .scalar_values
+                    .iter()
+                    .find(|(id, _)| *id == ValId(1))
+                    .unwrap()
+                    .1
+                    .as_i32()
+                    .unwrap();
+                assert!((0..=1000).contains(&x) && (0..=1000).contains(&y), "{name}: pre violated");
+                assert!(x + y > 1500, "{name}: counterexample must falsify ret <= 1500, got {x}+{y}");
+            }
+            other => panic!("{name}: expected Sat for falsified postcondition, got {other:?}"),
+        }
+
+        // Bad ensures_params arity returns EncodingError.
+        let bad_params = [(ValId(0), ValType::I32), (ValId(1), ValType::I32)];
+        let mut bad_spec = ContractSpec::from_func(&entry).with_ensures(&ens_valid);
+        bad_spec.ensures_params = Some(&bad_params);
+        assert!(
+            matches!(
+                backend.check_contract(&module, &reg, &bad_spec),
+                Err(SieveError::EncodingError(_))
+            ),
+            "{name}: mismatched ensures_params arity must error"
+        );
+    });
+}
+
+#[test]
+fn test_contract_trap_freedom_and_allow_traps_both_backends() {
+    let module = mod_with_mems(&[(0, 1, Some(1))]);
+    let reg = StratumRegistry::new();
+
+    // div_u(x, y) -> x /u y
+    let div_params = [(ValId(0), ValType::I32), (ValId(1), ValType::I32)];
+    let div_entry = Region::build(|b| {
+        b.push_let(ValId(2), ValType::I32, Op::Bin(BinOp::I32DivU, ValId(0), ValId(1)));
+        b.push_yield(&[ValId(2)]);
+    });
+    let y_ne_zero = Region::build(|b| {
+        b.push_let(ValId(2), ValType::I32, Op::ConstI32(0));
+        b.push_let(ValId(3), ValType::I32, Op::Bin(BinOp::I32Ne, ValId(1), ValId(2)));
+        b.push_yield(&[ValId(3)]);
+    });
+    let ens_le_x = Region::build(|b| {
+        b.push_let(ValId(3), ValType::I32, Op::Bin(BinOp::I32LeU, ValId(2), ValId(0)));
+        b.push_yield(&[ValId(3)]);
+    });
+    let ens_lt_x = Region::build(|b| {
+        b.push_let(ValId(3), ValType::I32, Op::Bin(BinOp::I32LtU, ValId(2), ValId(0)));
+        b.push_yield(&[ValId(3)]);
+    });
+
+    // load_i32(addr) -> i32
+    let load_params = [(ValId(0), ValType::I32)];
+    let load_entry = Region::build(|b| {
+        b.push_let(
+            ValId(1),
+            ValType::I32,
+            Op::Load {
+                mem: MemId(0),
+                addr: ValId(0),
+                offset: 0,
+                width: MemWidth::B4,
+                signed: false,
+                result_ty: ValType::I32,
+            },
+        );
+        b.push_yield(&[ValId(1)]);
+    });
+    let addr_in_bounds = Region::build(|b| {
+        b.push_let(ValId(1), ValType::I32, Op::ConstI32((WASM_PAGE_SIZE - 4) as i32));
+        b.push_let(ValId(2), ValType::I32, Op::Bin(BinOp::I32LeU, ValId(0), ValId(1)));
+        b.push_yield(&[ValId(2)]);
+    });
+
+    with_both_backends(|backend, name| {
+        // 1. Unguarded div_u traps on y == 0.
+        let spec_div_unguarded = ContractSpec::new(&div_params, &[ValType::I32], &div_entry);
+        match backend.check_contract(&module, &reg, &spec_div_unguarded).unwrap() {
+            SmtResult::Sat(m) => {
+                assert!(m.scalar_values.contains(&(ValId(1), Val::I32(0))), "{name}: expected y=0");
+            }
+            other => panic!("{name}: expected Sat for unguarded div0, got {other:?}"),
+        }
+
+        // 2. Guarded div_u is trap-free and satisfies ret <=u x.
+        let spec_div_guarded = ContractSpec::new(&div_params, &[ValType::I32], &div_entry)
+            .with_requires(&y_ne_zero)
+            .with_ensures(&ens_le_x);
+        assert_eq!(
+            backend.check_contract(&module, &reg, &spec_div_guarded).unwrap(),
+            SmtResult::Unsat,
+            "{name}: guarded div_u must be UNSAT"
+        );
+
+        // 3. check_trap_free = false allows y == 0 trap, still checks postcondition on y != 0.
+        let spec_partial_ok = ContractSpec::new(&div_params, &[ValType::I32], &div_entry)
+            .with_ensures(&ens_le_x)
+            .with_check_trap_free(false);
+        assert_eq!(
+            backend.check_contract(&module, &reg, &spec_partial_ok).unwrap(),
+            SmtResult::Unsat,
+            "{name}: partial correctness div_u <=u x must be UNSAT"
+        );
+        let spec_partial_bad = ContractSpec::new(&div_params, &[ValType::I32], &div_entry)
+            .with_ensures(&ens_lt_x)
+            .with_check_trap_free(false);
+        match backend.check_contract(&module, &reg, &spec_partial_bad).unwrap() {
+            SmtResult::Sat(m) => {
+                let y = m.scalar_values.iter().find(|(id, _)| *id == ValId(1)).unwrap().1.as_i32().unwrap();
+                assert_ne!(y, 0, "{name}: partial correctness counterexample must not trap");
+            }
+            other => panic!("{name}: expected Sat for ret <u x, got {other:?}"),
+        }
+
+        // 4. OOB load caught when unguarded, proved when guarded.
+        let spec_load_bad = ContractSpec::new(&load_params, &[ValType::I32], &load_entry);
+        match backend.check_contract(&module, &reg, &spec_load_bad).unwrap() {
+            SmtResult::Sat(m) => {
+                let addr = m.scalar_values.iter().find(|(id, _)| *id == ValId(0)).unwrap().1.as_u32().unwrap();
+                assert!(addr > (WASM_PAGE_SIZE - 4) as u32, "{name}: expected OOB addr, got {addr}");
+            }
+            other => panic!("{name}: expected Sat for unguarded load, got {other:?}"),
+        }
+        let spec_load_ok =
+            ContractSpec::new(&load_params, &[ValType::I32], &load_entry).with_requires(&addr_in_bounds);
+        assert_eq!(
+            backend.check_contract(&module, &reg, &spec_load_ok).unwrap(),
+            SmtResult::Unsat,
+            "{name}: guarded load must be UNSAT"
+        );
+    });
+}
+
+#[test]
+fn test_contract_inductive_stateful_globals_and_memory_both_backends() {
+    // Module:
+    // - Memory 0: 1 page; init_data writes orig_qty = 100i64 at offset 0
+    //   (with an earlier overlapping non-zero segment to test overwrite order).
+    // - Global 0 (mut i64, init 0): leaves_qty
+    // - Global 1 (mut i64, init 0): cum_filled
+    // Notice raw initial Wasm state has orig=100, leaves=0, cum=0, so I(raw_init) is FALSE!
+    let mut orig_bytes = 100i64.to_le_bytes().to_vec();
+    orig_bytes.shrink_to_fit();
+    let module = Module {
+        memories: vec![MemoryDef {
+            id: MemId(0),
+            min_pages: 1,
+            max_pages: Some(1),
+            init_data: vec![(0, vec![0xFF; 8]), (0, orig_bytes)],
+        }],
+        globals: vec![
+            GlobalDef { id: GlobalId(0), ty: ValType::I64, mutable: true, init: Val::I64(0) },
+            GlobalDef { id: GlobalId(1), ty: ValType::I64, mutable: true, init: Val::I64(0) },
+        ],
+        ..Module::default()
+    };
+    let reg = StratumRegistry::new();
+
+    // Invariant I(): orig > 0 && leaves >= 0 && cum >= 0 && leaves + cum == orig
+    let inv = Region::build(|b| {
+        b.push_let(ValId(0), ValType::I32, Op::ConstI32(0));
+        b.push_let(
+            ValId(1),
+            ValType::I64,
+            Op::Load {
+                mem: MemId(0),
+                addr: ValId(0),
+                offset: 0,
+                width: MemWidth::B8,
+                signed: true,
+                result_ty: ValType::I64,
+            },
+        );
+        b.push_let(ValId(2), ValType::I64, Op::GlobalGet(GlobalId(0))); // leaves
+        b.push_let(ValId(3), ValType::I64, Op::GlobalGet(GlobalId(1))); // cum
+        b.push_let(ValId(4), ValType::I64, Op::ConstI64(0));
+        b.push_let(ValId(5), ValType::I32, Op::Bin(BinOp::I64GtS, ValId(1), ValId(4))); // orig > 0
+        b.push_let(ValId(6), ValType::I32, Op::Bin(BinOp::I64GeS, ValId(2), ValId(4))); // leaves >= 0
+        b.push_let(ValId(7), ValType::I32, Op::Bin(BinOp::I64GeS, ValId(3), ValId(4))); // cum >= 0
+        b.push_let(ValId(8), ValType::I64, Op::Bin(BinOp::I64Add, ValId(2), ValId(3))); // leaves + cum
+        b.push_let(ValId(9), ValType::I32, Op::Bin(BinOp::I64Eq, ValId(8), ValId(1))); // == orig
+        b.push_let(ValId(10), ValType::I32, Op::Bin(BinOp::I32And, ValId(5), ValId(6)));
+        b.push_let(ValId(11), ValType::I32, Op::Bin(BinOp::I32And, ValId(7), ValId(9)));
+        b.push_let(ValId(12), ValType::I32, Op::Bin(BinOp::I32And, ValId(10), ValId(11)));
+        b.push_yield(&[ValId(12)]);
+    });
+
+    // init_ok(): leaves = load_i64(0); cum = 0
+    let init_ok = Region::build(|b| {
+        b.push_let(ValId(0), ValType::I32, Op::ConstI32(0));
+        b.push_let(
+            ValId(1),
+            ValType::I64,
+            Op::Load {
+                mem: MemId(0),
+                addr: ValId(0),
+                offset: 0,
+                width: MemWidth::B8,
+                signed: true,
+                result_ty: ValType::I64,
+            },
+        );
+        b.push_let(ValId(2), ValType::I64, Op::ConstI64(0));
+        b.push_effect(EffectOp::GlobalSet { id: GlobalId(0), val: ValId(1) });
+        b.push_effect(EffectOp::GlobalSet { id: GlobalId(1), val: ValId(2) });
+        b.push_yield(&[]);
+    });
+
+    // init_buggy(): forgets to set leaves (stays 0 != 100)
+    let init_buggy = Region::build(|b| {
+        b.push_let(ValId(0), ValType::I64, Op::ConstI64(0));
+        b.push_effect(EffectOp::GlobalSet { id: GlobalId(1), val: ValId(0) });
+        b.push_yield(&[]);
+    });
+
+    // req_fill(qty: i64): qty > 0 && qty <= leaves
+    let fill_params = [(ValId(0), ValType::I64)];
+    let req_fill = Region::build(|b| {
+        b.push_let(ValId(1), ValType::I64, Op::ConstI64(0));
+        b.push_let(ValId(2), ValType::I64, Op::GlobalGet(GlobalId(0)));
+        b.push_let(ValId(3), ValType::I32, Op::Bin(BinOp::I64GtS, ValId(0), ValId(1)));
+        b.push_let(ValId(4), ValType::I32, Op::Bin(BinOp::I64LeS, ValId(0), ValId(2)));
+        b.push_let(ValId(5), ValType::I32, Op::Bin(BinOp::I32And, ValId(3), ValId(4)));
+        b.push_yield(&[ValId(5)]);
+    });
+
+    // on_fill_ok(qty: i64) -> i64 { leaves -= qty; cum += qty; return cum; }
+    let on_fill_ok = Region::build(|b| {
+        b.push_let(ValId(1), ValType::I64, Op::GlobalGet(GlobalId(0)));
+        b.push_let(ValId(2), ValType::I64, Op::GlobalGet(GlobalId(1)));
+        b.push_let(ValId(3), ValType::I64, Op::Bin(BinOp::I64Sub, ValId(1), ValId(0)));
+        b.push_let(ValId(4), ValType::I64, Op::Bin(BinOp::I64Add, ValId(2), ValId(0)));
+        b.push_effect(EffectOp::GlobalSet { id: GlobalId(0), val: ValId(3) });
+        b.push_effect(EffectOp::GlobalSet { id: GlobalId(1), val: ValId(4) });
+        b.push_yield(&[ValId(4)]);
+    });
+
+    // on_fill_buggy(qty: i64) -> i64 { cum += qty; (forgets leaves -= qty!) return cum; }
+    let on_fill_buggy = Region::build(|b| {
+        b.push_let(ValId(2), ValType::I64, Op::GlobalGet(GlobalId(1)));
+        b.push_let(ValId(4), ValType::I64, Op::Bin(BinOp::I64Add, ValId(2), ValId(0)));
+        b.push_effect(EffectOp::GlobalSet { id: GlobalId(1), val: ValId(4) });
+        b.push_yield(&[ValId(4)]);
+    });
+
+    // ensures_fill(qty: ValId(0), ret: ValId(1)): ret >= qty
+    let ens_fill = Region::build(|b| {
+        b.push_let(ValId(2), ValType::I32, Op::Bin(BinOp::I64GeS, ValId(1), ValId(0)));
+        b.push_yield(&[ValId(2)]);
+    });
+
+    with_both_backends(|backend, name| {
+        // 1. Base-case init_ok establishes invariant from raw Module initial state.
+        let init_ok_spec = ContractSpec::new(&[], &[], &init_ok)
+            .with_invariant(&inv)
+            .with_initial_state(true);
+        assert_eq!(
+            backend.check_contract(&module, &reg, &init_ok_spec).unwrap(),
+            SmtResult::Unsat,
+            "{name}: valid init must establish invariant"
+        );
+
+        // 2. Base-case init_buggy MUST be caught as Sat (proves I(raw_init) is NOT assumed!).
+        let init_buggy_spec = ContractSpec::new(&[], &[], &init_buggy)
+            .with_invariant(&inv)
+            .with_initial_state(true);
+        match backend.check_contract(&module, &reg, &init_buggy_spec).unwrap() {
+            SmtResult::Sat(m) => {
+                assert_eq!(
+                    m.global_values,
+                    vec![(GlobalId(0), Val::I64(0)), (GlobalId(1), Val::I64(0))],
+                    "{name}: init_buggy must report initial global values"
+                );
+                let mem0 = m.memory_bytes.iter().find(|(id, _)| *id == MemId(0)).expect("mem0 bytes");
+                let mut raw = [0u8; 8];
+                for &(off, byte) in &mem0.1 {
+                    if (off as usize) < 8 {
+                        raw[off as usize] = byte;
+                    }
+                }
+                assert_eq!(i64::from_le_bytes(raw), 100, "{name}: init_data must reflect 100i64");
+            }
+            other => panic!("{name}: expected Sat for init_buggy, got {other:?}"),
+        }
+
+        // 3. Inductive step on_fill_ok preserves invariant from arbitrary symbolic state.
+        let step_ok_spec = ContractSpec::new(&fill_params, &[ValType::I64], &on_fill_ok)
+            .with_requires(&req_fill)
+            .with_ensures(&ens_fill)
+            .with_invariant(&inv);
+        assert_eq!(
+            backend.check_contract(&module, &reg, &step_ok_spec).unwrap(),
+            SmtResult::Unsat,
+            "{name}: valid inductive step must be UNSAT"
+        );
+
+        // 4. Buggy step on_fill_buggy returns Sat with replayable symbolic state counterexample!
+        let step_buggy_spec = ContractSpec::new(&fill_params, &[ValType::I64], &on_fill_buggy)
+            .with_requires(&req_fill)
+            .with_ensures(&ens_fill)
+            .with_invariant(&inv);
+        match backend.check_contract(&module, &reg, &step_buggy_spec).unwrap() {
+            SmtResult::Sat(m) => {
+                let mut heap = HeapState::from_module(&module, 10_000).unwrap();
+                for &(gid, val) in &m.global_values {
+                    heap.globals[gid.0 as usize] = val;
+                }
+                for (mid, bytes) in &m.memory_bytes {
+                    let mem = heap.memory_mut(*mid).unwrap();
+                    for &(off, b) in bytes {
+                        mem.bytes[off as usize] = b;
+                    }
+                }
+                // Pre-state invariant and precondition MUST hold in gnomon-kernel:
+                let (inv_pre_v, _) = eval_region(&module, &reg, &inv, &[], heap.clone()).unwrap();
+                assert_ne!(inv_pre_v[0], Val::I32(0), "{name}: counterexample must satisfy I(pre)");
+                let (req_v, _) =
+                    eval_region(&module, &reg, &req_fill, &m.scalar_values, heap.clone()).unwrap();
+                assert_ne!(req_v[0], Val::I32(0), "{name}: counterexample must satisfy requires");
+                // Post-state invariant MUST be violated in gnomon-kernel:
+                let (_, post_heap) =
+                    eval_region(&module, &reg, &on_fill_buggy, &m.scalar_values, heap).unwrap();
+                let (inv_post_v, _) = eval_region(&module, &reg, &inv, &[], post_heap).unwrap();
+                assert_eq!(inv_post_v[0], Val::I32(0), "{name}: counterexample must falsify I(post)");
+            }
+            other => panic!("{name}: expected Sat for on_fill_buggy, got {other:?}"),
+        }
+    });
+}
+
+#[test]
+fn test_inline_gnomon_assume_and_assert_soundness_both_backends() {
+    let mut module = mod_with_mems(&[(0, 1, Some(1))]);
+    module.host_contracts = vec![
+        make_intrinsic_host(0, "gnomon", "gnomon_assume"),
+        make_intrinsic_host(1, "gnomon", "gnomon_assert"),
+        make_intrinsic_host(2, "env", "assume"),
+        make_intrinsic_host(3, "", "gnomon::assert"),
+    ];
+    let reg = StratumRegistry::new();
+
+    // 1. Valid inline harness: assume(y != 0); q = x /u y; assert(q <=u x)
+    let params2 = [(ValId(0), ValType::I32), (ValId(1), ValType::I32)];
+    let valid_harness = Region::build(|b| {
+        b.push_let(ValId(2), ValType::I32, Op::ConstI32(0));
+        b.push_let(ValId(3), ValType::I32, Op::Bin(BinOp::I32Ne, ValId(1), ValId(2)));
+        b.push_call(&[], CallTarget::Host(HostCallId(0)), &[ValId(3)]);
+        b.push_let(ValId(4), ValType::I32, Op::Bin(BinOp::I32DivU, ValId(0), ValId(1)));
+        b.push_let(ValId(5), ValType::I32, Op::Bin(BinOp::I32LeU, ValId(4), ValId(0)));
+        b.push_call(&[], CallTarget::Host(HostCallId(1)), &[ValId(5)]);
+        b.push_yield(&[ValId(4)]);
+    });
+
+    // 2. Failing assert: assume(x >= 10); assert(x > 10) -> Sat with x == 10
+    let params1 = [(ValId(0), ValType::I32)];
+    let failing_assert = Region::build(|b| {
+        b.push_let(ValId(1), ValType::I32, Op::ConstI32(10));
+        b.push_let(ValId(2), ValType::I32, Op::Bin(BinOp::I32GeS, ValId(0), ValId(1)));
+        b.push_call(&[], CallTarget::Host(HostCallId(2)), &[ValId(2)]);
+        b.push_let(ValId(3), ValType::I32, Op::Bin(BinOp::I32GtS, ValId(0), ValId(1)));
+        b.push_call(&[], CallTarget::Host(HostCallId(3)), &[ValId(3)]);
+        b.push_yield(&[]);
+    });
+
+    // 3. CRITICAL SOUNDNESS: trap BEFORE assume(false) MUST STILL BE CAUGHT!
+    let trap_before_assume_false = Region::build(|b| {
+        b.push_let(ValId(2), ValType::I32, Op::Bin(BinOp::I32DivU, ValId(0), ValId(1)));
+        b.push_let(ValId(3), ValType::I32, Op::ConstI32(0));
+        b.push_call(&[], CallTarget::Host(HostCallId(0)), &[ValId(3)]);
+        b.push_yield(&[ValId(2)]);
+    });
+
+    // 4. CRITICAL SOUNDNESS: trap BEFORE assume(false) INSIDE an IfElse branch!
+    let trap_before_assume_in_branch = {
+        let mut rb = RegionBuilder::new();
+        let then_id = rb.embed_region_id(&Region::build(|b| {
+            b.push_let(ValId(2), ValType::I32, Op::ConstI32(1));
+            b.push_let(ValId(3), ValType::I32, Op::Bin(BinOp::I32DivU, ValId(2), ValId(1)));
+            b.push_let(ValId(4), ValType::I32, Op::ConstI32(0));
+            b.push_call(&[], CallTarget::Host(HostCallId(0)), &[ValId(4)]);
+            b.push_yield(&[ValId(3)]);
+        }));
+        let else_id = rb.embed_region_id(&Region::build(|b| {
+            b.push_let(ValId(5), ValType::I32, Op::ConstI32(0));
+            b.push_yield(&[ValId(5)]);
+        }));
+        let res_tys = rb.alloc_tys(&[ValType::I32]);
+        let if_node = rb.alloc_node(RegionNode::IfElse {
+            cond: ValId(0),
+            then_region: then_id,
+            else_region: else_id,
+            results: res_tys,
+        });
+        rb.push_subregion_id(&[(ValId(6), ValType::I32)], if_node);
+        rb.push_yield(&[ValId(6)]);
+        rb.finish()
+    };
+
+    // 5. CRITICAL SOUNDNESS: trap in branch, then assume(false) AFTER IfElse!
+    let trap_in_branch_assume_after = {
+        let mut rb = RegionBuilder::new();
+        let then_id = rb.embed_region_id(&Region::build(|b| {
+            b.push_effect(EffectOp::Trap(TrapCode::Unreachable));
+            b.push_yield(&[]);
+        }));
+        let else_id = rb.embed_region_id(&Region::build(|b| {
+            b.push_yield(&[]);
+        }));
+        let if_node = rb.alloc_node(RegionNode::IfElse {
+            cond: ValId(0),
+            then_region: then_id,
+            else_region: else_id,
+            results: gnomon_kernel::Span::EMPTY,
+        });
+        rb.push_subregion_id(&[], if_node);
+        rb.push_let(ValId(2), ValType::I32, Op::ConstI32(0));
+        rb.push_call(&[], CallTarget::Host(HostCallId(0)), &[ValId(2)]);
+        rb.push_yield(&[]);
+        rb.finish()
+    };
+
+    // 6. CRITICAL SOUNDNESS: MemoryFill unroll overflow BEFORE assume(false) MUST return Unknown
+    //    when in-bounds (not Unsat!), and Sat when OOB is reachable!
+    let overflow_before_assume_false = Region::build(|b| {
+        b.push_let(ValId(1), ValType::I32, Op::ConstI32(0));
+        b.push_let(ValId(2), ValType::I32, Op::ConstI32(7));
+        b.push_effect(EffectOp::MemoryFill {
+            mem: MemId(0),
+            dst: ValId(1),
+            val: ValId(2),
+            len: ValId(0),
+        });
+        b.push_call(&[], CallTarget::Host(HostCallId(0)), &[ValId(1)]); // assume(0)
+        b.push_yield(&[]);
+    });
+    let len_le_1000 = Region::build(|b| {
+        b.push_let(ValId(1), ValType::I32, Op::ConstI32(1000));
+        b.push_let(ValId(2), ValType::I32, Op::Bin(BinOp::I32LeU, ValId(0), ValId(1)));
+        b.push_yield(&[ValId(2)]);
+    });
+
+    // 7. Inline assume/assert inside check_vc and check_equivalence!
+    let vc_goal_with_assume = Region::build(|b| {
+        b.push_let(ValId(1), ValType::I32, Op::ConstI32(0));
+        b.push_let(ValId(2), ValType::I32, Op::Bin(BinOp::I32Ne, ValId(0), ValId(1)));
+        b.push_call(&[], CallTarget::Host(HostCallId(0)), &[ValId(2)]);
+        b.push_let(ValId(3), ValType::I32, Op::Bin(BinOp::I32DivU, ValId(0), ValId(0)));
+        b.push_let(ValId(4), ValType::I32, Op::ConstI32(1));
+        b.push_let(ValId(5), ValType::I32, Op::Bin(BinOp::I32Eq, ValId(3), ValId(4)));
+        b.push_call(&[], CallTarget::Host(HostCallId(1)), &[ValId(5)]);
+        b.push_yield(&[ValId(5)]);
+    });
+    let vc_ok = VcObligation {
+        kind: VcKind::Init,
+        params: vec![(ValId(0), ValType::I32)],
+        assumptions: RegionList::empty(),
+        goal: vc_goal_with_assume,
+    };
+
+    let eq_lhs = Region::build(|b| {
+        b.push_let(ValId(1), ValType::I32, Op::ConstI32(0));
+        b.push_let(ValId(2), ValType::I32, Op::Bin(BinOp::I32Ne, ValId(0), ValId(1)));
+        b.push_call(&[], CallTarget::Host(HostCallId(0)), &[ValId(2)]);
+        b.push_let(ValId(3), ValType::I32, Op::Bin(BinOp::I32DivU, ValId(0), ValId(0)));
+        b.push_yield(&[ValId(3)]);
+    });
+    let eq_rhs = Region::build(|b| {
+        b.push_let(ValId(1), ValType::I32, Op::ConstI32(1));
+        b.push_yield(&[ValId(1)]);
+    });
+
+    with_both_backends(|backend, name| {
+        let s1 = ContractSpec::new(&params2, &[ValType::I32], &valid_harness);
+        assert_eq!(
+            backend.check_contract(&module, &reg, &s1).unwrap(),
+            SmtResult::Unsat,
+            "{name}: valid inline assume+assert harness must be UNSAT"
+        );
+
+        let s2 = ContractSpec::new(&params1, &[], &failing_assert);
+        match backend.check_contract(&module, &reg, &s2).unwrap() {
+            SmtResult::Sat(m) => {
+                assert!(
+                    m.scalar_values.contains(&(ValId(0), Val::I32(10))),
+                    "{name}: expected x=10 counterexample, got {:?}",
+                    m.scalar_values
+                );
+            }
+            other => panic!("{name}: expected Sat for failing inline assert, got {other:?}"),
+        }
+
+        let s3 = ContractSpec::new(&params2, &[ValType::I32], &trap_before_assume_false);
+        match backend.check_contract(&module, &reg, &s3).unwrap() {
+            SmtResult::Sat(m) => {
+                assert!(
+                    m.scalar_values.contains(&(ValId(1), Val::I32(0))),
+                    "{name}: trap before assume(0) must produce y=0 counterexample"
+                );
+            }
+            other => panic!("{name}: trap BEFORE assume(0) MUST be caught as Sat, got {other:?}"),
+        }
+
+        let s4 = ContractSpec::new(&params2, &[ValType::I32], &trap_before_assume_in_branch);
+        match backend.check_contract(&module, &reg, &s4).unwrap() {
+            SmtResult::Sat(m) => {
+                let c = m.scalar_values.iter().find(|(id, _)| *id == ValId(0)).unwrap().1.as_i32().unwrap();
+                let y = m.scalar_values.iter().find(|(id, _)| *id == ValId(1)).unwrap().1.as_i32().unwrap();
+                assert!(c != 0 && y == 0, "{name}: expected cond!=0 && y==0, got cond={c}, y={y}");
+            }
+            other => panic!("{name}: trap BEFORE assume(0) in branch MUST be Sat, got {other:?}"),
+        }
+
+        let s5 = ContractSpec::new(&params1, &[], &trap_in_branch_assume_after);
+        match backend.check_contract(&module, &reg, &s5).unwrap() {
+            SmtResult::Sat(m) => {
+                let c = m.scalar_values.iter().find(|(id, _)| *id == ValId(0)).unwrap().1.as_i32().unwrap();
+                assert_ne!(c, 0, "{name}: expected cond!=0 for trap in branch before assume(0)");
+            }
+            other => panic!("{name}: trap in branch before assume(0) MUST be Sat, got {other:?}"),
+        }
+
+        let s6_oob = ContractSpec::new(&params1, &[], &overflow_before_assume_false);
+        assert!(
+            matches!(backend.check_contract(&module, &reg, &s6_oob).unwrap(), SmtResult::Sat(_)),
+            "{name}: OOB MemoryFill BEFORE assume(0) must return Sat"
+        );
+        let s6_overflow =
+            ContractSpec::new(&params1, &[], &overflow_before_assume_false).with_requires(&len_le_1000);
+        assert!(
+            matches!(backend.check_contract(&module, &reg, &s6_overflow).unwrap(), SmtResult::Unknown(_)),
+            "{name}: in-bounds unroll overflow BEFORE assume(0) must return Unknown, not Unsat"
+        );
+
+        assert_eq!(
+            backend.check_vc(&module, &reg, &vc_ok).unwrap(),
+            SmtResult::Unsat,
+            "{name}: inline assume+assert in check_vc must be UNSAT"
+        );
+        assert_eq!(
+            backend.check_equivalence(&module, &reg, &eq_lhs, &eq_rhs, None).unwrap(),
+            SmtResult::Unsat,
+            "{name}: inline assume in check_equivalence must be UNSAT"
+        );
+    });
+}
+
+#[test]
+fn test_contract_uf_cegar_pure_total_stratum_both_backends() {
+    let module = Module::default();
+    let mut reg = StratumRegistry::new();
+
+    let fmix_body = Region::build(|b| {
+        b.push_let(ValId(1), ValType::I64, Op::ConstI64(33));
+        b.push_let(ValId(2), ValType::I64, Op::Bin(BinOp::I64ShrU, ValId(0), ValId(1)));
+        b.push_let(ValId(3), ValType::I64, Op::Bin(BinOp::I64Xor, ValId(0), ValId(2)));
+        b.push_let(ValId(4), ValType::I64, Op::ConstI64(0xff51_afd7_ed55_8ccdu64 as i64));
+        b.push_let(ValId(5), ValType::I64, Op::Bin(BinOp::I64Mul, ValId(3), ValId(4)));
+        b.push_let(ValId(6), ValType::I64, Op::Bin(BinOp::I64ShrU, ValId(5), ValId(1)));
+        b.push_let(ValId(7), ValType::I64, Op::Bin(BinOp::I64Xor, ValId(5), ValId(6)));
+        b.push_let(ValId(8), ValType::I64, Op::ConstI64(0xc4ce_b9fe_1a85_ec53u64 as i64));
+        b.push_let(ValId(9), ValType::I64, Op::Bin(BinOp::I64Mul, ValId(7), ValId(8)));
+        b.push_let(ValId(10), ValType::I64, Op::Bin(BinOp::I64ShrU, ValId(9), ValId(1)));
+        b.push_let(ValId(11), ValType::I64, Op::Bin(BinOp::I64Xor, ValId(9), ValId(10)));
+        b.push_yield(&[ValId(11)]);
+    });
+    let fmix_call = Region::build(|b| {
+        b.push_call(&[(ValId(1), ValType::I64)], CallTarget::Stratum(StratumId(71)), &[ValId(0)]);
+        b.push_yield(&[ValId(1)]);
+    });
+    reg.promote_stratum(Stratum {
+        op: StratumOp {
+            id: StratumId(71),
+            name: "fmix64_contract".into(),
+            layer: 1,
+            params: vec![(ValId(0), ValType::I64)],
+            results: vec![ValType::I64],
+            body: fmix_body,
+            docstring: "Nonlinear 64-bit mixer".into(),
+        },
+        laws: LawList::single(Law {
+            name: "fmix64_contract_refl".into(),
+            kind: LawKind::Algebraic,
+            params: vec![(ValId(0), ValType::I64)],
+            precondition: Region::empty(),
+            lhs: fmix_call.clone(),
+            rhs: fmix_call,
+            proof_digest: [0x71; 32],
+        }),
+    })
+    .unwrap();
+
+    let params = [(ValId(0), ValType::I64), (ValId(1), ValType::I64)];
+    // entry_ok(x, y) = fmix64^4((x << 1) + x + y)
+    let entry_ok = Region::build(|b| {
+        b.push_let(ValId(2), ValType::I64, Op::ConstI64(1));
+        b.push_let(ValId(3), ValType::I64, Op::Bin(BinOp::I64Shl, ValId(0), ValId(2)));
+        b.push_let(ValId(4), ValType::I64, Op::Bin(BinOp::I64Add, ValId(3), ValId(0)));
+        b.push_let(ValId(5), ValType::I64, Op::Bin(BinOp::I64Add, ValId(4), ValId(1)));
+        let mut cur = ValId(5);
+        for nid in 10u32..14 {
+            b.push_call(&[(ValId(nid), ValType::I64)], CallTarget::Stratum(StratumId(71)), &[cur]);
+            cur = ValId(nid);
+        }
+        b.push_yield(&[cur]);
+    });
+    // ensures(x: 0, y: 1, ret: 2): ret == fmix64^4(x * 3 + y)
+    let ensures_4 = Region::build(|b| {
+        b.push_let(ValId(3), ValType::I64, Op::ConstI64(3));
+        b.push_let(ValId(4), ValType::I64, Op::Bin(BinOp::I64Mul, ValId(0), ValId(3)));
+        b.push_let(ValId(5), ValType::I64, Op::Bin(BinOp::I64Add, ValId(4), ValId(1)));
+        let mut cur = ValId(5);
+        for nid in 10u32..14 {
+            b.push_call(&[(ValId(nid), ValType::I64)], CallTarget::Stratum(StratumId(71)), &[cur]);
+            cur = ValId(nid);
+        }
+        b.push_let(ValId(20), ValType::I32, Op::Bin(BinOp::I64Eq, ValId(2), cur));
+        b.push_yield(&[ValId(20)]);
+    });
+
+    // Buggy single-round entry: fmix64(x * 3 + y + 1) vs ensures fmix64(x * 3 + y)
+    let entry_buggy = Region::build(|b| {
+        b.push_let(ValId(3), ValType::I64, Op::ConstI64(3));
+        b.push_let(ValId(4), ValType::I64, Op::Bin(BinOp::I64Mul, ValId(0), ValId(3)));
+        b.push_let(ValId(5), ValType::I64, Op::Bin(BinOp::I64Add, ValId(4), ValId(1)));
+        b.push_let(ValId(6), ValType::I64, Op::ConstI64(1));
+        b.push_let(ValId(7), ValType::I64, Op::Bin(BinOp::I64Add, ValId(5), ValId(6)));
+        b.push_call(&[(ValId(10), ValType::I64)], CallTarget::Stratum(StratumId(71)), &[ValId(7)]);
+        b.push_yield(&[ValId(10)]);
+    });
+    let ensures_1 = Region::build(|b| {
+        b.push_let(ValId(3), ValType::I64, Op::ConstI64(3));
+        b.push_let(ValId(4), ValType::I64, Op::Bin(BinOp::I64Mul, ValId(0), ValId(3)));
+        b.push_let(ValId(5), ValType::I64, Op::Bin(BinOp::I64Add, ValId(4), ValId(1)));
+        b.push_call(&[(ValId(10), ValType::I64)], CallTarget::Stratum(StratumId(71)), &[ValId(5)]);
+        b.push_let(ValId(20), ValType::I32, Op::Bin(BinOp::I64Eq, ValId(2), ValId(10)));
+        b.push_yield(&[ValId(20)]);
+    });
+
+    let mut native = BitwuzlaNativeBackend::with_time_limit_ms(5_000);
+    let mut pipe = BitwuzlaPipeBackend::new().unwrap();
+    for (backend, name) in [
+        (&mut native as &mut dyn SmtBackend, "native"),
+        (&mut pipe as &mut dyn SmtBackend, "pipe"),
+    ] {
+        let ok_spec = ContractSpec::new(&params, &[ValType::I64], &entry_ok).with_ensures(&ensures_4);
+        assert_eq!(
+            backend.check_contract(&module, &reg, &ok_spec).unwrap(),
+            SmtResult::Unsat,
+            "{name}: UF CEGAR in check_contract must prove fmix64^4 contract quickly"
+        );
+        let bad_spec =
+            ContractSpec::new(&params, &[ValType::I64], &entry_buggy).with_ensures(&ensures_1);
+        assert!(
+            matches!(backend.check_contract(&module, &reg, &bad_spec).unwrap(), SmtResult::Sat(_)),
+            "{name}: buggy fmix64 contract must fall back to concrete Layer-0 and return Sat"
+        );
+    }
+}
+
+#[test]
+fn test_contract_allow_traps_assert_and_pre_loop_overflow_both_backends() {
+    let module = Module {
+        host_contracts: vec![
+            make_intrinsic_host(0, "gnomon", "gnomon_assume"),
+            make_intrinsic_host(1, "gnomon", "gnomon_assert"),
+        ],
+        ..Module::default()
+    };
+    let reg = StratumRegistry::new();
+    let params1 = [(ValId(0), ValType::I32)];
+
+    // 1. Regression for check_trap_free: false vs inline gnomon_assert(0):
+    //    let q = 100 /u x; gnomon_assert(0);
+    //    DivByZero on x == 0 is allowed, but gnomon_assert(0) on x != 0 MUST still return Sat!
+    let div_then_assert_false = Region::build(|b| {
+        b.push_let(ValId(1), ValType::I32, Op::ConstI32(100));
+        b.push_let(ValId(2), ValType::I32, Op::Bin(BinOp::I32DivU, ValId(1), ValId(0)));
+        b.push_let(ValId(3), ValType::I32, Op::ConstI32(0));
+        b.push_call(&[], CallTarget::Host(HostCallId(1)), &[ValId(3)]);
+        b.push_yield(&[ValId(2)]);
+    });
+    //    let q = 100 /u x; gnomon_assert(q <=u 100);
+    //    With check_trap_free: false, x == 0 trap is allowed and x != 0 satisfies assert -> Unsat.
+    let div_then_assert_true = Region::build(|b| {
+        b.push_let(ValId(1), ValType::I32, Op::ConstI32(100));
+        b.push_let(ValId(2), ValType::I32, Op::Bin(BinOp::I32DivU, ValId(1), ValId(0)));
+        b.push_let(ValId(3), ValType::I32, Op::Bin(BinOp::I32LeU, ValId(2), ValId(1)));
+        b.push_call(&[], CallTarget::Host(HostCallId(1)), &[ValId(3)]);
+        b.push_yield(&[ValId(2)]);
+    });
+
+    // 2. Regression for BoundedLoop > 64 iters inside `requires`:
+    //    loop (i = 0; i < n; i += 1) {} returns 1 (max_iters = 100 > MAX_SMT_LOOP_UNROLL = 64).
+    let req_loop_100 = {
+        let mut rb = RegionBuilder::new();
+        let body_id = rb.embed_region_id(&Region::build(|b| {
+            // ValId(10) is loop state `i`; break with 1 when i >=u ValId(0) (n), else continue(i + 1).
+            b.push_let(ValId(11), ValType::I32, Op::Bin(BinOp::I32GeU, ValId(10), ValId(0)));
+            b.push_let(ValId(12), ValType::I32, Op::ConstI32(1));
+            b.push_break(0, Some(ValId(11)), &[ValId(12)]);
+            b.push_let(ValId(13), ValType::I32, Op::Bin(BinOp::I32Add, ValId(10), ValId(12)));
+            b.push_continue(0, None, &[ValId(13)]);
+        }));
+        rb.push_let(ValId(1), ValType::I32, Op::ConstI32(0));
+        let init_vars = rb.alloc_vals(&[ValId(1)]);
+        let state_vars = rb.alloc_vars(&[(ValId(10), ValType::I32)]);
+        let loop_node = rb.alloc_node(RegionNode::BoundedLoop {
+            max_iters: 100,
+            init_vars,
+            state_vars,
+            body: body_id,
+        });
+        rb.push_subregion_id(&[(ValId(2), ValType::I32)], loop_node);
+        rb.push_yield(&[ValId(2)]);
+        rb.finish()
+    };
+    // entry(n) -> n; ensures: ret <=u 64 (holds on all non-overflowing n <= 64, unknown for n > 64!)
+    let id_entry = Region::build(|b| {
+        b.push_yield(&[ValId(0)]);
+    });
+    let ens_le_64 = Region::build(|b| {
+        b.push_let(ValId(2), ValType::I32, Op::ConstI32(64));
+        b.push_let(ValId(3), ValType::I32, Op::Bin(BinOp::I32LeU, ValId(1), ValId(2)));
+        b.push_yield(&[ValId(3)]);
+    });
+
+    with_both_backends(|backend, name| {
+        let s_assert_fail = ContractSpec::new(&params1, &[ValType::I32], &div_then_assert_false)
+            .with_check_trap_free(false);
+        match backend.check_contract(&module, &reg, &s_assert_fail).unwrap() {
+            SmtResult::Sat(m) => {
+                let x = m
+                    .scalar_values
+                    .iter()
+                    .find(|(id, _)| *id == ValId(0))
+                    .unwrap()
+                    .1
+                    .as_i32()
+                    .unwrap();
+                assert_ne!(x, 0, "{name}: assert(0) counterexample under allow-traps must have x != 0");
+            }
+            other => panic!(
+                "{name}: inline gnomon_assert(0) MUST NOT be masked by check_trap_free: false, got {other:?}"
+            ),
+        }
+
+        let s_assert_ok = ContractSpec::new(&params1, &[ValType::I32], &div_then_assert_true)
+            .with_check_trap_free(false);
+        assert_eq!(
+            backend.check_contract(&module, &reg, &s_assert_ok).unwrap(),
+            SmtResult::Unsat,
+            "{name}: valid assert with check_trap_free: false must still be UNSAT"
+        );
+
+        let s_pre_overflow = ContractSpec::new(&params1, &[ValType::I32], &id_entry)
+            .with_requires(&req_loop_100)
+            .with_ensures(&ens_le_64);
+        assert!(
+            matches!(backend.check_contract(&module, &reg, &s_pre_overflow).unwrap(), SmtResult::Unknown(_)),
+            "{name}: BoundedLoop > 64 overflow in `requires` must return Unknown, not Unsat"
+        );
+    });
+
+    // 3. Regression for `EffectOp::Trap(Unreachable)` on a symbolic branch inside a
+    //    value-returning function (must fold `path_active` to `Some(false)` instead of
+    //    emitting a dead empty fallthrough that collides with `Return(&[val])`).
+    let trap_branch_in_value_func = {
+        let mut rb = RegionBuilder::new();
+        let then_id = rb.embed_region_id(&Region::build(|b| {
+            b.push_effect(EffectOp::Trap(TrapCode::Unreachable));
+        }));
+        let else_id = rb.embed_region_id(&Region::build(|b| {
+            b.push_let(ValId(2), ValType::I32, Op::ConstI32(1));
+            b.push_return(&[ValId(2)]);
+        }));
+        let if_node = rb.alloc_node(RegionNode::IfElse {
+            cond: ValId(0),
+            then_region: then_id,
+            else_region: else_id,
+            results: gnomon_kernel::Span::EMPTY,
+        });
+        rb.push_subregion_id(&[], if_node);
+        rb.finish()
+    };
+    with_both_backends(|backend, name| {
+        let spec = ContractSpec::new(&params1, &[ValType::I32], &trap_branch_in_value_func);
+        match backend.check_contract(&module, &reg, &spec).unwrap() {
+            SmtResult::Sat(m) => {
+                let c = m
+                    .scalar_values
+                    .iter()
+                    .find(|(id, _)| *id == ValId(0))
+                    .unwrap()
+                    .1
+                    .as_i32()
+                    .unwrap();
+                assert_ne!(c, 0, "{name}: expected cond != 0 triggering Unreachable trap");
+            }
+            other => panic!("{name}: expected Sat for Unreachable branch, got {other:?}"),
+        }
+    });
 }

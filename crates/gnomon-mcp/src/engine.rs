@@ -10,8 +10,8 @@ use gnomon_kernel::{
     split_invariant_loop, validate_read_only_with_registry,
 };
 use gnomon_sieve::{
-    BitwuzlaNativeBackend, ConsolidationConfig, ConsolidationReport, EgglogSimplifier,
-    EqSatConfig, SmtBackend, SmtModel, SmtResult, consolidate_registry,
+    BitwuzlaNativeBackend, ConsolidationConfig, ConsolidationReport, ContractSpec,
+    EgglogSimplifier, EqSatConfig, SmtBackend, SmtModel, SmtResult, consolidate_registry,
     eqsat::count_region_nodes, render_autodoc,
 };
 use gnomon_wasm::{ExecOutcome, FuzzConfig, FuzzOutcome, emit_wasm, fuzz_equivalence};
@@ -735,6 +735,340 @@ impl GnomonEngine {
     }
 
     // -----------------------------------------------------------------------
+    // Tool 7: gnomon_check_contract (pre/post, inductive invariants, inline assume/assert)
+    // -----------------------------------------------------------------------
+    pub fn check_contract(
+        &self,
+        req: CheckContractRequest,
+    ) -> Result<CheckContractOutput, GnomonError> {
+        let start = Instant::now();
+        let suite_mode = !req.ops.is_empty() || req.init.is_some();
+
+        if suite_mode && req.entry.is_some() {
+            return Err(GnomonError::InvalidInput(
+                "cannot combine entry with ops/init inductive suite mode".into(),
+            ));
+        }
+        if suite_mode && (req.requires.is_some() || req.ensures.is_some()) {
+            return Err(GnomonError::InvalidInput(
+                "requires/ensures are only supported in single-op mode; use invariant for multi-op suite mode"
+                    .into(),
+            ));
+        }
+        if suite_mode && req.use_initial_state {
+            return Err(GnomonError::InvalidInput(
+                "use_initial_state applies only to single-op mode; in suite mode --init runs with initial state and --ops run inductively"
+                    .into(),
+            ));
+        }
+
+        // Preserve full Module (memories, globals, host_contracts, helper funcs) when loading
+        // `.wasm`/`.ir`, or fall back to `self.active_module`.
+        let (mut module, standalone_region) = match req.artifact {
+            Some(LoadedArtifact::Module(m)) => (m, None),
+            Some(LoadedArtifact::Region { params, results, region }) => {
+                if suite_mode {
+                    return Err(GnomonError::InvalidInput(
+                        "inductive multi-op suite mode requires a module artifact with named functions, not a standalone region"
+                            .into(),
+                    ));
+                }
+                if req.entry.is_some() {
+                    return Err(GnomonError::InvalidInput(
+                        "cannot specify entry function when checking a standalone region artifact"
+                            .into(),
+                    ));
+                }
+                (self.active_module.clone().unwrap_or_default(), Some((params, results, region)))
+            }
+            None => {
+                let m = self.active_module.as_ref().ok_or_else(|| {
+                    GnomonError::InvalidInput(
+                        "no module loaded; call gnomon_lift_check or provide an input artifact"
+                            .into(),
+                    )
+                })?;
+                (m.clone(), None)
+            }
+        };
+
+        let resolved_req = req
+            .requires
+            .map(|p| resolve_contract_pred(&module, p, "requires"))
+            .transpose()?;
+        let resolved_ens = req
+            .ensures
+            .map(|p| resolve_contract_pred(&module, p, "ensures"))
+            .transpose()?;
+        let resolved_inv = req
+            .invariant
+            .map(|p| resolve_contract_pred(&module, p, "invariant"))
+            .transpose()?;
+        if let Some(ref inv) = resolved_inv
+            && inv.params.as_ref().is_some_and(|p| !p.is_empty())
+        {
+            return Err(GnomonError::InvalidInput(
+                "invariant predicate must take 0 parameters".into(),
+            ));
+        }
+
+        // For standalone region inputs, synthesize any referenced memories that aren't already
+        // declared on the fallback module (real Module inputs are preserved untouched).
+        if let Some((_, _, ref reg)) = standalone_region {
+            let mut regions: Vec<&Region> = vec![reg];
+            if let Some(ref r) = resolved_req {
+                regions.push(&r.region);
+            }
+            if let Some(ref e) = resolved_ens {
+                regions.push(&e.region);
+            }
+            if let Some(ref i) = resolved_inv {
+                regions.push(&i.region);
+            }
+            ensure_memories_for_regions(&mut module, &self.registry, &regions);
+        }
+
+        // --- Single-op mode ---
+        if !suite_mode {
+            let (entry_name, params, results, body) = match standalone_region {
+                Some((p, r, reg)) => ("<region>".to_string(), p, r, reg),
+                None => {
+                    let func = find_entry_func(&module, req.entry.as_deref())?;
+                    (
+                        func.name.clone(),
+                        func.params.clone(),
+                        func.results.clone(),
+                        func.body.clone(),
+                    )
+                }
+            };
+            let op_res = self.run_single_contract(
+                &module,
+                &entry_name,
+                &params,
+                &results,
+                &body,
+                resolved_req.as_ref(),
+                resolved_ens.as_ref(),
+                resolved_inv.as_ref(),
+                req.use_initial_state,
+                req.check_trap_free,
+                req.timeout_ms,
+                "single",
+            )?;
+            return Ok(CheckContractOutput {
+                status: op_res.status,
+                mode: "single".into(),
+                entry: Some(op_res.entry),
+                use_initial_state: req.use_initial_state,
+                check_trap_free: req.check_trap_free,
+                elapsed_ms: start.elapsed().as_secs_f64() * 1000.0,
+                counterexample: op_res.counterexample,
+                op_results: Vec::new(),
+                detail: op_res.detail,
+            });
+        }
+
+        // --- Inductive multi-op suite mode ---
+        // Validate all referenced functions exist before invoking the SMT solver.
+        let init_func = match req.init.as_deref() {
+            Some(init_name) => Some(
+                find_entry_func(&module, Some(init_name))
+                    .map_err(|_| {
+                        GnomonError::InvalidInput(format!(
+                            "init function '{init_name}' not found in module"
+                        ))
+                    })?
+                    .clone(),
+            ),
+            None => None,
+        };
+        let mut op_funcs = Vec::with_capacity(req.ops.len());
+        for op_name in &req.ops {
+            let f = find_entry_func(&module, Some(op_name.as_str()))
+                .map_err(|_| {
+                    GnomonError::InvalidInput(format!(
+                        "op function '{op_name}' not found in module"
+                    ))
+                })?
+                .clone();
+            op_funcs.push(f);
+        }
+
+        let mut op_results = Vec::with_capacity(op_funcs.len() + usize::from(init_func.is_some()));
+
+        // Base case: verify `init` from concrete initial state (`I(post_init)`).
+        if let Some(init_f) = init_func {
+            let res = self.run_single_contract(
+                &module,
+                &init_f.name,
+                &init_f.params,
+                &init_f.results,
+                &init_f.body,
+                None,
+                None,
+                resolved_inv.as_ref(),
+                true,
+                req.check_trap_free,
+                req.timeout_ms,
+                "init",
+            )?;
+            op_results.push(res);
+        }
+
+        // Inductive step: verify every op in `ops` with `use_initial_state = false`.
+        for op_f in &op_funcs {
+            let res = self.run_single_contract(
+                &module,
+                &op_f.name,
+                &op_f.params,
+                &op_f.results,
+                &op_f.body,
+                None,
+                None,
+                resolved_inv.as_ref(),
+                false,
+                req.check_trap_free,
+                req.timeout_ms,
+                "op",
+            )?;
+            op_results.push(res);
+        }
+
+        let falsified: Vec<&str> = op_results
+            .iter()
+            .filter(|r| r.status == "FALSIFIED")
+            .map(|r| r.entry.as_str())
+            .collect();
+        let unknown: Vec<&str> = op_results
+            .iter()
+            .filter(|r| r.status == "UNKNOWN")
+            .map(|r| r.entry.as_str())
+            .collect();
+        let first_cex = op_results
+            .iter()
+            .find(|r| r.status == "FALSIFIED")
+            .and_then(|r| r.counterexample.clone());
+
+        let (overall_status, detail) = if !falsified.is_empty() {
+            (
+                "FALSIFIED".to_string(),
+                format!(
+                    "inductive suite falsified ({}/{} checks failed: {})",
+                    falsified.len(),
+                    op_results.len(),
+                    falsified.join(", ")
+                ),
+            )
+        } else if !unknown.is_empty() {
+            (
+                "UNKNOWN".to_string(),
+                format!(
+                    "inductive suite unknown ({}/{} checks unknown: {})",
+                    unknown.len(),
+                    op_results.len(),
+                    unknown.join(", ")
+                ),
+            )
+        } else {
+            (
+                "PROVED".to_string(),
+                format!(
+                    "inductive suite proved (all {} checks passed)",
+                    op_results.len()
+                ),
+            )
+        };
+
+        Ok(CheckContractOutput {
+            status: overall_status,
+            mode: "inductive_suite".into(),
+            entry: None,
+            use_initial_state: req.init.is_some(),
+            check_trap_free: req.check_trap_free,
+            elapsed_ms: start.elapsed().as_secs_f64() * 1000.0,
+            counterexample: first_cex,
+            op_results,
+            detail,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_single_contract(
+        &self,
+        module: &Module,
+        entry_name: &str,
+        params: &[(ValId, ValType)],
+        results: &[ValType],
+        body: &Region,
+        requires: Option<&ResolvedPred>,
+        ensures: Option<&ResolvedPred>,
+        invariant: Option<&ResolvedPred>,
+        use_initial_state: bool,
+        check_trap_free: bool,
+        timeout_ms: u64,
+        role: &str,
+    ) -> Result<ContractOpResult, GnomonError> {
+        let op_start = Instant::now();
+        let mut spec = ContractSpec::new(params, results, body)
+            .with_check_trap_free(check_trap_free)
+            .with_initial_state(use_initial_state);
+        if let Some(r) = requires {
+            spec.requires = Some(&r.region);
+            spec.requires_params = r.params.as_deref();
+        }
+        if let Some(e) = ensures {
+            spec.ensures = Some(&e.region);
+            spec.ensures_params = e.params.as_deref();
+        }
+        if let Some(inv) = invariant {
+            spec.invariant = Some(&inv.region);
+        }
+
+        let mut backend = BitwuzlaNativeBackend::with_time_limit_ms(timeout_ms.max(100));
+        let smt_res = backend
+            .check_contract(module, &self.registry, &spec)
+            .map_err(|e| GnomonError::Sieve(e.to_string()))?;
+        let elapsed_ms = op_start.elapsed().as_secs_f64() * 1000.0;
+
+        match smt_res {
+            SmtResult::Unsat => Ok(ContractOpResult {
+                entry: entry_name.to_string(),
+                role: role.to_string(),
+                status: "PROVED".into(),
+                use_initial_state,
+                check_trap_free,
+                elapsed_ms,
+                counterexample: None,
+                detail: format!("contract for '{entry_name}' proved by Bitwuzla QF_ABV"),
+            }),
+            SmtResult::Sat(model) => {
+                let cex = smt_model_to_contract_cex(params, &model);
+                Ok(ContractOpResult {
+                    entry: entry_name.to_string(),
+                    role: role.to_string(),
+                    status: "FALSIFIED".into(),
+                    use_initial_state,
+                    check_trap_free,
+                    elapsed_ms,
+                    counterexample: Some(cex),
+                    detail: format!("contract for '{entry_name}' falsified by Bitwuzla QF_ABV"),
+                })
+            }
+            SmtResult::Unknown(reason) => Ok(ContractOpResult {
+                entry: entry_name.to_string(),
+                role: role.to_string(),
+                status: "UNKNOWN".into(),
+                use_initial_state,
+                check_trap_free,
+                elapsed_ms,
+                counterexample: None,
+                detail: format!("Bitwuzla returned unknown for '{entry_name}': {reason}"),
+            }),
+        }
+    }
+
+    // -----------------------------------------------------------------------
     // Internal helpers
     // -----------------------------------------------------------------------
     fn resolve_op(&self, selector: &str) -> Result<StratumOp, GnomonError> {
@@ -936,6 +1270,213 @@ pub struct CheckGoalOutput {
     pub elapsed_ms: f64,
     pub counterexample: Option<CounterexampleJson>,
     pub detail: String,
+}
+
+/// Predicate reference for `check_contract` (`requires`, `ensures`, or `invariant`).
+#[derive(Clone, Debug)]
+pub enum ContractPred {
+    /// Function name inside the target module.
+    FuncName(String),
+    /// External `.wasm` or `.ir` artifact (optionally selecting a named function inside a module).
+    Artifact {
+        artifact: Box<LoadedArtifact>,
+        entry: Option<String>,
+    },
+}
+
+/// Request parameters for `GnomonEngine::check_contract` (single-op or multi-op inductive suite).
+#[derive(Clone, Debug)]
+pub struct CheckContractRequest {
+    /// Optional module or region artifact override (defaults to `self.active_module` when `None`).
+    pub artifact: Option<LoadedArtifact>,
+    /// Single-op mode: entry function name (defaults to func 0 when `ops`/`init` are empty).
+    pub entry: Option<String>,
+    /// Inductive suite mode: operation function names checked with `use_initial_state = false`.
+    pub ops: Vec<String>,
+    /// Inductive suite mode: optional initializer function name checked with `use_initial_state = true`.
+    pub init: Option<String>,
+    /// Optional precondition (`requires`, single-op mode only).
+    pub requires: Option<ContractPred>,
+    /// Optional postcondition (`ensures`, single-op mode only).
+    pub ensures: Option<ContractPred>,
+    /// Optional 0-arg state invariant (`invariant`).
+    pub invariant: Option<ContractPred>,
+    /// Single-op mode: start from concrete initial state and do NOT assume `invariant` on pre-state.
+    pub use_initial_state: bool,
+    /// Require trap-freedom on assumption-satisfying paths (default `true`).
+    pub check_trap_free: bool,
+    /// Bitwuzla per-check timeout budget in milliseconds (default `5_000`, clamped to `>= 100`).
+    pub timeout_ms: u64,
+}
+
+impl Default for CheckContractRequest {
+    fn default() -> Self {
+        Self {
+            artifact: None,
+            entry: None,
+            ops: Vec::new(),
+            init: None,
+            requires: None,
+            ensures: None,
+            invariant: None,
+            use_initial_state: false,
+            check_trap_free: true,
+            timeout_ms: 5_000,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct ContractMemoryBytesJson {
+    pub mem_id: u16,
+    pub bytes: Vec<(u32, u8)>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct ContractCounterexampleJson {
+    /// Symbolic scalar parameter values `(val_id, val)` formatted like `inputs` in `check_goal`.
+    pub scalar_values: Vec<(u32, IrVal)>,
+    /// Symbolic pre-state global values `(global_id, val)`.
+    pub global_values: Vec<(u32, IrVal)>,
+    /// Sparse pre-state memory byte witnesses grouped by `mem_id`.
+    pub memory_bytes: Vec<ContractMemoryBytesJson>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct ContractOpResult {
+    pub entry: String,
+    pub role: String,
+    pub status: String,
+    pub use_initial_state: bool,
+    pub check_trap_free: bool,
+    pub elapsed_ms: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub counterexample: Option<ContractCounterexampleJson>,
+    pub detail: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct CheckContractOutput {
+    pub status: String,
+    pub mode: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub entry: Option<String>,
+    pub use_initial_state: bool,
+    pub check_trap_free: bool,
+    pub elapsed_ms: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub counterexample: Option<ContractCounterexampleJson>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub op_results: Vec<ContractOpResult>,
+    pub detail: String,
+}
+
+struct ResolvedPred {
+    params: Option<Vec<(ValId, ValType)>>,
+    region: Region,
+}
+
+fn resolve_contract_pred(
+    module: &Module,
+    pred: ContractPred,
+    role: &str,
+) -> Result<ResolvedPred, GnomonError> {
+    match pred {
+        ContractPred::FuncName(name) => {
+            let func = find_entry_func(module, Some(&name)).map_err(|_| {
+                GnomonError::InvalidInput(format!(
+                    "{role} function '{name}' not found in module"
+                ))
+            })?;
+            Ok(ResolvedPred {
+                params: Some(func.params.clone()),
+                region: func.body.clone(),
+            })
+        }
+        ContractPred::Artifact { artifact, entry } => match *artifact {
+            LoadedArtifact::Module(ext_mod) => {
+                let func = find_entry_func(&ext_mod, entry.as_deref()).map_err(|e| {
+                    GnomonError::InvalidInput(format!("{role} artifact error: {e}"))
+                })?;
+                Ok(ResolvedPred {
+                    params: Some(func.params.clone()),
+                    region: func.body.clone(),
+                })
+            }
+            LoadedArtifact::Region { params, results: _, region } => Ok(ResolvedPred {
+                params: if params.is_empty() { None } else { Some(params) },
+                region,
+            }),
+        },
+    }
+}
+
+fn smt_model_to_contract_cex(
+    params: &[(ValId, ValType)],
+    model: &SmtModel,
+) -> ContractCounterexampleJson {
+    let mut scalar_values: Vec<(u32, IrVal)> = Vec::new();
+    for &(vid, ty) in params {
+        let val = model
+            .scalar_values
+            .iter()
+            .find(|(id, _)| *id == vid)
+            .map(|(_, v)| *v)
+            .unwrap_or(match ty {
+                ValType::I32 => Val::I32(0),
+                ValType::I64 => Val::I64(0),
+            });
+        scalar_values.push((vid.0, val.into()));
+    }
+    for &(vid, val) in &model.scalar_values {
+        if !scalar_values.iter().any(|(id, _)| *id == vid.0) {
+            scalar_values.push((vid.0, val.into()));
+        }
+    }
+    let global_values = model
+        .global_values
+        .iter()
+        .map(|&(gid, val)| (gid.0, val.into()))
+        .collect();
+    let memory_bytes = model
+        .memory_bytes
+        .iter()
+        .map(|(mid, bytes)| ContractMemoryBytesJson {
+            mem_id: mid.0,
+            bytes: bytes.clone(),
+        })
+        .collect();
+    ContractCounterexampleJson {
+        scalar_values,
+        global_values,
+        memory_bytes,
+    }
+}
+
+fn ensure_memories_for_regions(module: &mut Module, registry: &StratumRegistry, regions: &[&Region]) {
+    let mut max_mem: Option<u16> = None;
+    for reg in regions {
+        if let Some(mx) = max_mem_id_in_region(reg) {
+            max_mem = Some(max_mem.map_or(mx, |cur| cur.max(mx)));
+        }
+    }
+    for st in registry.promoted() {
+        if let Some(mx) = max_mem_id_in_region(&st.op.body) {
+            max_mem = Some(max_mem.map_or(mx, |cur| cur.max(mx)));
+        }
+    }
+    if let Some(mx) = max_mem {
+        for id in 0..=mx {
+            if !module.memories.iter().any(|mem| mem.id == MemId(id)) {
+                module.memories.push(MemoryDef {
+                    id: MemId(id),
+                    min_pages: 1,
+                    max_pages: Some(1),
+                    init_data: Vec::new(),
+                });
+            }
+        }
+    }
 }
 
 // ===========================================================================

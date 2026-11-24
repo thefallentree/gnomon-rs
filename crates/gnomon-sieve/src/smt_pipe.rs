@@ -8,8 +8,8 @@ use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 
 use gnomon_kernel::{Module, Region, StratumRegistry, VcObligation};
 
-use crate::smt_ir::{RawSat, SmtTarget, run_check_equivalence, run_check_vc};
-use crate::{SieveError, SmtBackend, SmtResult};
+use crate::smt_ir::{RawSat, SmtTarget, run_check_contract, run_check_equivalence, run_check_vc};
+use crate::{ContractSpec, SieveError, SmtBackend, SmtResult};
 
 /// Persistent incremental `bitwuzla` SMT-LIB2 child-process backend.
 pub struct BitwuzlaPipeBackend {
@@ -214,6 +214,18 @@ impl SmtBackend for BitwuzlaPipeBackend {
             run_check_equivalence(session, module, registry, lhs, rhs, precondition, &prefix)
         })
     }
+
+    fn check_contract(
+        &mut self,
+        module: &Module,
+        registry: &StratumRegistry,
+        contract: &ContractSpec<'_>,
+    ) -> Result<SmtResult, SieveError> {
+        self.run_in_frame(|session| {
+            let prefix = format!("pq{}", session.qid);
+            run_check_contract(session, module, registry, contract, &prefix)
+        })
+    }
 }
 
 struct PipeSession<'a> {
@@ -359,6 +371,14 @@ impl SmtTarget for PipeSession<'_> {
         self.def(
             "(Array (_ BitVec 32) Bool)",
             format!("((as const (Array (_ BitVec 32) Bool)) {b})"),
+        )
+    }
+
+    fn const_array_bv8(&mut self, v: u8) -> String {
+        let b = self.bv_const(8, v as u64);
+        self.def(
+            "(Array (_ BitVec 32) (_ BitVec 8))",
+            format!("((as const (Array (_ BitVec 32) (_ BitVec 8))) {b})"),
         )
     }
 

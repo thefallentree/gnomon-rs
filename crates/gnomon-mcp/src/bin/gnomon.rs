@@ -6,8 +6,8 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand, ValueEnum};
 use gnomon_mcp::{
-    GnomonEngine, GnomonError, GnomonMcpServer, InputType, IrLawKind, IrTypedVar, IrVal,
-    IrValType, load_artifact_bytes, read_input_bytes,
+    CheckContractRequest, ContractPred, GnomonEngine, GnomonError, GnomonMcpServer, InputType,
+    IrLawKind, IrTypedVar, IrVal, IrValType, LoadedArtifact, load_artifact_bytes, read_input_bytes,
 };
 use gnomon_sieve::ConsolidationConfig;
 use gnomon_wasm::emit_wasm;
@@ -152,6 +152,39 @@ enum Commands {
         timeout_ms: u64,
     },
 
+    /// Verify pre/post contracts, trap-freedom, inline assume/assert, or inductive multi-op invariant suites.
+    CheckContract {
+        /// Path to a .wasm or .ir module/region, or '-' / omitted to read stdin (or active --state module).
+        input: Option<String>,
+        /// Single-op mode: entry function name inside the module (defaults to func 0).
+        #[arg(long)]
+        entry: Option<String>,
+        /// Inductive suite mode: comma-separated (or repeated) list of op function names checked with I(pre) => !trap && I(post).
+        #[arg(long = "ops", value_delimiter = ',')]
+        ops: Vec<String>,
+        /// Inductive suite mode: optional initializer function name checked from initial state (I(post_init)).
+        #[arg(long)]
+        init: Option<String>,
+        /// Precondition function name in module or path to external .wasm/.ir predicate (single-op mode).
+        #[arg(long)]
+        requires: Option<String>,
+        /// Postcondition function name in module or path to external .wasm/.ir predicate (single-op mode).
+        #[arg(long)]
+        ensures: Option<String>,
+        /// State invariant function name (0-arg () -> i32) in module or path to external .wasm/.ir predicate.
+        #[arg(long)]
+        invariant: Option<String>,
+        /// Single-op mode: start from concrete initial state (GlobalDef::init + zeroed min_pages + init_data) and do NOT assume invariant on pre-state.
+        #[arg(long = "init-state", visible_alias = "use-initial-state")]
+        init_state: bool,
+        /// Allow traps on assumption-satisfying paths (checks partial correctness only).
+        #[arg(long)]
+        allow_traps: bool,
+        /// Bitwuzla per-check timeout budget in milliseconds.
+        #[arg(long, default_value_t = 5_000)]
+        timeout_ms: u64,
+    },
+
     /// Run stitch_core MDL + egglog 3-step law non-redundancy consolidation and emit AutoDoc.
     Consolidate {
         /// Additional verified solution .wasm or .ir files.
@@ -175,9 +208,39 @@ enum Commands {
 fn load_cli_artifact(
     path: Option<&str>,
     kind: InputType,
-) -> Result<(InputType, gnomon_mcp::LoadedArtifact), GnomonError> {
+) -> Result<(InputType, LoadedArtifact), GnomonError> {
     let (bytes, resolved_path) = read_input_bytes(path)?;
     load_artifact_bytes(&bytes, kind, resolved_path)
+}
+
+fn resolve_cli_contract_pred(
+    arg: &str,
+    target_module: Option<&gnomon_kernel::Module>,
+    input_type: InputType,
+) -> Result<ContractPred, GnomonError> {
+    if arg == "-" {
+        let (_, artifact) = load_cli_artifact(Some("-"), input_type)?;
+        return Ok(ContractPred::Artifact { artifact: Box::new(artifact), entry: None });
+    }
+    let looks_like_path = arg.contains('/')
+        || arg.contains('\\')
+        || arg.ends_with(".wasm")
+        || arg.ends_with(".ir")
+        || arg.ends_with(".json");
+    if !looks_like_path
+        && target_module.is_some_and(|m| {
+            m.funcs
+                .iter()
+                .any(|f| f.name == arg || f.export_name.as_deref() == Some(arg))
+        })
+    {
+        return Ok(ContractPred::FuncName(arg.to_string()));
+    }
+    if looks_like_path || std::path::Path::new(arg).is_file() {
+        let (_, artifact) = load_cli_artifact(Some(arg), input_type)?;
+        return Ok(ContractPred::Artifact { artifact: Box::new(artifact), entry: None });
+    }
+    Ok(ContractPred::FuncName(arg.to_string()))
 }
 
 fn parse_cli_inputs(raw: &str) -> Result<Vec<IrVal>, GnomonError> {
@@ -394,6 +457,77 @@ fn run(cli: Cli) -> Result<bool, GnomonError> {
             if let Some(ref p) = cli.state {
                 eng.save_state_file(p)?;
             }
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&out)
+                    .map_err(|e| GnomonError::Internal(e.to_string()))?
+            );
+            Ok(out.status == "PROVED")
+        }
+        Commands::CheckContract {
+            input,
+            entry,
+            ops,
+            init,
+            requires,
+            ensures,
+            invariant,
+            init_state,
+            allow_traps,
+            timeout_ms,
+        } => {
+            let eng = match &cli.state {
+                Some(p) => GnomonEngine::load_state_file(p)?,
+                None => GnomonEngine::new(),
+            };
+            let art_override = match input.as_deref() {
+                Some(p) => Some(load_cli_artifact(Some(p), input_type)?.1),
+                None => {
+                    if eng.active_module.is_some() {
+                        if std::io::stdin().is_terminal() {
+                            None
+                        } else {
+                            let (bytes, _) = read_input_bytes(None)?;
+                            if bytes.is_empty() {
+                                None
+                            } else {
+                                Some(load_artifact_bytes(&bytes, input_type, None)?.1)
+                            }
+                        }
+                    } else {
+                        Some(load_cli_artifact(None, input_type)?.1)
+                    }
+                }
+            };
+            let target_module_ref = match &art_override {
+                Some(LoadedArtifact::Module(m)) => Some(m),
+                Some(LoadedArtifact::Region { .. }) => eng.active_module.as_ref(),
+                None => eng.active_module.as_ref(),
+            };
+            let req_pred = requires
+                .as_deref()
+                .map(|s| resolve_cli_contract_pred(s, target_module_ref, input_type))
+                .transpose()?;
+            let ens_pred = ensures
+                .as_deref()
+                .map(|s| resolve_cli_contract_pred(s, target_module_ref, input_type))
+                .transpose()?;
+            let inv_pred = invariant
+                .as_deref()
+                .map(|s| resolve_cli_contract_pred(s, target_module_ref, input_type))
+                .transpose()?;
+            let out = eng.check_contract(CheckContractRequest {
+                artifact: art_override,
+                entry,
+                ops,
+                init,
+                requires: req_pred,
+                ensures: ens_pred,
+                invariant: inv_pred,
+                use_initial_state: init_state,
+                check_trap_free: !allow_traps,
+                timeout_ms,
+            })?;
             println!(
                 "{}",
                 serde_json::to_string_pretty(&out)

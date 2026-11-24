@@ -1,4 +1,4 @@
-//! Single MCP server (`rmcp` + `tokio` stdio) exposing all 6 atomic Gnomon tools.
+//! Single MCP server (`rmcp` + `tokio` stdio) exposing all 7 atomic Gnomon tools.
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -11,12 +11,12 @@ use rmcp::{ErrorData as McpError, ServerHandler, ServiceExt, tool, tool_handler,
 use serde::Deserialize;
 
 use crate::GnomonError;
-use crate::engine::GnomonEngine;
+use crate::engine::{CheckContractRequest, ContractPred, GnomonEngine};
 use crate::ir_codec::{
     InputType, IrLawKind, IrTypedVar, IrVal, IrValType, load_artifact_from_mcp_arg,
 };
 
-/// Single stateful Gnomon MCP Server serving all 6 verification & abstraction tools.
+/// Single stateful Gnomon MCP Server serving all 7 verification & abstraction tools.
 #[derive(Clone)]
 pub struct GnomonMcpServer {
     engine: Arc<Mutex<GnomonEngine>>,
@@ -104,6 +104,10 @@ fn default_fuel() -> u64 {
 
 fn default_timeout_ms() -> u64 {
     5_000
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -227,6 +231,65 @@ pub struct ConsolidateParams {
     pub min_solutions: Option<usize>,
     /// Max `egglog` steps for law redundancy pruning (default 3, clamped to 1..=3).
     pub max_derivation_steps: Option<usize>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct CheckContractParams {
+    /// Optional inline `.ir` JSON or base64/hex `.wasm` module/region (defaults to last lifted module).
+    pub content: Option<String>,
+    /// Optional local file path to a `.wasm` or `.ir` module/region.
+    pub path: Option<String>,
+    /// Input format: `auto`, `wasm`, or `ir`.
+    #[serde(default = "default_input_type")]
+    pub input_type: InputType,
+    /// Single-op mode: entry function name inside the module (defaults to func 0 when `ops`/`init` are omitted).
+    pub entry: Option<String>,
+    /// Inductive suite mode: list of operation function names checked with `use_initial_state = false`.
+    #[serde(default)]
+    pub ops: Vec<String>,
+    /// Inductive suite mode: optional initializer function name checked with `use_initial_state = true`.
+    pub init: Option<String>,
+    /// Precondition function name inside the target module (or entry function inside `requires_content`/`requires_path`).
+    pub requires: Option<String>,
+    /// Optional inline `.ir` JSON or base64/hex `.wasm` precondition artifact.
+    pub requires_content: Option<String>,
+    /// Optional local file path to a `.wasm` or `.ir` precondition artifact.
+    pub requires_path: Option<String>,
+    /// Postcondition function name inside the target module (or entry function inside `ensures_content`/`ensures_path`).
+    pub ensures: Option<String>,
+    /// Optional inline `.ir` JSON or base64/hex `.wasm` postcondition artifact.
+    pub ensures_content: Option<String>,
+    /// Optional local file path to a `.wasm` or `.ir` postcondition artifact.
+    pub ensures_path: Option<String>,
+    /// State invariant function name (0-arg `() -> i32`) inside the target module (or entry inside `invariant_content`/`invariant_path`).
+    pub invariant: Option<String>,
+    /// Optional inline `.ir` JSON or base64/hex `.wasm` invariant artifact.
+    pub invariant_content: Option<String>,
+    /// Optional local file path to a `.wasm` or `.ir` invariant artifact.
+    pub invariant_path: Option<String>,
+    /// Single-op mode: start from concrete initial state (`GlobalDef::init` + zeroed `min_pages` + `init_data`) and do NOT assume `invariant` on pre-state (default `false`).
+    #[serde(default)]
+    pub use_initial_state: bool,
+    /// Require trap-freedom on assumption-satisfying paths (default `true`).
+    #[serde(default = "default_true")]
+    pub check_trap_free: bool,
+    /// Bitwuzla per-check timeout budget in milliseconds (default `5000`).
+    #[serde(default = "default_timeout_ms")]
+    pub timeout_ms: u64,
+}
+
+fn load_mcp_contract_pred(
+    name: Option<String>,
+    content: Option<&str>,
+    path: Option<&str>,
+    input_type: InputType,
+) -> Result<Option<ContractPred>, GnomonError> {
+    if content.is_some() || path.is_some() {
+        let (_, artifact) = load_artifact_from_mcp_arg(content, path, input_type)?;
+        Ok(Some(ContractPred::Artifact { artifact: Box::new(artifact), entry: name }))
+    } else {
+        Ok(name.map(ContractPred::FuncName))
+    }
 }
 
 #[tool_router]
@@ -461,6 +524,61 @@ impl GnomonMcpServer {
             .await?;
         json_ok(&report)
     }
+
+    #[tool(
+        name = "gnomon_check_contract",
+        description = "Verify function contracts (requires/ensures, trap-freedom, inline gnomon_assume/gnomon_assert) or multi-op inductive state-invariant suites (init + ops + invariant) via Bitwuzla QF_ABV."
+    )]
+    async fn gnomon_check_contract(
+        &self,
+        Parameters(p): Parameters<CheckContractParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let out = self
+            .with_engine(false, move |eng| {
+                let artifact = if p.content.is_some() || p.path.is_some() {
+                    let (_, art) = load_artifact_from_mcp_arg(
+                        p.content.as_deref(),
+                        p.path.as_deref(),
+                        p.input_type,
+                    )?;
+                    Some(art)
+                } else {
+                    None
+                };
+                let requires = load_mcp_contract_pred(
+                    p.requires,
+                    p.requires_content.as_deref(),
+                    p.requires_path.as_deref(),
+                    p.input_type,
+                )?;
+                let ensures = load_mcp_contract_pred(
+                    p.ensures,
+                    p.ensures_content.as_deref(),
+                    p.ensures_path.as_deref(),
+                    p.input_type,
+                )?;
+                let invariant = load_mcp_contract_pred(
+                    p.invariant,
+                    p.invariant_content.as_deref(),
+                    p.invariant_path.as_deref(),
+                    p.input_type,
+                )?;
+                eng.check_contract(CheckContractRequest {
+                    artifact,
+                    entry: p.entry,
+                    ops: p.ops,
+                    init: p.init,
+                    requires,
+                    ensures,
+                    invariant,
+                    use_initial_state: p.use_initial_state,
+                    check_trap_free: p.check_trap_free,
+                    timeout_ms: p.timeout_ms,
+                })
+            })
+            .await?;
+        json_ok(&out)
+    }
 }
 
 #[tool_handler(router = self.tool_router)]
@@ -473,7 +591,8 @@ impl ServerHandler for GnomonMcpServer {
                  (3) gnomon_define_op to decompose hard nonlinear/stateful tasks into Layer-k Strata, \
                  (4) gnomon_prove_law to prove algebraic or unconditional MemoryFrame laws (Wasmtime -> Bitwuzla QF_ABV -> kernel TCB), \
                  (5) gnomon_check_goal to verify composite goals via egglog + Ackermann UF CEGAR + Bitwuzla (or 3-way InvariantLoop VC split), \
-                 (6) gnomon_consolidate to prune low-MDL ops (stitch_core) and redundant laws (<=3 egglog steps) into a compact AutoDoc.",
+                 (6) gnomon_consolidate to prune low-MDL ops (stitch_core) and redundant laws (<=3 egglog steps) into a compact AutoDoc, \
+                 (7) gnomon_check_contract to verify pre/post contracts, trap-freedom, inline gnomon_assume/gnomon_assert harnesses, and multi-op inductive state-invariant suites (init + ops + invariant).",
             );
         info.server_info = Implementation::new("gnomon", env!("CARGO_PKG_VERSION"));
         info

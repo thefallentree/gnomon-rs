@@ -1,15 +1,17 @@
 #![forbid(unsafe_code)]
 
 //! Phase 2 Gnomon CLI, `.ir`/`.wasm` codec, 3-stage verification engine, and single
-//! `rmcp` + `tokio` MCP server exposing the 6 atomic Gnomon tools.
+//! `rmcp` + `tokio` MCP server exposing the 7 atomic Gnomon tools.
 
 pub mod engine;
 pub mod ir_codec;
 pub mod mcp_server;
 
 pub use engine::{
-    CheckGoalOutput, CounterexampleJson, DefineOpOutput, EngineSnapshot, FuncSummary,
-    GnomonEngine, LiftCheckOutput, MemoryDiffEntry, ProveLawOutput, RunTraceOutput,
+    CheckContractOutput, CheckContractRequest, CheckGoalOutput, ContractCounterexampleJson,
+    ContractMemoryBytesJson, ContractOpResult, ContractPred, CounterexampleJson, DefineOpOutput,
+    EngineSnapshot, FuncSummary, GnomonEngine, LiftCheckOutput, MemoryDiffEntry, ProveLawOutput,
+    RunTraceOutput,
 };
 pub use ir_codec::{
     InputType, IrBinOp, IrCallTarget, IrDocument, IrEffectOp, IrFuncDef, IrGlobalDef,
@@ -20,13 +22,14 @@ pub use ir_codec::{
 };
 pub use mcp_server::GnomonMcpServer;
 
-pub const MCP_TOOL_NAMES: [&str; 6] = [
+pub const MCP_TOOL_NAMES: [&str; 7] = [
     "gnomon_lift_check",
     "gnomon_run_trace",
     "gnomon_define_op",
     "gnomon_prove_law",
     "gnomon_check_goal",
     "gnomon_consolidate",
+    "gnomon_check_contract",
 ];
 
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
