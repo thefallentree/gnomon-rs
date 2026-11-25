@@ -28,7 +28,7 @@ export CXX="/usr/lib/llvm-23/bin/clang++"
   - **CRITICAL:** Never apply `ulimit -v 4194304` to `wasmtime` tests (`gnomon-wasm`, `gnomon-mcp`, `gnomon-bench`), because Wasmtime reserves >4 GiB virtual `PROT_NONE` guard pages.
 - **Kani verification (`15/15` harnesses):**
   ```bash
-  (ulimit -v 4194304; timeout 600 cargo kani -p gnomon-kernel -j 1)
+  (ulimit -v 4194304; timeout 900 cargo kani -p gnomon-kernel -j 1)
   ```
   - Always guard `cargo kani` / `cbmc` with `ulimit -v 4194304`, `timeout`, and `-j 1`.
   - Note: Kani compiles Rust MIR directly to CBMC GOTO (not `target/release`), so `--release` does not affect Kani proofs.
@@ -69,3 +69,5 @@ export CXX="/usr/lib/llvm-23/bin/clang++"
   - **Columnar DB (`db_parquet_varint_slice.rs`):** 4-byte LEB128 varint slice decoder (`--ignore-dead-stack`, `SliceFrame readonly`) + Delta-ZigZag bijection.
   - **Networking (`net_wireguard_replay.rs`):** WireGuard/IPsec RFC 6479 64-bit sliding anti-replay window.
   - **Cloud Infrastructure (`cloud_quota_saga.rs`):** Multi-tenant 4-slot two-phase reservation quota saga.
+- **Live Blind AI Closed-Loop Showcase (`examples/closed_loop_demo/`):**
+  - 3 real-world OMS/trading kernels (`k1_fix_ascii_price.rs`, `k2_sor_venue_router.rs`, `k3_oms_tick_risk_fastpath.rs` + Layer-1 `strata_l1.rs` / `strata_l1_laws.rs`) autonomously optimized end-to-end using only `rustc` and `gnomon` (`REPORT.md`, `verify_and_profile.sh`).

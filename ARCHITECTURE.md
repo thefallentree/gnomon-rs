@@ -49,7 +49,7 @@ export CXX="/usr/lib/llvm-23/bin/clang++"
    - **Stage 2b (`gnomon-sieve`):** Exact `Bitwuzla` `QF_ABVFP` + `BV128` solver (in-process native API + zero-respawn SMT-LIB2 pipe backend) supporting equivalence (`check-goal`), pre/post/inductive/inline contracts (`check-contract`), `--ignore-dead-stack`, and `--slice-frame`.
    - **Stage 3 (`gnomon-kernel`):** SHA-256 `proof_digest` computation + TCB `promote_stratum` admission.
    - **Consolidation (`gnomon-sieve::consolidate`):** `stitch_core` silent `rewrite_with_invention` MDL scoring across `>= 2` verified solutions + `egglog` `<= 3`-step law non-redundancy pruning + transitive DAG closure + fresh TCB `promote_stratum` rebuild + compact `AutoDoc` export.
-   - **Native Performance Oracle (`gnomon-mcp::profiler`):** Compiles strict `#![no_std]` Rust to native `x86_64` (`rustc -C opt-level=3 --emit=asm`) and `aarch64` (`rustc --emit=llvm-ir` → LLVM-23 `llc -O3 -mtriple=aarch64-unknown-linux-gnu`), analyzes via `llvm-mca` (`skylake` / `neoverse-v2`) with exact instruction, branch, hardware `div`/`udiv`, stack frame, register spill/reload, and SSE/AVX/NEON SIMD counters, plus opt-in 1M-iteration native host microbenchmark (`--bench`).
+   - **Native Performance Oracle (`gnomon-mcp::profiler`):** Compiles strict `#![no_std]` Rust to native `x86_64` (`rustc -C opt-level=3 --emit=asm`) and `aarch64` (`rustc --emit=llvm-ir` → LLVM-23 `llc -O3 -mtriple=aarch64-unknown-linux-gnu`), analyzes via `llvm-mca` (`skylake` / `neoverse-v2`) with exact instruction, branch, hardware `div`/`udiv`, stack frame, register spill/reload, and SSE/AVX/NEON SIMD counters, plus opt-in 1M-iteration native host microbenchmarking (`--bench` with `--bench-inputs` and `--bench-preset`).
 
 ---
 
@@ -60,22 +60,23 @@ gnomon-rs/
 ├── Cargo.toml                  # Workspace manifest, forbidden unsafe_code, locked deps
 ├── README.md                   # Overview, measured benchmark tables, CLI/MCP quickstart
 ├── ARCHITECTURE.md             # Audited environment, TCB v2 invariants, crate contracts
-├── ROADMAP.md                  # Completed 6-step execution report & measured tables
+├── ROADMAP.md                  # Completed 7-step execution report & measured tables
 ├── AGENTS.md                   # Engineering & verification instructions for AI agents
 ├── crates/
 │   ├── gnomon-kernel/          # [TCB v2] #![no_std] IR (24B IrSlot), fp.rs, eval, VC, registry, 15 Kani proofs (14 tests)
 │   ├── gnomon-wasm/            # Lossless wasm <-> GnomonIR (i32/i64/f32/f64/v128) + wasmtime fuzzer (14 tests, 27,768 checks)
 │   ├── gnomon-sieve/           # egglog v3.0 + Bitwuzla QF_ABVFP + Ackermann UF CEGAR + cliff + stitch_core (34 tests)
-│   ├── gnomon-mcp/             # Codec, rust_bridge (-t rust), profiler (x64/ARM64), CLI, 8-tool MCP server (32 tests)
+│   ├── gnomon-mcp/             # Codec, rust_bridge (-t rust), profiler (x64/ARM64), CLI, 8-tool MCP server (40 tests)
 │   └── gnomon-bench/           # phase1_gate, proof1_cliff, wasm_smith_fuzz (1,000 mods), proof2_oms_ablation (9 tests)
 └── examples/
     ├── oms_strata/             # 15 OMS Strata (S1.1-S4.2) + S4.3 6 perf pairs + 11 *_buggy.rs files + build.sh (27 .rs files)
-    └── vertical_packs/         # 4 non-trading packs: AI Q8_0, Parquet varint, WireGuard replay, Cloud quota saga (8 .rs files)
+    ├── vertical_packs/         # 4 non-trading packs: AI Q8_0, Parquet varint, WireGuard replay, Cloud quota saga (8 .rs files)
+    └── closed_loop_demo/       # Live blind AI closed-loop opt showcase (K1 FIX, K2 SOR, K3 Tick-Risk + REPORT.md)
 ```
 
 ### Public Crate Contracts
 - **`gnomon-kernel` (14 unit/prop tests + 15 Kani harnesses):** `ir` (`IrSlot` 24B, `SlotPool`, `Region`, `Module`, `ValType`/`Val` 5 types, `MemWidth` `B1..B16`, `LaneKind` 8, `UnOp` 100, `BinOp` 141, `Op` 17, `MemId`, `HostContract`), `fp` (`#![no_std]` IEEE-754 & `v128` semantics), `eval` (`HeapState`, `eval_func`, `eval_region`), `vc` (`LoopVcs`, `VcObligation`, `split_invariant_loop`, `eval_vc`, `validate_read_only_with_registry`), `registry` (`Law`, `LawKind`, `StratumOp`, `Stratum`, `StratumRegistry`).
 - **`gnomon-wasm` (14 tests, 27,768 3-way checks):** `lift_wasm`, `emit_wasm`, `fuzz_equivalence`, `verify_round_trip`, `differential_check` (full `i32`/`i64`/`f32`/`f64`/`v128` coverage).
 - **`gnomon-sieve` (34 tests):** `SmtBackend`, `BitwuzlaNativeBackend`, `BitwuzlaPipeBackend`, `EgglogSimplifier`, `estimate_smt_cliff`, `estimate_region_cliff`, `consolidate_registry`, `discover_candidate_inventions`, `encode_region_as_stitch_expr`, `render_autodoc`.
-- **`gnomon-mcp` (32 tests):** `GnomonEngine`, `GnomonMcpServer`, `IrDocument`, `InputType` (`Auto | Wasm | Ir | Rust`), `rust_bridge` (`compile_rust_to_wasm_with_registry`, `generate_strata_rs`, `lower_module_strata`), `profiler` (`profile_rust`, `ProfileArch`, `DEFAULT_X64_CPU = "skylake"`, `DEFAULT_ARM64_CPU = "neoverse-v2"`), `MCP_TOOL_NAMES` (**8 tools**: `gnomon_lift_check`, `gnomon_run_trace`, `gnomon_define_op`, `gnomon_prove_law`, `gnomon_check_goal`, `gnomon_check_contract`, `gnomon_consolidate`, `gnomon_profile`), and `gnomon` CLI binary (`lift`, `trace`, `define-op`, `prove-law`, `check-goal`, `check-contract`, `consolidate`, `emit-rust`, `profile`, `mcp`, `schema`).
+- **`gnomon-mcp` (40 tests; 111 workspace total):** `GnomonEngine`, `GnomonMcpServer`, `IrDocument`, `InputType` (`Auto | Wasm | Ir | Rust`), `rust_bridge` (`compile_rust_to_wasm_with_registry`, `generate_strata_rs`, `lower_module_strata`), `profiler` (`profile_rust`, `ProfileArch`, `BenchPreset`, `DEFAULT_X64_CPU = "skylake"`, `DEFAULT_ARM64_CPU = "neoverse-v2"`), `MCP_TOOL_NAMES` (**8 tools**: `gnomon_lift_check`, `gnomon_run_trace`, `gnomon_define_op`, `gnomon_prove_law`, `gnomon_check_goal`, `gnomon_check_contract`, `gnomon_consolidate`, `gnomon_profile`), and `gnomon` CLI binary (`lift`, `trace`, `define-op`, `prove-law`, `check-goal`, `check-contract`, `consolidate`, `emit-rust`, `profile`, `mcp`, `schema`).
 - **`gnomon-bench` (9 tests):** `phase1_gate` (30+30 corpus), `proof1_cliff` (nonlinear & dual-memory cliff), `wasm_smith_fuzz` / `wasm_smith_gate` (1,000-module differential & blowup gate), `proof2_oms_ablation` / `proof2_ablation_gate` (compute-matched 3-arm ablation on `Gnomon-T2T` OMS).

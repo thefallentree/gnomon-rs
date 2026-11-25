@@ -126,34 +126,34 @@ G=./target/release/gnomon
 $G check-goal -t rust --candidate "$P" --candidate-entry oms_bucket_opt --spec "$P" --spec-entry oms_bucket_ref --pre "$P" --pre-entry req_oms_bucket
 $G profile "$P" --entry oms_bucket_ref --opt-entry oms_bucket_opt --targets x64,arm64 --bench
 
-# Pair 2: SWAR 8-Byte FIX Digit Validator (7 branches -> 0 branches)
+# Pair 2: SWAR 8-Byte FIX Digit Validator (7 branches -> 0 branches; --bench-preset ascii-digits)
 $G check-goal -t rust --candidate "$P" --candidate-entry oms_fix_digits_opt --spec "$P" --spec-entry oms_fix_digits_ref
-$G profile "$P" --entry oms_fix_digits_ref --opt-entry oms_fix_digits_opt --targets x64,arm64 --bench
+$G profile "$P" --entry oms_fix_digits_ref --opt-entry oms_fix_digits_opt --targets x64,arm64 --bench --bench-preset ascii-digits
 
 # Pair 3: Register-Pressure / Unroll Study (x64 19 spills -> 0 spills; ARM64 31 GPRs 0 spills)
 $G check-goal -t rust --candidate "$P" --candidate-entry oms_hash_mix_4x --spec "$P" --spec-entry oms_hash_mix_12x_spill
 $G profile "$P" --entry oms_hash_mix_12x_spill --opt-entry oms_hash_mix_4x --targets x64,arm64 --bench
 
-# Pair 4: Branchless Child Order FSM + Pre-Trade Risk (x64 23->0 br, ARM64 45->0 br)
+# Pair 4: Branchless Child Order FSM + Pre-Trade Risk (x64 23->0 br, ARM64 45->0 br; --bench-preset oms-valid)
 $G check-goal -t rust --candidate "$P" --candidate-entry oms_risk_fsm_opt --spec "$P" --spec-entry oms_risk_fsm_ref
-$G profile "$P" --entry oms_risk_fsm_ref --opt-entry oms_risk_fsm_opt --targets x64,arm64 --bench
+$G profile "$P" --entry oms_risk_fsm_ref --opt-entry oms_risk_fsm_opt --targets x64,arm64 --bench --bench-preset oms-valid
 
 # Pair 5: Zero-Copy OUCH 48B Frame Builder (56B/64B stack -> 0B, --ignore-dead-stack)
 $G check-goal -t rust --candidate "$P" --candidate-entry oms_ouch_pack_opt --spec "$P" --spec-entry oms_ouch_pack_ref --pre "$P" --pre-entry req_oms_ouch_pack --ignore-dead-stack
-$G profile "$P" --entry oms_ouch_pack_ref --opt-entry oms_ouch_pack_opt --targets x64,arm64 --bench
+$G profile "$P" --entry oms_ouch_pack_ref --opt-entry oms_ouch_pack_opt --targets x64,arm64 --bench --bench-preset oms-valid
 
 # Pair 6: 4-Lane Portfolio VWAP SIMD (QF_ABVFP proved, SSE mulps/addps + ARM64 NEON 0->14)
 $G check-goal -t rust --candidate "$P" --candidate-entry oms_vwap_vec_opt --spec "$P" --spec-entry oms_vwap_scalar_ref --pre "$P" --pre-entry req_oms_vwap
-$G profile "$P" --entry oms_vwap_scalar_ref --opt-entry oms_vwap_vec_opt --targets x64,arm64 --bench
+$G profile "$P" --entry oms_vwap_scalar_ref --opt-entry oms_vwap_vec_opt --targets x64,arm64 --bench --bench-preset oms-valid
 ```
 
-### Measured `gnomon profile` Results (`skylake` + `neoverse-v2` + 1M-iter x64 Host `--bench`)
+### Measured `gnomon profile` Results (`skylake` + `neoverse-v2` + 1M-iter x64 Host `--bench` w/ Realistic Presets)
 
 | Pair (`ref -> opt`) | x64 (`skylake`) Inst / Br / Div / Stack / Spills | x64 Cyc & RTh Speedup | ARM64 (`neoverse-v2`) Inst / Br / Div / SIMD / Spills | ARM64 Cyc & RTh Speedup | Host x64 `ns/op` |
 | --- | --- | --- | --- | --- | --- |
 | **1. Barrett Fastmod** (`oms_bucket_ref -> _opt`) | `9->15` / br `1->1` / **div `1->0`** / `0B` / `0->0` | **1.48×** (`1616->1095`) / **2.50×** (`8.0->3.2`) | `6->12` / br `1->1` / **udiv `1->0`** / `0` / `0->0` | **6.24×** (`1304->209`) / **6.50×** (`13.0->2.0`) | `18.72` -> **`15.42`** (**1.21×**) |
-| **2. SWAR FIX Digits** (`oms_fix_digits_ref -> _opt`) | `40->13` / **br `7->0`** / `0` / `0B` / `0->0` | **3.02×** (`1011->335`) / **3.00×** (`7.5->2.5`) | `47->10` / **br `7->0`** / `0` / `0` / `0->0` | **1.31×** (`790->604`) / **4.59×** (`7.8->1.7`) | `6.64` -> `8.31` *(rand early-exit)* |
+| **2. SWAR FIX Digits** (`oms_fix_digits_ref -> _opt`) | `40->13` / **br `7->0`** / `0` / `0B` / `0->0` | **3.02×** (`1011->335`) / **3.00×** (`7.5->2.5`) | `47->10` / **br `7->0`** / `0` / `0` / `0->0` | **1.31×** (`790->604`) / **4.59×** (`7.8->1.7`) | `5.58` -> **`2.41`** (**2.31×**, `preset:ascii-digits`) |
 | **3. Hash Unroll** (`12x_spill -> 4x`) | `342->300` / `0` / `0` / **`56B->0B`** / **spills `19->0` (rel `16->0`)** | **1.14×** (`8712->7667`) / **1.15×** (`61.3->53.3`) | `261->259` / `0` / `0` / `0` / **spills `0->0` (31 GPRs)** | **1.02×** (`4411->4344`) / **1.02×** (`44.0->43.2`) | `39.02` -> `41.25` (`2x`: `36.80`) |
-| **4. Branchless Risk FSM** (`oms_risk_fsm_ref -> _opt`) | `128->91` / **br `23->0`** / `0` / `0B->4B` / `0->1` | **1.66×** (`3760->2264`) / **1.52×** (`28.5->18.7`) | `136->73` / **br `45->0`** / `0` / `0` / `0->0` | **2.21×** (`3104->1406`) / **2.54×** (`31.0->12.2`) | `14.31` -> `24.03` *(rand `s>7` fast-ret)* |
-| **5. Zero-Copy OUCH 48B** (`oms_ouch_pack_ref -> _opt`) | `36->28` / `4->4` / `0` / **`56B->0B`** / **`1->0`** | **2.20×** (`2207->1005`) / `0.83×` (`8.3->10.0`) | `28->32` / `4->4` / `0` / `0` (stack **`64B->0B`**) / `0->0` | **1.53×** (`1078->705`) / `0.76×` (`5.3->7.0`) | `10.30` -> `10.91` *(rand invalid-side)* |
+| **4. Branchless Risk FSM** (`oms_risk_fsm_ref -> _opt`) | `128->91` / **br `23->0`** / `0` / `0B->4B` / `0->1` | **1.66×** (`3760->2264`) / **1.52×** (`28.5->18.7`) | `136->73` / **br `45->0`** / `0` / `0` / `0->0` | **2.21×** (`3104->1406`) / **2.54×** (`31.0->12.2`) | `20.05` -> **`10.38`** (**1.93×**, `preset:oms-valid`) |
+| **5. Zero-Copy OUCH 48B** (`oms_ouch_pack_ref -> _opt`) | `36->28` / `4->4` / `0` / **`56B->0B`** / **`1->0`** | **2.20×** (`2207->1005`) / `0.83×` (`8.3->10.0`) | `28->32` / `4->4` / `0` / `0` (stack **`64B->0B`**) / `0->0` | **1.53×** (`1078->705`) / `0.76×` (`5.3->7.0`) | `12.68` -> **`5.91`** (**2.15×**, `--bench-inputs`) |
 | **6. 4-Lane VWAP SIMD** (`oms_vwap_scalar_ref -> _vec_opt`) | `37->16` / **br `7->1`** / `0` / `0B` / `0->0` | **1.23×** (`952->775`) / **1.20×** (`7.2->6.0`) | `32->22` / **br `6->1`** / `0` / **NEON `0->14`** / `0->0` | **1.45×** (`660->456`) / **1.70×** (`6.3->3.7`) | `9.99` -> **`3.24`** (**3.09×**) |

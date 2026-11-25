@@ -533,7 +533,7 @@ impl GnomonMcpServer {
 
     #[tool(
         name = "gnomon_prove_law",
-        description = "Run the 3-stage sieve (Wasmtime fuzz -> Bitwuzla QF_ABV -> gnomon-kernel TCB admission) to prove an algebraic or disjoint memory-frame law for a Stratum op."
+        description = "Run the 3-stage sieve (Wasmtime fuzz -> Bitwuzla QF_ABVFP -> gnomon-kernel TCB admission) to prove an algebraic or disjoint memory-frame law for a Stratum op."
     )]
     async fn gnomon_prove_law(
         &self,
@@ -597,7 +597,7 @@ impl GnomonMcpServer {
 
     #[tool(
         name = "gnomon_check_goal",
-        description = "Check equivalence or InvariantLoop VCs by running bounded egglog cancellation with proved Strata laws, sound Ackermann UF congruence CEGAR for shared pure-total Strata, and residual Bitwuzla QF_ABV proving (supports ignore_dead_stack for shadow-stack refinement)."
+        description = "Check equivalence or InvariantLoop VCs by running bounded egglog cancellation with proved Strata laws, sound Ackermann UF congruence CEGAR for shared pure-total Strata, and residual Bitwuzla QF_ABVFP proving (supports ignore_dead_stack for shadow-stack refinement)."
     )]
     async fn gnomon_check_goal(
         &self,
@@ -739,7 +739,7 @@ impl GnomonMcpServer {
 
     #[tool(
         name = "gnomon_check_contract",
-        description = "Verify function contracts (requires/ensures, trap-freedom, intra-memory slice_frame write-frame bounds, shadow-stack ignore_dead_stack, inline gnomon_assume/gnomon_assert) or multi-op inductive state-invariant suites (init + ops + invariant) via Bitwuzla QF_ABV."
+        description = "Verify function contracts (requires/ensures, trap-freedom, intra-memory slice_frame write-frame bounds, shadow-stack ignore_dead_stack, inline gnomon_assume/gnomon_assert) or multi-op inductive state-invariant suites (init + ops + invariant) via Bitwuzla QF_ABVFP."
     )]
     async fn gnomon_check_contract(
         &self,
@@ -800,7 +800,7 @@ impl GnomonMcpServer {
 
     #[tool(
         name = "gnomon_profile",
-        description = "Profile strict #![no_std] Rust on native x86-64 (skylake) and ARM64 (neoverse-v2) via rustc/llc assembly lowering + llvm-mca cycle/IPC/RThroughput analysis + static hardware metrics (instructions, branches, div/idiv/udiv/sdiv, SIMD, stack frame, register spills/reloads), with optional ref-vs-opt speedup comparison and opt-in host microbenchmarking."
+        description = "Profile strict #![no_std] Rust on native x86-64 (skylake) and ARM64 (neoverse-v2) via rustc/llc assembly lowering + llvm-mca cycle/IPC/RThroughput analysis + static hardware metrics (instructions, branches, div/idiv/udiv/sdiv, SIMD, stack frame, register spills/reloads), with optional ref-vs-opt speedup comparison and opt-in host microbenchmarking (supporting custom bench_inputs and bench_preset)."
     )]
     async fn gnomon_profile(
         &self,
@@ -842,11 +842,11 @@ impl ServerHandler for GnomonMcpServer {
                  Workflow: (1) gnomon_lift_check to lift .wasm/.rs/.ir and report static SMT-cliff warnings, \
                  (2) gnomon_run_trace to inspect concrete outputs/traps/memory diffs, \
                  (3) gnomon_define_op to decompose hard nonlinear/stateful tasks into Layer-k Strata, \
-                 (4) gnomon_prove_law to prove algebraic or unconditional MemoryFrame laws (Wasmtime -> Bitwuzla QF_ABV -> kernel TCB), \
-                 (5) gnomon_check_goal to verify equivalence via egglog + Ackermann UF CEGAR + Bitwuzla (supports ignore_dead_stack for shadow-stack refinement and 3-way InvariantLoop VC splits), \
+                 (4) gnomon_prove_law to prove algebraic or unconditional MemoryFrame laws (Wasmtime -> Bitwuzla QF_ABVFP -> kernel TCB), \
+                 (5) gnomon_check_goal to verify equivalence via egglog + Ackermann UF CEGAR + Bitwuzla QF_ABVFP (supports ignore_dead_stack for shadow-stack refinement and 3-way InvariantLoop VC splits), \
                  (6) gnomon_consolidate to prune low-MDL ops (stitch_core) and redundant laws (<=3 egglog steps) into a compact AutoDoc, \
                  (7) gnomon_check_contract to verify pre/post contracts, trap-freedom, intra-memory slice_frame write-frame bounds (including readonly), shadow-stack ignore_dead_stack, inline gnomon_assume/gnomon_assert harnesses, and multi-op inductive state-invariant suites (init + ops + invariant), \
-                 (8) gnomon_profile to lower strict #![no_std] Rust to native x86-64 & ARM64 assembly, measure llvm-mca cycles/IPC/RThroughput and static hardware metrics (div, branches, SIMD, stack frame, register spills/reloads), compare ref vs opt speedups, and optionally run host microbenchmarks.",
+                 (8) gnomon_profile to lower strict #![no_std] Rust to native x86-64 & ARM64 assembly, measure llvm-mca cycles/IPC/RThroughput and static hardware metrics (div, branches, SIMD, stack frame, register spills/reloads), compare ref vs opt speedups, and optionally run host microbenchmarks with bench_inputs or bench_preset.",
             );
         info.server_info = Implementation::new("gnomon", env!("CARGO_PKG_VERSION"));
         info

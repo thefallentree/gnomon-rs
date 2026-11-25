@@ -1,10 +1,10 @@
-# Project Gnomon Roadmap — Completed 6-Step Execution Report
+# Project Gnomon Roadmap — Completed 7-Step Execution Report
 
 ## 1. North Star: Specialize Deeply First (Trading / OMS) → Generalize Cleanly Next
 
 Project Gnomon is a **Verified AI Systems & Performance Engineering Engine** targeting native **x86-64 and ARM64** systems code written in **strict `#![no_std]` Rust** (with `rustc`/LLVM trusted for native lowering, and deterministic `wasm32` / `GnomonIR` serving as the tiny, Kani-verified semantic verification layer).
 
-**Status: ALL 6 STEPS COMPLETE & VERIFIED GREEN.**
+**Status: ALL 7 STEPS COMPLETE & VERIFIED GREEN.**
 - **Vertical Beachhead Completed:** E2E Verified, Ultra-Low-Latency OMS + Tick-to-Trade Core (`Gnomon-T2T`, all **15 Strata `S1.1–S4.2`** + **6 verified perf-opt pairs `S4.3`** + **11 separate `*_buggy.rs` files**, `27` `.rs` files total).
 - **Zero Domain Lock-In Proved:** Not a single line of `gnomon-kernel`, `gnomon-wasm`, `gnomon-sieve`, or `gnomon-mcp` is hard-coded to trading. Step 6 verified and profiled **4 real-world non-trading vertical packs** (`24/24` live verdicts) on the 100% unmodified engine.
 
@@ -22,6 +22,7 @@ Project Gnomon is a **Verified AI Systems & Performance Engineering Engine** tar
 | **Step 4** | Layer-4 E2E OMS (`S4.1` + `S4.2`) + Native **x64 & ARM64 Performance Oracle** (`gnomon profile` CLI + 8th MCP tool `gnomon_profile`: `rustc -O3 --emit=asm` + `llc` + `llvm-mca` + spill/branch/div/SIMD counters + `--bench`). | **`S4.1` & `S4.2`:** **24/24** exact verdicts (**17/17 `PROVED`**, **7/7 mutants `FALSIFIED`**) with genuine `stratum::*` composition (`order_id_mix`, `checked_notional`, `price_collar_ok`), `SliceFrame` RX isolation, and `--ignore-dead-stack`. **`S4.3` (6 perf pairs):** **8/8 `PROVED`**, `1.14×–3.02×` x64 cycles, `1.02×–6.24×` ARM64 cycles, `div 1->0`, `br 7->0/23->0/45->0`, x64 `spills 19->0`, stack `56B/64B->0B`, ARM64 `NEON 0->14`, host VWAP **`3.09×`** (`9.99->3.24 ns/op`). | **DONE** |
 | **Step 5** | **Proof 2 — Compute-Matched 3-Arm Ablation (`proof2_oms_ablation` + `proof2_ablation_gate`)** on `Gnomon-T2T` OMS (`3,000 ms/task` cap): Arm A (Flat L0) vs Arm B (Modular Helpers) vs Arm C (Full Gnomon). | **Arm C `10/10` (`5.0×` Arms A & B `2/10`)** (gate `>= 2.0×`); median SMT speedup **`99.5×` vs A / `103.4×` vs B** (gate `>= 5.0×`); cross-rung reuse **`100.0%` (`10/10`)** Strata / **`70.0%` (`7/10`)** R1–2 `egglog` laws (gate `>= 30%`); **2/2** soundness mutants `FALSIFIED`, **0** unsound admissions. | **DONE** |
 | **Step 6** | **Horizontal Generalization (`examples/vertical_packs/`):** Zero engine changes — 4 real-world non-trading `#![no_std]` Rust vertical packs + buggy mutants. | **4/4 packs** (`ai_q8_0_quant`, `db_parquet_varint_slice`, `net_wireguard_replay`, `cloud_quota_saga`): `8/8` `-D warnings` clean & round-trip lifted, **24/24** live verdicts (**16/16 `PROVED`**, **8/8 `FALSIFIED`**), live `gnomon profile` x64 (`skylake`) & ARM64 (`neoverse-v2`) speedups up to **2.61×** x64 / **1.57×** ARM64 (`NEON 13->33`). | **DONE** |
+| **Step 7** | **Realistic Hot-Path Benchmarking + Live Blind AI Closed-Loop Opt + Full CI Lock-In:** `--bench-inputs` / `--bench-preset` (`default \| ascii-digits \| oms-valid`) in `gnomon profile`, `e2e_s4_and_verticals.rs` CI lock-in (**111** workspace tests), `AGENTS.md` sync, & `examples/closed_loop_demo/` showcase. | Realistic host speedups on `S4.3` (SWAR **2.31×**, FSM **1.93×**, OUCH **2.15×**); blind AI agent autonomously proved & sped up K1 FIX 8B (**2.58×** x64 / **3.17×** ARM64 / **1.78×** host), K2 4-Venue SOR (**5.66×** x64 / **4.06×** ARM64 / `div 4->0` / **1.16×** host), and K3 Tick-Risk (**18.57×** x64 / **3.00×** ARM64 / `div ->0` / **1.33×** host), catching 3 real correctness bugs & 2 microarch regressions mid-loop. | **DONE** |
 
 ---
 
