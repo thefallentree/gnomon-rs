@@ -608,6 +608,284 @@ fn strip_panic_handler(src: &str) -> String {
     src.replace("#[panic_handler]", "#[cfg(any())]")
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum IrFpTy {
+    F32,
+    F64,
+    Other,
+}
+
+/// Losslessly widens an IEEE-754 binary32 bit pattern into the 64-bit IEEE-754 binary64
+/// hex encoding expected by LLVM 23.0 `0x<16-hex>` `float` literals, preserving exact
+/// signaling/quiet NaN bits and payloads (unlike `f32 as f64`, which quiets sNaNs).
+fn f32_bits_to_f64_bits(bits32: u32) -> u64 {
+    let exp = (bits32 >> 23) & 0xFF;
+    let mant = bits32 & 0x007F_FFFF;
+    if exp == 0xFF && mant != 0 {
+        let sign = ((bits32 >> 31) as u64) << 63;
+        sign | 0x7FF0_0000_0000_0000 | ((mant as u64) << 29)
+    } else {
+        (f32::from_bits(bits32) as f64).to_bits()
+    }
+}
+
+fn is_ir_lit_left_delim(bytes: &[u8], i: usize) -> bool {
+    i == 0
+        || matches!(
+            bytes[i - 1],
+            b' ' | b'\t' | b',' | b'(' | b'[' | b'<' | b'=' | b'{' | b'\n' | b'\r'
+        )
+}
+
+fn is_ir_token_end(bytes: &[u8], end: usize) -> bool {
+    end == bytes.len()
+        || !(bytes[end].is_ascii_alphanumeric() || matches!(bytes[end], b'_' | b'.'))
+}
+
+/// Attempts to parse an LLVM 23.1+ special FP token (`+inf`, `-inf`, `+qnan`, `-qnan`,
+/// `+snan`, `-snan`, `±nan(0x...)`, `±snan(0x...)`) starting at `i` and returns
+/// `(end_index, bits64)`.
+fn parse_llvm23_special_fp(
+    ir: &str,
+    i: usize,
+    fp_ty: Option<IrFpTy>,
+) -> Option<(usize, u64)> {
+    let bytes = ir.as_bytes();
+    let sign_bit = match *bytes.get(i)? {
+        b'+' => 0u64,
+        b'-' => 1u64 << 63,
+        _ => return None,
+    };
+    let rest = &ir[i + 1..];
+    if rest.starts_with("inf") && is_ir_token_end(bytes, i + 4) && bytes.get(i + 4) != Some(&b'(') {
+        return Some((i + 4, sign_bit | 0x7FF0_0000_0000_0000));
+    }
+    if rest.starts_with("qnan") && is_ir_token_end(bytes, i + 5) && bytes.get(i + 5) != Some(&b'(')
+    {
+        return Some((i + 5, sign_bit | 0x7FF8_0000_0000_0000));
+    }
+    if rest.starts_with("snan") && is_ir_token_end(bytes, i + 5) && bytes.get(i + 5) != Some(&b'(')
+    {
+        return Some((i + 5, sign_bit | 0x7FF4_0000_0000_0000));
+    }
+    let (is_snan, prefix_len) = if rest.starts_with("nan(0x") {
+        (false, 7usize) // "+nan(0x"
+    } else if rest.starts_with("snan(0x") {
+        (true, 8usize) // "+snan(0x"
+    } else {
+        return None;
+    };
+    let hex_start = i + prefix_len;
+    let mut hex_end = hex_start;
+    while hex_end < bytes.len() && bytes[hex_end].is_ascii_hexdigit() {
+        hex_end += 1;
+    }
+    if hex_end == hex_start || bytes.get(hex_end) != Some(&b')') {
+        return None;
+    }
+    let payload = u64::from_str_radix(&ir[hex_start..hex_end], 16).ok()?;
+    let quiet_bit = if is_snan { 0u64 } else { 1u64 << 51 };
+    let bits64 = match fp_ty {
+        Some(IrFpTy::F32) => {
+            sign_bit | 0x7FF0_0000_0000_0000 | quiet_bit | ((payload & 0x3F_FFFF) << 29)
+        }
+        _ => sign_bit | 0x7FF0_0000_0000_0000 | quiet_bit | (payload & 0x0007_FFFF_FFFF_FFFF),
+    };
+    Some((hex_end + 1, bits64))
+}
+
+/// Attempts to parse a scientific-notation decimal float literal (`[-+]?[0-9]+\.[0-9]+[eE][+-][0-9]+`)
+/// starting at `i` in `float` (`f32`) type context. Returns `(end_index, bits64)` ONLY when
+/// LLVM 23.0 would reject the decimal literal as not losslessly representable as `float`
+/// (e.g., `1.000000e-01` for `0.1f32` or `1.401300e-45` for `f32::from_bits(1)`).
+fn parse_inexact_f32_sci_literal(ir: &str, i: usize) -> Option<(usize, u64)> {
+    let bytes = ir.as_bytes();
+    let mut j = i;
+    if matches!(bytes.get(j), Some(b'+' | b'-')) {
+        j += 1;
+    }
+    let int_start = j;
+    while j < bytes.len() && bytes[j].is_ascii_digit() {
+        j += 1;
+    }
+    if j == int_start || bytes.get(j) != Some(&b'.') {
+        return None;
+    }
+    j += 1;
+    let frac_start = j;
+    while j < bytes.len() && bytes[j].is_ascii_digit() {
+        j += 1;
+    }
+    if j == frac_start || !matches!(bytes.get(j), Some(b'e' | b'E')) {
+        return None;
+    }
+    j += 1;
+    if !matches!(bytes.get(j), Some(b'+' | b'-')) {
+        return None;
+    }
+    j += 1;
+    let exp_start = j;
+    while j < bytes.len() && bytes[j].is_ascii_digit() {
+        j += 1;
+    }
+    if j == exp_start || !is_ir_token_end(bytes, j) {
+        return None;
+    }
+    let tok = &ir[i..j];
+    let v32 = tok.parse::<f32>().ok()?;
+    let v64 = tok.parse::<f64>().ok()?;
+    if v64.to_bits() != (v32 as f64).to_bits() {
+        Some((j, f32_bits_to_f64_bits(v32.to_bits())))
+    } else {
+        None
+    }
+}
+
+/// Normalizes LLVM 23.1+ textual IR floating-point literals into LLVM 23.0-compatible
+/// `0x<16-hex>` IEEE-754 binary64 hex encodings so IR emitted by `rustc 1.100+` (LLVM 23.1)
+/// lowers cleanly through system `llc-23` (23.0). Handles:
+/// - `f0x<8-hex>` (`float`) and `f0x<16-hex>` (`double`) hex literals
+/// - `+inf`, `-inf`, `+qnan`, `-qnan`, `+snan`, `-snan`, `±nan(0x...)`, `±snan(0x...)`
+/// - `float` scientific-notation decimals (e.g. `1.000000e-01`, `1.401300e-45`) that round-trip
+///   in `f32` but not losslessly through `f64`
+/// - Properly skips `;` line comments and double-quoted strings (including `\\` escapes).
+fn normalize_llvm_ir_for_llc(ir: &str) -> String {
+    let bytes = ir.as_bytes();
+    let mut out = String::with_capacity(ir.len() + 64);
+    let mut i = 0usize;
+    let mut last_fp_ty: Option<IrFpTy> = None;
+
+    while i < bytes.len() {
+        let b = bytes[i];
+
+        // 1. Copy `;` line comments verbatim (never let quotes or tokens inside comments interfere).
+        if b == b';' {
+            let start = i;
+            while i < bytes.len() && bytes[i] != b'\n' {
+                i += 1;
+            }
+            out.push_str(&ir[start..i]);
+            continue;
+        }
+
+        // 2. Copy double-quoted string literals verbatim (handling `\\` and `\"` escapes).
+        if b == b'"' {
+            let start = i;
+            i += 1;
+            while i < bytes.len() {
+                if bytes[i] == b'\\' {
+                    if i + 1 < bytes.len() && matches!(bytes[i + 1], b'\\' | b'"') {
+                        i += 2;
+                    } else {
+                        i += 1;
+                    }
+                    continue;
+                }
+                if bytes[i] == b'"' {
+                    i += 1;
+                    break;
+                }
+                i += 1;
+            }
+            out.push_str(&ir[start..i]);
+            continue;
+        }
+
+        // 3. Rewrite delimited LLVM 23.1 FP literals outside strings and comments.
+        if is_ir_lit_left_delim(bytes, i) {
+            // 3a. `f0x<8-hex>` (float) and `f0x<16-hex>` (double)
+            if bytes[i..].starts_with(b"f0x") {
+                let hex_start = i + 3;
+                let mut hex_end = hex_start;
+                while hex_end < bytes.len() && bytes[hex_end].is_ascii_hexdigit() {
+                    hex_end += 1;
+                }
+                let hex_len = hex_end - hex_start;
+                if is_ir_token_end(bytes, hex_end) {
+                    if hex_len == 8
+                        && let Ok(bits32) = u32::from_str_radix(&ir[hex_start..hex_end], 16)
+                    {
+                        let bits64 = f32_bits_to_f64_bits(bits32);
+                        let _ = write!(out, "0x{bits64:016X}");
+                        i = hex_end;
+                        continue;
+                    } else if hex_len == 16
+                        && let Ok(bits64) = u64::from_str_radix(&ir[hex_start..hex_end], 16)
+                    {
+                        let _ = write!(out, "0x{bits64:016X}");
+                        i = hex_end;
+                        continue;
+                    }
+                }
+            }
+
+            // 3b. `+inf`, `-inf`, `±qnan`, `±snan`, `±nan(0x...)`, `±snan(0x...)`
+            if matches!(b, b'+' | b'-')
+                && let Some((end, bits64)) = parse_llvm23_special_fp(ir, i, last_fp_ty)
+            {
+                let _ = write!(out, "0x{bits64:016X}");
+                i = end;
+                continue;
+            }
+
+            // 3c. Scientific-notation `float` constants rejected by LLVM 23.0
+            if last_fp_ty == Some(IrFpTy::F32)
+                && (b.is_ascii_digit() || matches!(b, b'+' | b'-'))
+                && let Some((end, bits64)) = parse_inexact_f32_sci_literal(ir, i)
+            {
+                let _ = write!(out, "0x{bits64:016X}");
+                i = end;
+                continue;
+            }
+
+            // 3d. Track FP type context (`float` / `double` / other) and reset across top-level defs.
+            if b.is_ascii_alphabetic() {
+                let start = i;
+                while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+                    i += 1;
+                }
+                let word = &ir[start..i];
+                if !matches!(bytes.get(i), Some(b'.' | b':')) {
+                    match word {
+                        "float" => last_fp_ty = Some(IrFpTy::F32),
+                        "double" => last_fp_ty = Some(IrFpTy::F64),
+                        "half" | "bfloat" | "fp128" | "x86_fp80" | "ppc_fp128" => {
+                            last_fp_ty = Some(IrFpTy::Other);
+                        }
+                        "define" | "declare" | "attributes" => {
+                            last_fp_ty = None;
+                        }
+                        _ => {}
+                    }
+                }
+                out.push_str(word);
+                continue;
+            }
+        }
+
+        if b == b'}' {
+            last_fp_ty = None;
+        }
+        let ch = ir[i..].chars().next().unwrap();
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
+}
+
+fn normalize_llvm_ir_file_for_llc(ll_path: &Path) -> Result<(), GnomonError> {
+    let raw = std::fs::read_to_string(ll_path).map_err(|e| {
+        GnomonError::Io(format!("failed reading llvm-ir '{}': {e}", ll_path.display()))
+    })?;
+    let norm = normalize_llvm_ir_for_llc(&raw);
+    if norm != raw {
+        std::fs::write(ll_path, norm).map_err(|e| {
+            GnomonError::Io(format!("failed writing normalized llvm-ir '{}': {e}", ll_path.display()))
+        })?;
+    }
+    Ok(())
+}
+
 /// Strips x86-64 target datalayout/triple and CPU/feature attribute tags from LLVM IR
 /// before passing it to `llc -mtriple=aarch64-unknown-linux-gnu -mcpu=<cpu>`.
 fn strip_target_ir_metadata(ir: &str) -> String {
@@ -628,7 +906,7 @@ fn strip_target_ir_metadata(ir: &str) -> String {
             out.push('\n');
         }
     }
-    out
+    normalize_llvm_ir_for_llc(&out)
 }
 
 fn strip_ir_quoted_attr(line: &str, key: &str) -> String {
@@ -750,6 +1028,7 @@ fn compile_targets(
                             format_cmd_error("rustc (x86_64 llvm-ir)", &rustc_out),
                         ));
                     }
+                    normalize_llvm_ir_file_for_llc(&ll_path)?;
                     let llc_out = Command::new(llc_bin)
                         .args([
                             "-O3",
@@ -857,6 +1136,7 @@ fn compile_targets(
                                 format_cmd_error("rustc (aarch64 llvm-ir)", &rustc_out),
                             ));
                         }
+                        normalize_llvm_ir_file_for_llc(&ll_path)?;
                         let llc_out = Command::new(llc_bin)
                             .args([
                                 "-O3",
@@ -2788,5 +3068,60 @@ bar:
         assert_eq!(ma.stack_frame_bytes, 32);
         assert_eq!(ma.register_spills, 0);
         assert_eq!(ma.register_reloads, 0);
+    }
+
+    #[test]
+    fn test_normalize_llvm_ir_for_llc() {
+        let ir = "\
+@bs = constant [4 x i8] c\"foo\\\\\", align 1
+@msg = private constant [12 x i8] c\"f0x4B000000\\00\"
+; comment with unmatched \" quote and f0x4B000000 +inf should stay untouched
+define float @f(float %x) {
+  %1 = fadd <4 x float> %0, splat (float f0x4B000000)
+  %2 = fcmp ugt <4 x float> %1, splat (float f0x7F7FFFFF)
+  %3 = fadd float %x, f0x80000000
+  %4 = fadd float %x, f0x7F800001
+  %5 = fadd float %x, 1.000000e-01
+  %6 = fadd float %x, 1.401300e-45
+  %7 = fadd float %x, 1.000000e+00
+  %8 = fcmp one float %x, +inf
+  %9 = select i1 %8, float -inf, float +qnan
+  %10 = select i1 %8, float +nan(0x1234), float +snan(0x1)
+  ret float -qnan
+}
+define double @d(double %x) {
+  %1 = fadd double %x, f0x400921FB54442D18
+  %2 = fadd double %x, 1.000000e-01
+  %3 = select i1 %c, double +nan(0x1234), double -snan(0x1)
+  ret double %3
+}
+; keep non-literal myf0x4B000000 and f0x4B0000001 untouched
+";
+        let norm = normalize_llvm_ir_for_llc(ir);
+        // Backslash-terminated string + quoted string + comment preserved verbatim
+        assert!(norm.contains("c\"foo\\\\\""));
+        assert!(norm.contains("c\"f0x4B000000\\00\""));
+        assert!(norm.contains("; comment with unmatched \" quote and f0x4B000000 +inf"));
+        // f32 f0x<8-hex> incl. sNaN payload preservation (bit 51 stays 0!)
+        assert!(norm.contains("splat (float 0x4160000000000000)"));
+        assert!(norm.contains("splat (float 0x47EFFFFFE0000000)"));
+        assert!(norm.contains("fadd float %x, 0x8000000000000000"));
+        assert!(norm.contains("fadd float %x, 0x7FF0000020000000"));
+        // Inexact f32 scientific decimals rewritten, exact 1.000000e+00 preserved
+        assert!(norm.contains("fadd float %x, 0x3FB99999A0000000"));
+        assert!(norm.contains("fadd float %x, 0x36A0000000000000"));
+        assert!(norm.contains("fadd float %x, 1.000000e+00"));
+        // f32 ±inf, ±qnan, ±nan(0x...), ±snan(0x...)
+        assert!(norm.contains("fcmp one float %x, 0x7FF0000000000000"));
+        assert!(norm.contains("float 0xFFF0000000000000, float 0x7FF8000000000000"));
+        assert!(norm.contains("float 0x7FF8024680000000, float 0x7FF0000020000000"));
+        assert!(norm.contains("ret float 0xFFF8000000000000"));
+        // f64 f0x<16-hex>, double decimal preserved, double NaN payloads unshifted
+        assert!(norm.contains("fadd double %x, 0x400921FB54442D18"));
+        assert!(norm.contains("fadd double %x, 1.000000e-01"));
+        assert!(norm.contains("double 0x7FF8000000001234, double 0xFFF0000000000001"));
+        // Non-literals untouched
+        assert!(norm.contains("myf0x4B000000"));
+        assert!(norm.contains("f0x4B0000001"));
     }
 }

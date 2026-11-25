@@ -16,7 +16,7 @@ During verification, `egglog` v3.0 cancels high-level Strata laws and Ackermann 
 - **TCB v2 (`gnomon-kernel`):** `#![no_std]`, `#![forbid(unsafe_code)]`, 24-byte `IrSlot`, 0 runtime deps, 0 stubs, **15/15 Kani proofs green** (`0` failures, `11m54.38s`, `-j 1`, `ulimit -v 4194304`).
 - **3-Way Differential Fuzzer (`gnomon-wasm` vs `wasmtime 51`):** **27,768** 3-way bit-exact checks (including **13,896** IEEE-754 FP & `v128` SIMD corner cases), **0** mismatches.
 - **`wasm-smith` Differential & Blowup Gate (`wasm_smith_fuzz --count 1000`):** **1,000/1,000** random modules lifted & round-tripped, **4,785** differential checks across `1,916` functions, **0** mismatches, `egglog` p99 `129.256 ms` (`0` blowups), **3** real `gnomon-sieve` bugs caught & fixed.
-- **Full Workspace Suite:** **111** release tests across 5 crates (`gnomon-kernel`: 14, `gnomon-wasm`: 14, `gnomon-sieve`: 34, `gnomon-bench`: 9, `gnomon-mcp`: 40), `0` clippy warnings (`-D warnings`).
+- **Full Workspace Suite:** **116** release tests across 5 crates (`gnomon-kernel`: 14, `gnomon-wasm`: 14, `gnomon-sieve`: 34, `gnomon-bench`: 9, `gnomon-mcp`: 45), `0` clippy warnings (`-D warnings`).
 
 ### 2. Proof 2 — Compute-Matched 3-Arm Ablation on `Gnomon-T2T` OMS (`proof2_oms_ablation`, `3,000 ms/task` cap)
 Zero-trust Rung 1–2 training promoted 12 raw OMS Strata (13 laws UNSAT-verified in `1,934.9 ms`); `stitch_core` + `egglog` consolidation kept **11 Strata (11 laws)** and pruned 1 scratch Stratum (`331.4 ms`, **0** unsound admissions). Evaluated on 10 held-out Rung 3–4 OMS cliff tasks + 2 soundness-control mutants under an identical `3,000 ms/task` Bitwuzla cap:
@@ -42,15 +42,18 @@ All **27** strict `#![no_std]` Rust OMS files (**15** Strata `S1.1–S4.2` + `S4
 | **5. Zero-Copy OUCH 48B** (`oms_ouch_pack`) | **stack `56B->0B`**, spills `1->0` · **2.20×** cyc | **stack `64B->0B`** · **1.53×** cyc | `12.68 -> 5.91` (**2.15×**, `--bench-inputs`) |
 | **6. 4-Lane VWAP SIMD** (`oms_vwap`) | **br `7->1`**, `mulps`/`addps` · **1.23×** cyc / **1.20×** RTh | **br `6->1`**, **NEON `0->14`** · **1.45×** cyc / **1.70×** RTh | `9.99 -> 3.24` (**3.09×**) |
 
-### 4. Horizontal Generalization — 4 Non-Trading Vertical Packs (`examples/vertical_packs/`)
-Verified and profiled on the **100% unmodified** `gnomon` engine (**0** engine changes, `8/8` round-trip lift valid, **24/24** live verdicts: **16/16 `PROVED`**, **8/8 buggy mutants `FALSIFIED`**):
+### 4. Horizontal Generalization — 7 Non-Trading Vertical Packs (`examples/vertical_packs/`)
+Verified and profiled across **7** distinct non-trading systems domains (**0** domain-specific engine changes, `14/14` round-trip lift valid, **55/55** live verdicts via [`examples/vertical_packs/verify_all.sh`](examples/vertical_packs/verify_all.sh): **38/38 `PROVED`**, **17/17 buggy mutants `FALSIFIED`**):
 
-| Vertical Pack | Domain & Verified Properties | Live Verdicts | `gnomon profile` (`x64` / `arm64`) |
+| Vertical Pack | Domain & Verified Properties | Live Verdicts | `gnomon profile` (`x64` / `arm64` / host) |
 | --- | --- | :---: | --- |
 | **`ai_q8_0_quant`** | AI Inference `Q8_0` 4-lane `f32x4` block quantizer (`QF_ABVFP`, no `0*Inf=NaN`, exact `nearest` rounding) | `3 PROVED` / `2 FALSIFIED` | x64 **2.61×** cyc (`-20` insns) · ARM64 **1.57×** cyc, **NEON `13->33`**, br `2->0` |
 | **`db_parquet_varint_slice`** | Columnar DB zero-copy `&[u8]` LEB128 varint + ZigZag (`--ignore-dead-stack`, `SliceFrame readonly`, branchless equiv) | `6 PROVED` / `2 FALSIFIED` | x64 **br `4->0`**, `1.10×` RTh · ARM64 **br `3->0`**, **1.50×** cyc |
 | **`net_wireguard_replay`** | Networking RFC 6479 / WireGuard 64-bit sliding anti-replay window (inductive invariant, large-jump reset, branchless equiv) | `4 PROVED` / `2 FALSIFIED` | x64 **br `2->0`**, `0` spills · ARM64 `0` br (`csel`), `0` spills |
 | **`cloud_quota_saga`** | Cloud Distributed Quota Saga (`reserve`/`commit`/`cancel_reserve` inductive conservation, zero double-release/commit) | `3 PROVED` / `2 FALSIFIED` | Inductive stateful FSM (`globals=0`) |
+| **`crypto_ct_tls_record`** | Cryptography Constant-Time PKCS#7 unpad (`--ignore-dead-stack`, `SliceFrame readonly`) + `v128` 16B MAC + ChaCha20 `u32x4` round (`SliceFrame param:0:64`) | `8 PROVED` / `3 FALSIFIED` | x64 **br `34->0`** (CT!), **3.38×** cyc / **3.72×** RTh · ARM64 **br `37->0`** (CT!), **3.30×** cyc / **4.17×** RTh · Host **1.39×** |
+| **`robotics_flight_pid_mixer`** | Safety-Critical Robotics Stateful IEEE-754 `QF_ABVFP` PID + anti-windup + slew-rate + E-stop + `f32x4` 4-motor mixer (`2^23` magic-bias RNE proved bit-exact) | `7 PROVED` / `3 FALSIFIED` | x64 **br `17->0`**, **3.67×** cyc / **2.89×** RTh · ARM64 **br `17->0`**, **NEON `0->35`**, **1.50×** RTh · Host **1.93×** |
+| **`os_mmu_wx_tlb`** | OS Kernel / Hypervisor 4-region `W^X` MMU (inductive `W^X`, 4 KiB align, zero wrap, disjointness, global `W^X` non-interference, unmap revocation) + `v128` 4-way TLB | `7 PROVED` / `3 FALSIFIED` | x64 **br `20->0`**, **AVX2 `0->20`**, **2.16×** RTh · ARM64 **br `18->0`**, **NEON `0->18`**, **2.38×** RTh · Host **1.53×** |
 
 ### 5. Step 7: Live Blind AI Closed-Loop Optimization (`examples/closed_loop_demo/`)
 A blind AI optimization agent using **only `rustc` and `gnomon`** (`define-op`, `prove-law`, `check-goal`, `check-contract`, `profile --targets x64,arm64 --bench`) autonomously hill-climbed 3 slow trading/OMS reference kernels to `PROVED` (`0` divs, `0` register spills on both x64 & ARM64) while catching **3 real correctness bugs** and **2 hardware regressions** mid-loop (see [examples/closed_loop_demo/REPORT.md](./examples/closed_loop_demo/REPORT.md)):
@@ -131,12 +134,15 @@ Exposes **8 atomic tools** over stdio (`rmcp` + `tokio`): `gnomon_lift_check`, `
 ## Verification & Benchmark Commands
 
 ```bash
-# Workspace lints & release tests (111 tests across 5 crates — never set ulimit -v on Wasmtime tests!)
+# Workspace lints & release tests (116 tests across 5 crates — never set ulimit -v on Wasmtime tests!)
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace --release
 
 # Build & round-trip lift all 27 OMS Strata fixtures (S1.1-S4.3 + all buggy mutants)
 ./examples/oms_strata/build.sh
+
+# Build, round-trip lift, verify (55/55 verdicts) & profile all 7 non-trading vertical packs
+./examples/vertical_packs/verify_all.sh
 
 # Live blind AI closed-loop verification & x64/ARM64 hardware profiling showcase
 ./examples/closed_loop_demo/verify_and_profile.sh

@@ -64,10 +64,13 @@ export CXX="/usr/lib/llvm-23/bin/clang++"
   - Layer 2 (`S2.1–S2.4`): SPSC ring, Stratum-linked order slab (`order_id_mix`), zero-copy ITCH RX decode & OUCH TX encode (`--ignore-dead-stack`, `--slice-frame`).
   - Layer 3 (`S3.1–S3.5`): 8-state child FSM, parent-child zero-overfill OMS, SEC 15c3-5 pre-trade risk gate (`checked_notional`, `price_collar_ok`), `v128` L2 book sweep, `f32x4` `QF_ABVFP` VWAP/VaR signal.
   - Layer 4 (`S4.1–S4.2` + `S4.3`): E2E inbound ExecReport pipeline (`s4_1_oms_on_exec_report.rs`), E2E Tick-to-Trade + OUCH pipeline (`s4_2_oms_on_tick_or_order.rs`), and 6 formally proved `ref -> opt` performance pairs (`s4_3_perf_opt_pairs.rs`) + 11 `*_buggy.rs` mutant files.
-- **4 Non-Trading Vertical Packs (`examples/vertical_packs/`):**
+- **7 Non-Trading Vertical Packs (`examples/vertical_packs/`, `./examples/vertical_packs/verify_all.sh`):**
   - **AI Inference (`ai_q8_0_quant.rs`):** `llama.cpp`/GGML `Q8_0` `f32x4` block quantization (`QF_ABVFP`).
   - **Columnar DB (`db_parquet_varint_slice.rs`):** 4-byte LEB128 varint slice decoder (`--ignore-dead-stack`, `SliceFrame readonly`) + Delta-ZigZag bijection.
   - **Networking (`net_wireguard_replay.rs`):** WireGuard/IPsec RFC 6479 64-bit sliding anti-replay window.
   - **Cloud Infrastructure (`cloud_quota_saga.rs`):** Multi-tenant 4-slot two-phase reservation quota saga.
+  - **Cryptography / Constant-Time Security (`crypto_ct_tls_record.rs`):** Constant-time RFC 5652 PKCS#7 unpad (`--ignore-dead-stack`, `SliceFrame readonly`, 0-branch x64/ARM64 audit) + `v128` 16B MAC + ChaCha20 `u32x4` round (`SliceFrame param:0:64`).
+  - **Safety-Critical Robotics / Aerospace (`robotics_flight_pid_mixer.rs`):** Stateful inductive IEEE-754 `QF_ABVFP` flight PID + anti-windup + slew-rate + E-stop + `f32x4` 4-motor mixer (`2^23` magic-bias RNE proved bit-exact).
+  - **OS Kernel / Hypervisor (`os_mmu_wx_tlb.rs`):** 4-region `W^X` MMU (inductive `W^X`, 4 KiB alignment, zero wraparound, pairwise disjointness, global `W^X` non-interference, unmap revocation) + `v128` 4-way parallel TLB lookup.
 - **Live Blind AI Closed-Loop Showcase (`examples/closed_loop_demo/`):**
   - 3 real-world OMS/trading kernels (`k1_fix_ascii_price.rs`, `k2_sor_venue_router.rs`, `k3_oms_tick_risk_fastpath.rs` + Layer-1 `strata_l1.rs` / `strata_l1_laws.rs`) autonomously optimized end-to-end using only `rustc` and `gnomon` (`REPORT.md`, `verify_and_profile.sh`).

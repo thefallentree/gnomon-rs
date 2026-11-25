@@ -59,6 +59,19 @@ fn oms_rs(name: &str) -> PathBuf {
     p
 }
 
+fn vp_rs(name: &str) -> PathBuf {
+    let p = repo_root()
+        .join("examples")
+        .join("vertical_packs")
+        .join(format!("{name}.rs"));
+    assert!(
+        p.is_file(),
+        "missing vertical-pack Rust fixture: {}",
+        p.display()
+    );
+    p
+}
+
 /// Resolves prebuilt `examples/<subdir>/out/<name>.wasm` or compiles `examples/<subdir>/<name>.rs`
 /// into `tmp_dir` on demand so tests remain green even on a clean checkout without `out/`.
 fn fixture_wasm(subdir: &str, name: &str, simd128: bool, tmp_dir: &Path) -> PathBuf {
@@ -1007,4 +1020,746 @@ fn test_vertical_pack_4_cloud_quota_saga_and_mutants() {
         1,
     );
     assert_eq!(bug_double_rel["status"], "FALSIFIED");
+}
+
+// ============================================================================
+// Vertical Pack 5: Cryptography / Constant-Time TLS & AEAD Security
+// ============================================================================
+
+#[test]
+fn test_vertical_pack_5_crypto_ct_tls_record_and_mutants() {
+    let tmp = TempDirGuard::new("vp5_crypto");
+    let good_w = fixture_wasm("vertical_packs", "crypto_ct_tls_record", true, tmp.path());
+    let buggy_w = fixture_wasm(
+        "vertical_packs",
+        "crypto_ct_tls_record_buggy",
+        true,
+        tmp.path(),
+    );
+    let good = good_w.to_str().unwrap();
+    let buggy = buggy_w.to_str().unwrap();
+    let rs_path = vp_rs("crypto_ct_tls_record");
+    let rs = rs_path.to_str().unwrap();
+
+    // 1. Zero-stack PKCS#7 opt === shadow-stack ref under --ignore-dead-stack
+    let pkcs7_eq = run_cli_expect(
+        &[
+            "check-goal",
+            "--candidate",
+            good,
+            "--candidate-entry",
+            "pkcs7_unpad16_opt",
+            "--spec",
+            good,
+            "--spec-entry",
+            "pkcs7_unpad16_ref",
+            "--pre",
+            good,
+            "--pre-entry",
+            "req_block16_slice",
+            "--ignore-dead-stack",
+            "--timeout-ms",
+            "15000",
+        ],
+        0,
+    );
+    assert_eq!(pkcs7_eq["status"], "PROVED");
+
+    // 2. Complete RFC 5652 postcondition + SliceFrame readonly (opt & ref --ignore-dead-stack)
+    let pkcs7_ro = run_cli_expect(
+        &[
+            "check-contract",
+            good,
+            "--entry",
+            "pkcs7_unpad16_opt",
+            "--requires",
+            "req_block16_slice",
+            "--ensures",
+            "ens_pkcs7_unpad16",
+            "--slice-frame",
+            "readonly",
+            "--timeout-ms",
+            "15000",
+        ],
+        0,
+    );
+    assert_eq!(pkcs7_ro["status"], "PROVED");
+
+    let pkcs7_ref_ro = run_cli_expect(
+        &[
+            "check-contract",
+            good,
+            "--entry",
+            "pkcs7_unpad16_ref",
+            "--requires",
+            "req_block16_slice",
+            "--slice-frame",
+            "readonly",
+            "--ignore-dead-stack",
+            "--timeout-ms",
+            "15000",
+        ],
+        0,
+    );
+    assert_eq!(pkcs7_ref_ro["status"], "PROVED");
+
+    // 3. Exact constant-time SWAR branchless === branchy across all 2^128 16-byte blocks
+    let ct_eq = run_cli_expect(
+        &[
+            "check-goal",
+            "--candidate",
+            good,
+            "--candidate-entry",
+            "pkcs7_unpad16_branchless",
+            "--spec",
+            good,
+            "--spec-entry",
+            "pkcs7_unpad16_branchy",
+            "--timeout-ms",
+            "15000",
+        ],
+        0,
+    );
+    assert_eq!(ct_eq["status"], "PROVED");
+
+    // 4. 16-byte AEAD MAC SIMD equivalence + 1-bit forgery rejection
+    let mac_eq = run_cli_expect(
+        &[
+            "check-goal",
+            "--candidate",
+            good,
+            "--candidate-entry",
+            "ct_mac16_eq_v128",
+            "--spec",
+            good,
+            "--spec-entry",
+            "ct_mac16_eq_ref",
+            "--timeout-ms",
+            "15000",
+        ],
+        0,
+    );
+    assert_eq!(mac_eq["status"], "PROVED");
+
+    let mac_flip = run_cli_expect(
+        &[
+            "check-contract",
+            good,
+            "--entry",
+            "contract_mac16_1bit_flip_rejected",
+            "--timeout-ms",
+            "15000",
+        ],
+        0,
+    );
+    assert_eq!(mac_flip["status"], "PROVED");
+
+    // 5. RFC 8439 ChaCha20 4-lane u32x4 SIMD equivalence + 64B SliceFrame containment
+    let chacha_eq = run_cli_expect(
+        &[
+            "check-goal",
+            "--candidate",
+            good,
+            "--candidate-entry",
+            "chacha20_col_round_v128",
+            "--spec",
+            good,
+            "--spec-entry",
+            "chacha20_col_round_ref",
+            "--pre",
+            good,
+            "--pre-entry",
+            "req_chacha_state",
+            "--timeout-ms",
+            "15000",
+        ],
+        0,
+    );
+    assert_eq!(chacha_eq["status"], "PROVED");
+
+    let chacha_sf = run_cli_expect(
+        &[
+            "check-contract",
+            good,
+            "--entry",
+            "chacha20_col_round_v128",
+            "--requires",
+            "req_chacha_state",
+            "--slice-frame",
+            "param:0:64",
+            "--timeout-ms",
+            "15000",
+        ],
+        0,
+    );
+    assert_eq!(chacha_sf["status"], "PROVED");
+
+    // 6. All 3 cryptographic buggy mutants MUST be FALSIFIED
+    let bug_pad = run_cli_expect(
+        &[
+            "check-contract",
+            buggy,
+            "--entry",
+            "pkcs7_unpad16_buggy_zero_pad_oracle",
+            "--requires",
+            "req_block16_slice",
+            "--ensures",
+            "ens_pkcs7_unpad16",
+            "--timeout-ms",
+            "15000",
+        ],
+        1,
+    );
+    assert_eq!(bug_pad["status"], "FALSIFIED");
+
+    let bug_mac = run_cli_expect(
+        &[
+            "check-contract",
+            buggy,
+            "--entry",
+            "contract_mac16_1bit_flip_rejected",
+            "--timeout-ms",
+            "15000",
+        ],
+        1,
+    );
+    assert_eq!(bug_mac["status"], "FALSIFIED");
+
+    let bug_chacha = run_cli_expect(
+        &[
+            "check-goal",
+            "--candidate",
+            buggy,
+            "--candidate-entry",
+            "chacha20_col_round_buggy_rot",
+            "--spec",
+            good,
+            "--spec-entry",
+            "chacha20_col_round_ref",
+            "--pre",
+            good,
+            "--pre-entry",
+            "req_chacha_state",
+            "--timeout-ms",
+            "15000",
+        ],
+        1,
+    );
+    assert_eq!(bug_chacha["status"], "FALSIFIED");
+
+    // 7. Native x64 & ARM64 constant-time audit: 0 secret-dependent branches on BOTH targets!
+    let prof = run_cli_expect(
+        &[
+            "profile",
+            rs,
+            "--entry",
+            "pkcs7_unpad16_branchy",
+            "--opt-entry",
+            "pkcs7_unpad16_branchless",
+            "--targets",
+            "x64,arm64",
+            "--bench",
+            "--bench-inputs",
+            r#"[["0x4142434445464748","0x04040404494a4b4c"],["0x1122334455667788","0x0808080808080808"],["0x0c0c0c0c41424344","0x0c0c0c0c0c0c0c0c"],["0x1010101010101010","0x1010101010101010"],["0x10101010101010ff","0x1010101010101010"]]"#,
+        ],
+        0,
+    );
+    assert_eq!(prof["status"], "OK");
+    let opt_targets = prof["opt_profile"]["targets"].as_array().unwrap();
+    assert_eq!(opt_targets.len(), 2);
+    for t in opt_targets {
+        assert_eq!(
+            t["branch_count"].as_u64().unwrap(),
+            0,
+            "expected constant-time 0 branches on {}: {t}",
+            t["arch"]
+        );
+    }
+    let deltas = prof["comparison"]["target_deltas"].as_array().unwrap();
+    assert_eq!(deltas.len(), 2);
+    for d in deltas {
+        assert!(d["branch_delta"].as_i64().unwrap() < 0, "expected branch elimination: {d}");
+        assert!(d["cycle_speedup"].as_f64().unwrap() > 2.0, "expected >2x cycle speedup: {d}");
+        assert!(d["rthroughput_speedup"].as_f64().unwrap() > 2.0, "expected >2x RTh speedup: {d}");
+    }
+    assert!(prof["opt_profile"]["host_ns_per_op"].as_f64().is_some());
+}
+
+// ============================================================================
+// Vertical Pack 6: Safety-Critical Robotics / Aerospace Flight PID + 4-Motor Mixer
+// ============================================================================
+
+#[test]
+fn test_vertical_pack_6_robotics_flight_pid_mixer_and_mutants() {
+    let tmp = TempDirGuard::new("vp6_robotics");
+    let good_w = fixture_wasm(
+        "vertical_packs",
+        "robotics_flight_pid_mixer",
+        true,
+        tmp.path(),
+    );
+    let buggy_w = fixture_wasm(
+        "vertical_packs",
+        "robotics_flight_pid_mixer_buggy",
+        true,
+        tmp.path(),
+    );
+    let good = good_w.to_str().unwrap();
+    let buggy = buggy_w.to_str().unwrap();
+    let rs_path = vp_rs("robotics_flight_pid_mixer");
+    let rs = rs_path.to_str().unwrap();
+
+    // 1. Inductive stateful IEEE-754 QF_ABVFP PID safety invariant
+    let inv = run_cli_expect(
+        &[
+            "check-contract",
+            good,
+            "--init",
+            "init_pid",
+            "--ops",
+            "step_pid,clear_estop",
+            "--invariant",
+            "inv_pid_safe",
+            "--timeout-ms",
+            "20000",
+        ],
+        0,
+    );
+    assert_eq!(inv["status"], "PROVED");
+
+    // 2. E-stop dominance, NaN sensor fault isolation, and slew-rate bound
+    for entry in [
+        "contract_estop_forces_zero",
+        "contract_nan_sensor_never_poisons",
+        "contract_slew_rate_bounded",
+    ] {
+        let res = run_cli_expect(
+            &[
+                "check-contract",
+                good,
+                "--entry",
+                entry,
+                "--timeout-ms",
+                "20000",
+            ],
+            0,
+        );
+        assert_eq!(res["status"], "PROVED", "failed contract {entry}");
+    }
+
+    // 3. Quadrotor 4-motor mixer: IEEE-754 2^23 magic-bias opt === v128 === scalar + safety
+    let eq_v128 = run_cli_expect(
+        &[
+            "check-goal",
+            "--candidate",
+            good,
+            "--candidate-entry",
+            "quad_mixer_4_opt",
+            "--spec",
+            good,
+            "--spec-entry",
+            "quad_mixer_4_v128",
+            "--timeout-ms",
+            "15000",
+        ],
+        0,
+    );
+    assert_eq!(eq_v128["status"], "PROVED");
+
+    let eq_scalar = run_cli_expect(
+        &[
+            "check-goal",
+            "--candidate",
+            good,
+            "--candidate-entry",
+            "quad_mixer_4_opt",
+            "--spec",
+            good,
+            "--spec-entry",
+            "quad_mixer_4_scalar",
+            "--timeout-ms",
+            "15000",
+        ],
+        0,
+    );
+    assert_eq!(eq_scalar["status"], "PROVED");
+
+    let mixer_safe = run_cli_expect(
+        &[
+            "check-contract",
+            good,
+            "--entry",
+            "quad_mixer_4_opt",
+            "--ensures",
+            "ens_quad_mixer_safe",
+            "--timeout-ms",
+            "15000",
+        ],
+        0,
+    );
+    assert_eq!(mixer_safe["status"], "PROVED");
+
+    // 4. Buggy mutants: NaN integrator poisoning & NaN full-throttle crash MUST be FALSIFIED
+    let bug_pid = run_cli_expect(
+        &[
+            "check-contract",
+            buggy,
+            "--init",
+            "init_pid",
+            "--ops",
+            "step_pid_buggy_nan_clamp,clear_estop",
+            "--invariant",
+            "inv_pid_safe",
+            "--timeout-ms",
+            "15000",
+        ],
+        1,
+    );
+    assert_eq!(bug_pid["status"], "FALSIFIED");
+
+    let bug_nan = run_cli_expect(
+        &[
+            "check-contract",
+            buggy,
+            "--entry",
+            "contract_nan_sensor_never_poisons",
+            "--timeout-ms",
+            "15000",
+        ],
+        1,
+    );
+    assert_eq!(bug_nan["status"], "FALSIFIED");
+
+    let bug_throttle = run_cli_expect(
+        &[
+            "check-contract",
+            buggy,
+            "--entry",
+            "quad_mixer_buggy_nan_full_throttle",
+            "--ensures",
+            "ens_quad_mixer_safe",
+            "--timeout-ms",
+            "15000",
+        ],
+        1,
+    );
+    assert_eq!(bug_throttle["status"], "FALSIFIED");
+
+    // 5. Native x64 & ARM64 NEON profile + host bench (also exercises LLVM 23.1 f0x normalization!)
+    let prof = run_cli_expect(
+        &[
+            "profile",
+            rs,
+            "--entry",
+            "quad_mixer_4_scalar",
+            "--opt-entry",
+            "quad_mixer_4_opt",
+            "--targets",
+            "x64,arm64",
+            "--bench",
+            "--bench-inputs",
+            "[[0.65,0.08,-0.05,0.02,0],[0.50,-0.12,0.10,-0.04,0],[0.85,0.20,0.15,0.05,0],[0.20,-0.25,-0.10,0.08,0]]",
+        ],
+        0,
+    );
+    assert_eq!(prof["status"], "OK");
+    for t in prof["opt_profile"]["targets"].as_array().unwrap() {
+        assert_eq!(t["branch_count"].as_u64().unwrap(), 0, "expected 0 branches: {t}");
+    }
+    let deltas = prof["comparison"]["target_deltas"].as_array().unwrap();
+    assert_eq!(deltas.len(), 2);
+    for d in deltas {
+        assert!(d["branch_delta"].as_i64().unwrap() < 0, "expected branch drop: {d}");
+        assert!(d["rthroughput_speedup"].as_f64().unwrap() > 1.2, "expected RTh speedup: {d}");
+    }
+    assert!(
+        prof["comparison"]["host_speedup"].as_f64().unwrap() > 1.0,
+        "expected host speedup > 1.0: {}",
+        prof["comparison"]
+    );
+}
+
+// ============================================================================
+// Vertical Pack 7: OS Kernel / Hypervisor W^X MMU & Vectorized 4-Way TLB
+// ============================================================================
+
+#[test]
+fn test_vertical_pack_7_os_mmu_wx_tlb_and_mutants() {
+    let tmp = TempDirGuard::new("vp7_os_mmu");
+    let good_w = fixture_wasm("vertical_packs", "os_mmu_wx_tlb", true, tmp.path());
+    let buggy_w = fixture_wasm("vertical_packs", "os_mmu_wx_tlb_buggy", true, tmp.path());
+    let good = good_w.to_str().unwrap();
+    let buggy = buggy_w.to_str().unwrap();
+    let rs_path = vp_rs("os_mmu_wx_tlb");
+    let rs = rs_path.to_str().unwrap();
+
+    // 1. Inductive 4-region W^X + page alignment + zero wraparound + pairwise disjointness
+    let inv = run_cli_expect(
+        &[
+            "check-contract",
+            good,
+            "--init",
+            "init_mmu",
+            "--ops",
+            "map_region,mprotect_region,unmap_region",
+            "--invariant",
+            "inv_mmu_wx",
+            "--timeout-ms",
+            "20000",
+        ],
+        0,
+    );
+    assert_eq!(inv["status"], "PROVED");
+
+    // 2. Global virtual-address W^X non-interference & immediate unmap revocation
+    let no_wx = run_cli_expect(
+        &[
+            "check-contract",
+            good,
+            "--entry",
+            "contract_no_wx_escalation",
+            "--timeout-ms",
+            "15000",
+        ],
+        0,
+    );
+    assert_eq!(no_wx["status"], "PROVED");
+
+    let unmap_rev = run_cli_expect(
+        &[
+            "check-contract",
+            good,
+            "--entry",
+            "contract_unmap_revokes_access",
+            "--timeout-ms",
+            "20000",
+        ],
+        0,
+    );
+    assert_eq!(unmap_rev["status"], "PROVED");
+
+    // 3. 4-way TLB lookup: v128 === branchless === ref + SliceFrame readonly
+    let tlb_v128 = run_cli_expect(
+        &[
+            "check-goal",
+            "--candidate",
+            good,
+            "--candidate-entry",
+            "tlb_check_4_v128",
+            "--spec",
+            good,
+            "--spec-entry",
+            "tlb_check_4_ref",
+            "--pre",
+            good,
+            "--pre-entry",
+            "req_tlb_tables",
+            "--timeout-ms",
+            "15000",
+        ],
+        0,
+    );
+    assert_eq!(tlb_v128["status"], "PROVED");
+
+    let tlb_bl = run_cli_expect(
+        &[
+            "check-goal",
+            "--candidate",
+            good,
+            "--candidate-entry",
+            "tlb_check_4_branchless",
+            "--spec",
+            good,
+            "--spec-entry",
+            "tlb_check_4_ref",
+            "--pre",
+            good,
+            "--pre-entry",
+            "req_tlb_tables",
+            "--timeout-ms",
+            "15000",
+        ],
+        0,
+    );
+    assert_eq!(tlb_bl["status"], "PROVED");
+
+    let tlb_ro = run_cli_expect(
+        &[
+            "check-contract",
+            good,
+            "--entry",
+            "tlb_check_4_branchless",
+            "--requires",
+            "req_tlb_tables",
+            "--slice-frame",
+            "readonly",
+            "--timeout-ms",
+            "15000",
+        ],
+        0,
+    );
+    assert_eq!(tlb_ro["status"], "PROVED");
+
+    let tlb_v128_ro = run_cli_expect(
+        &[
+            "check-contract",
+            good,
+            "--entry",
+            "tlb_check_4_v128",
+            "--requires",
+            "req_tlb_tables",
+            "--slice-frame",
+            "readonly",
+            "--timeout-ms",
+            "15000",
+        ],
+        0,
+    );
+    assert_eq!(tlb_v128_ro["status"], "PROVED");
+
+    // 4. All 3 OS kernel CVE mutants MUST be FALSIFIED
+    let bug_wrap = run_cli_expect(
+        &[
+            "check-contract",
+            buggy,
+            "--init",
+            "init_mmu",
+            "--ops",
+            "map_region_buggy_wrap_overlap,unmap_region",
+            "--invariant",
+            "inv_mmu_wx",
+            "--timeout-ms",
+            "15000",
+        ],
+        1,
+    );
+    assert_eq!(bug_wrap["status"], "FALSIFIED");
+
+    let bug_wx = run_cli_expect(
+        &[
+            "check-contract",
+            buggy,
+            "--entry",
+            "contract_no_wx_escalation",
+            "--timeout-ms",
+            "15000",
+        ],
+        1,
+    );
+    assert_eq!(bug_wx["status"], "FALSIFIED");
+
+    let bug_signed = run_cli_expect(
+        &[
+            "check-goal",
+            "--candidate",
+            buggy,
+            "--candidate-entry",
+            "tlb_check_4_buggy_signed_cmp",
+            "--spec",
+            good,
+            "--spec-entry",
+            "tlb_check_4_ref",
+            "--pre",
+            good,
+            "--pre-entry",
+            "req_tlb_tables",
+            "--timeout-ms",
+            "15000",
+        ],
+        1,
+    );
+    assert_eq!(bug_signed["status"], "FALSIFIED");
+
+    // 5. Native x64 (AVX2) & ARM64 (NEON) 4-way parallel TLB profile + host bench
+    let prof = run_cli_expect(
+        &[
+            "profile",
+            rs,
+            "--entry",
+            "tlb_check_4_ref",
+            "--opt-entry",
+            "tlb_check_4_branchless",
+            "--targets",
+            "x64,arm64",
+            "--bench",
+            "--bench-inputs",
+            "[[[4096,65536,131072,262144],[4096,8192,16384,32768],[5,3,1,5],266240,4],[[4096,65536,131072,262144],[4096,8192,16384,32768],[5,3,1,5],135168,1],[[4096,65536,131072,262144],[4096,8192,16384,32768],[5,3,1,5],524288,1],[[4096,65536,131072,262144],[4096,8192,16384,32768],[5,3,1,5],270336,2]]",
+        ],
+        0,
+    );
+    assert_eq!(prof["status"], "OK");
+    for t in prof["opt_profile"]["targets"].as_array().unwrap() {
+        assert_eq!(t["branch_count"].as_u64().unwrap(), 0, "expected 0 branches: {t}");
+        assert!(t["simd_count"].as_u64().unwrap() > 0, "expected SIMD/NEON vectorization: {t}");
+    }
+    let deltas = prof["comparison"]["target_deltas"].as_array().unwrap();
+    assert_eq!(deltas.len(), 2);
+    for d in deltas {
+        assert!(d["branch_delta"].as_i64().unwrap() < 0, "expected branch drop: {d}");
+        assert!(d["simd_delta"].as_i64().unwrap() > 0, "expected SIMD gain: {d}");
+        assert!(d["rthroughput_speedup"].as_f64().unwrap() > 1.5, "expected RTh speedup: {d}");
+    }
+    assert!(prof["opt_profile"]["host_ns_per_op"].as_f64().is_some());
+}
+
+// ============================================================================
+// Regression E2E: LLVM 23.1 -> 23.0 IR Float Literal Normalization in Profiler
+// ============================================================================
+
+#[test]
+fn test_profiler_llvm23_1_float_literal_normalization_e2e() {
+    let tmp = TempDirGuard::new("prof_llvm23_fp");
+    let src_path = tmp.path().join("llvm23_fp_edge_cases.rs");
+    let src = r#"#![no_std]
+
+#[unsafe(no_mangle)]
+pub static ESCAPED_BS: [u8; 4] = *b"foo\\";
+
+#[unsafe(no_mangle)]
+pub extern "C" fn f32_all_edge_literals(x: f32) -> f32 {
+    let a = x + 0.1f32;
+    let b = a + 8_388_608.0f32;
+    let c = b + f32::from_bits(1);
+    if c < f32::INFINITY && c > f32::NEG_INFINITY {
+        c + f32::MAX
+    } else if c == f32::INFINITY {
+        f32::from_bits(0x7FC0_1234)
+    } else if c == f32::NEG_INFINITY {
+        f32::from_bits(0x7F80_0001)
+    } else {
+        f32::NAN
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn f64_all_edge_literals(x: f64) -> f64 {
+    let a = x + 3.141592653589793f64;
+    let b = a + f64::from_bits(1);
+    if b < f64::INFINITY && b > f64::NEG_INFINITY {
+        b + f64::MAX
+    } else if b == f64::INFINITY {
+        f64::from_bits(0x7FF8_0000_0000_1234)
+    } else {
+        f64::from_bits(0x7FF0_0000_0000_0001)
+    }
+}
+"#;
+    std::fs::write(&src_path, src).expect("write llvm23_fp_edge_cases.rs");
+    let p = src_path.to_str().unwrap();
+
+    for entry in ["f32_all_edge_literals", "f64_all_edge_literals"] {
+        let prof = run_cli_expect(
+            &["profile", p, "--entry", entry, "--targets", "x64,arm64"],
+            0,
+        );
+        assert_eq!(prof["status"], "OK", "profile failed for {entry}: {prof}");
+        let targets = prof["profile"]["targets"].as_array().unwrap();
+        assert_eq!(targets.len(), 2, "expected x64+arm64 for {entry}: {prof}");
+        for t in targets {
+            assert!(
+                t["instruction_count"].as_u64().unwrap() > 0,
+                "expected non-empty asm for {entry}: {t}"
+            );
+        }
+    }
 }
