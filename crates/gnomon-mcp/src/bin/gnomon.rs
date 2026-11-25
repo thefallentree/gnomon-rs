@@ -8,8 +8,8 @@ use clap::{Parser, Subcommand, ValueEnum};
 use gnomon_mcp::{
     CheckContractRequest, ContractPred, DEFAULT_ARM64_CPU, DEFAULT_X64_CPU, GnomonEngine,
     GnomonError, GnomonMcpServer, InputType, IrDocument, IrLawKind, IrTypedVar, IrVal, IrValType,
-    LoadedArtifact, ProfileRequest, parse_slice_frame_spec, parse_targets_csv,
-    prepare_goal_artifacts, read_input_bytes,
+    LoadedArtifact, ProfileRequest, parse_bench_inputs_json, parse_bench_preset,
+    parse_slice_frame_spec, parse_targets_csv, prepare_goal_artifacts, read_input_bytes,
 };
 use gnomon_sieve::ConsolidationConfig;
 use gnomon_wasm::emit_wasm;
@@ -275,6 +275,12 @@ enum Commands {
         /// Run opt-in 1,000,000-iteration native host x86-64 microbenchmark (`host_ns_per_op`).
         #[arg(long)]
         bench: bool,
+        /// Optional JSON array of hot-path input tuples for `--bench`, e.g. `'[[3689348814741910323]]'` (supports ints, floats, bools, hex/ASCII strings, and `"buf"`/`null`/arrays for pointer params).
+        #[arg(long = "bench-inputs", value_name = "JSON")]
+        bench_inputs: Option<String>,
+        /// Built-in realistic hot-path input preset for `--bench`: `default`, `ascii-digits`, or `oms-valid`.
+        #[arg(long = "bench-preset", default_value = "default")]
+        bench_preset: String,
     },
 
     /// Start the single Gnomon MCP server over stdio (rmcp + tokio).
@@ -787,12 +793,19 @@ fn run(cli: Cli) -> Result<bool, GnomonError> {
             x64_cpu,
             arm64_cpu,
             bench,
+            bench_inputs,
+            bench_preset,
         } => {
             let eng = match &cli.state {
                 Some(p) => GnomonEngine::load_state_file(p)?,
                 None => GnomonEngine::new(),
             };
             let parsed_targets = parse_targets_csv(&targets)?;
+            let parsed_bench_inputs = bench_inputs
+                .as_deref()
+                .map(parse_bench_inputs_json)
+                .transpose()?;
+            let parsed_bench_preset = parse_bench_preset(&bench_preset)?;
             let (content, path) = if input == "-" {
                 let (bytes, _) = read_input_bytes(Some("-"))?;
                 let src = String::from_utf8(bytes).map_err(|e| {
@@ -826,6 +839,8 @@ fn run(cli: Cli) -> Result<bool, GnomonError> {
                 x64_cpu,
                 arm64_cpu,
                 bench,
+                bench_inputs: parsed_bench_inputs,
+                bench_preset: parsed_bench_preset,
             };
             let out = eng.profile(&req)?;
             println!(

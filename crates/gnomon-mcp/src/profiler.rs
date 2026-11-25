@@ -115,6 +115,63 @@ pub fn parse_targets_csv(raw: &str) -> Result<Vec<ProfileArch>, GnomonError> {
     Ok(out)
 }
 
+/// Built-in realistic hot-path input presets for `--bench` host microbenchmarking.
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize, schemars::JsonSchema,
+)]
+#[serde(rename_all = "kebab-case")]
+pub enum BenchPreset {
+    /// Deterministic pseudo-random positive values (original default).
+    #[default]
+    Default,
+    /// Realistic 8-byte ASCII digit words (`"00000000".."99999999"`) mixed with
+    /// occasional late-byte invalid edge cases (zero early-exit branch bias).
+    #[serde(alias = "ascii_digits")]
+    AsciiDigits,
+    /// Realistic OMS hot-path values: valid FSM states `0..=7`, valid events `0..=7`,
+    /// valid OUCH sides (`'B'`/`'S'`) & lengths `>= 48`, valid Barrett divisor/magic,
+    /// valid prices/qtys/bps, and live stack buffers for pointer parameters.
+    #[serde(alias = "oms_valid")]
+    OmsValid,
+}
+
+impl BenchPreset {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            BenchPreset::Default => "default",
+            BenchPreset::AsciiDigits => "ascii-digits",
+            BenchPreset::OmsValid => "oms-valid",
+        }
+    }
+}
+
+/// Parses a `--bench-preset` token (`default`, `ascii-digits`, `oms-valid`).
+pub fn parse_bench_preset(raw: &str) -> Result<BenchPreset, GnomonError> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "" | "default" => Ok(BenchPreset::Default),
+        "ascii-digits" | "ascii_digits" => Ok(BenchPreset::AsciiDigits),
+        "oms-valid" | "oms_valid" => Ok(BenchPreset::OmsValid),
+        other => Err(GnomonError::InvalidInput(format!(
+            "unknown --bench-preset '{other}' (expected default, ascii-digits, or oms-valid)"
+        ))),
+    }
+}
+
+/// Parses `--bench-inputs` JSON (array of argument tuples, e.g. `[[3689348814741910323]]`).
+pub fn parse_bench_inputs_json(raw: &str) -> Result<Vec<Vec<serde_json::Value>>, GnomonError> {
+    let parsed: Vec<Vec<serde_json::Value>> = serde_json::from_str(raw).map_err(|e| {
+        GnomonError::InvalidInput(format!(
+            "invalid --bench-inputs JSON (expected array of argument tuples, e.g. '[[3689348814741910323]]'): {e}"
+        ))
+    })?;
+    if parsed.is_empty() {
+        return Err(GnomonError::InvalidInput(
+            "--bench-inputs must contain at least one input tuple".into(),
+        ));
+    }
+    Ok(parsed)
+}
+
 /// Request parameters for single-function or ref-vs-opt native profiling.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ProfileRequest {
@@ -139,6 +196,13 @@ pub struct ProfileRequest {
     pub arm64_cpu: String,
     /// Opt-in 1,000,000-iteration native host x86-64 microbenchmark.
     pub bench: bool,
+    /// Optional explicit ring of hot-path input tuples for `--bench`
+    /// (supports ints, floats, bools, `"0x..."`/ASCII strings, and `"buf"`/arrays for pointers).
+    #[serde(default)]
+    pub bench_inputs: Option<Vec<Vec<serde_json::Value>>>,
+    /// Built-in realistic hot-path input preset for `--bench` (`default`, `ascii-digits`, `oms-valid`).
+    #[serde(default)]
+    pub bench_preset: BenchPreset,
 }
 
 impl Default for ProfileRequest {
@@ -154,6 +218,8 @@ impl Default for ProfileRequest {
             x64_cpu: DEFAULT_X64_CPU.to_string(),
             arm64_cpu: DEFAULT_ARM64_CPU.to_string(),
             bench: false,
+            bench_inputs: None,
+            bench_preset: BenchPreset::Default,
         }
     }
 }
@@ -193,6 +259,8 @@ pub struct FunctionProfile {
     pub targets: Vec<TargetProfile>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub host_ns_per_op: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bench_mode: Option<String>,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub notes: Vec<String>,
 }
@@ -301,6 +369,14 @@ pub fn profile_rust(
         req.arm64_cpu.trim().to_string()
     };
 
+    if let Some(ref inputs) = req.bench_inputs
+        && inputs.is_empty()
+    {
+        return Err(GnomonError::InvalidInput(
+            "bench_inputs must contain at least one input tuple".into(),
+        ));
+    }
+
     let primary = load_rust_source(req.content.as_deref(), req.path.as_deref(), "primary")?;
     let fallback_strata = registry.map(|reg| generate_strata_rs(reg, true));
 
@@ -327,6 +403,8 @@ pub fn profile_rust(
         &compiled_primary,
         &x64_cpu,
         req.bench,
+        req.bench_inputs.as_deref(),
+        req.bench_preset,
         fallback_strata.as_deref(),
     )?;
 
@@ -370,6 +448,8 @@ pub fn profile_rust(
         opt_compiled_ref,
         &x64_cpu,
         req.bench,
+        req.bench_inputs.as_deref(),
+        req.bench_preset,
         fallback_strata.as_deref(),
     )?;
 
@@ -1717,7 +1797,38 @@ fn split_top_level_commas(s: &str) -> Vec<&str> {
     parts
 }
 
-fn bench_param_setup_and_arg(idx: usize, ty: &str) -> Result<(Option<String>, String), String> {
+const PRESET_RING_LEN: usize = 256;
+
+fn splitmix64(state: &mut u64) -> u64 {
+    *state = state.wrapping_add(0x9e37_79b9_7f4a_7c15);
+    let mut z = *state;
+    z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    z ^ (z >> 31)
+}
+
+fn default_ptr_buffer_setup(idx: usize, ptr_ty: &str) -> (String, String) {
+    let is_mut = ptr_ty.starts_with("*mut ");
+    let elem = ptr_ty
+        .strip_prefix("*const ")
+        .or_else(|| ptr_ty.strip_prefix("*mut "))
+        .unwrap_or("u8")
+        .trim();
+    let ptr_method = if is_mut { "as_mut_ptr" } else { "as_ptr" };
+    let setup = match elem {
+        "f32" => format!(
+            "let mut buf_{idx}: [f32; 128] = core::array::from_fn(|k| 100.25f32 + ((k & 15) as f32) * 0.25f32);"
+        ),
+        "f64" => format!(
+            "let mut buf_{idx}: [f64; 64] = core::array::from_fn(|k| 100.25f64 + ((k & 15) as f64) * 0.25f64);"
+        ),
+        _ => format!("let mut buf_{idx} = [0x3736_3534_3332_3130u64; 64];"),
+    };
+    let arg = format!("std::hint::black_box(buf_{idx}.{ptr_method}() as {ptr_ty})");
+    (setup, arg)
+}
+
+fn bench_param_setup_and_arg_default(idx: usize, ty: &str) -> Result<(Option<String>, String), String> {
     let t = ty.trim();
     // Deterministic non-trivial positive non-zero values (avoid div-by-0, i32::MIN/-1, NaN).
     let seed = format!(
@@ -1738,18 +1849,384 @@ fn bench_param_setup_and_arg(idx: usize, ty: &str) -> Result<(Option<String>, St
         "bool" => Ok((None, format!("std::hint::black_box(({seed} & 1u64) != 0)"))),
         "f32" => Ok((None, format!("std::hint::black_box((({seed} & 1023u64) as f32) * 0.125f32 + 1.0f32)"))),
         "f64" => Ok((None, format!("std::hint::black_box((({seed} & 1023u64) as f64) * 0.125f64 + 1.0f64)"))),
-        _ if t.starts_with("*const ") => {
-            let setup = format!("let mut buf_{idx} = [0x0102_0304_0506_0708u64; 64];");
-            let arg = format!("std::hint::black_box(buf_{idx}.as_ptr() as {t})");
-            Ok((Some(setup), arg))
-        }
-        _ if t.starts_with("*mut ") => {
-            let setup = format!("let mut buf_{idx} = [0x0102_0304_0506_0708u64; 64];");
-            let arg = format!("std::hint::black_box(buf_{idx}.as_mut_ptr() as {t})");
+        _ if t.starts_with("*const ") || t.starts_with("*mut ") => {
+            let (setup, arg) = default_ptr_buffer_setup(idx, t);
             Ok((Some(setup), arg))
         }
         other => Err(format!("unsupported bench parameter type '{other}'")),
     }
+}
+
+fn format_u64_for_int_type(u: u64, ty: &str) -> Result<String, String> {
+    match ty {
+        "u64" => Ok(format!("{u}u64")),
+        "i64" => Ok(format!("({u}u64 as i64)")),
+        "u32" => Ok(format!("({u}u64 as u32)")),
+        "i32" => Ok(format!("({u}u64 as i32)")),
+        "u16" => Ok(format!("({u}u64 as u16)")),
+        "i16" => Ok(format!("({u}u64 as i16)")),
+        "u8" => Ok(format!("({u}u64 as u8)")),
+        "i8" => Ok(format!("({u}u64 as i8)")),
+        "usize" => Ok(format!("({u}u64 as usize)")),
+        "isize" => Ok(format!("({u}u64 as isize)")),
+        other => Err(format!("expected integer type, got '{other}'")),
+    }
+}
+
+fn format_i64_for_int_type(n: i64, ty: &str) -> Result<String, String> {
+    match ty {
+        "i64" => Ok(format!("{n}i64")),
+        "u64" => Ok(format!("({n}i64 as u64)")),
+        "i32" => Ok(format!("({n}i64 as i32)")),
+        "u32" => Ok(format!("({n}i64 as u32)")),
+        "i16" => Ok(format!("({n}i64 as i16)")),
+        "u16" => Ok(format!("({n}i64 as u16)")),
+        "i8" => Ok(format!("({n}i64 as i8)")),
+        "u8" => Ok(format!("({n}i64 as u8)")),
+        "isize" => Ok(format!("({n}i64 as isize)")),
+        "usize" => Ok(format!("({n}i64 as usize)")),
+        other => Err(format!("expected integer type, got '{other}'")),
+    }
+}
+
+fn format_json_scalar_literal(val: &serde_json::Value, ty: &str) -> Result<String, String> {
+    let t = ty.trim();
+    match t {
+        "u64" | "i64" | "u32" | "i32" | "u16" | "i16" | "u8" | "i8" | "usize" | "isize" => {
+            if let Some(u) = val.as_u64() {
+                format_u64_for_int_type(u, t)
+            } else if let Some(n) = val.as_i64() {
+                format_i64_for_int_type(n, t)
+            } else if let Some(b) = val.as_bool() {
+                format_u64_for_int_type(u64::from(b), t)
+            } else if let Some(s) = val.as_str() {
+                let st = s.trim();
+                if let Some(hex) = st.strip_prefix("0x").or_else(|| st.strip_prefix("0X")) {
+                    let clean: String = hex.chars().filter(|&c| c != '_').collect();
+                    let u = u64::from_str_radix(&clean, 16)
+                        .map_err(|_| format!("invalid hex literal '{s}' for type '{t}'"))?;
+                    format_u64_for_int_type(u, t)
+                } else {
+                    let bytes = s.as_bytes();
+                    match t {
+                        "u8" | "i8" if bytes.len() == 1 => {
+                            format_u64_for_int_type(u64::from(bytes[0]), t)
+                        }
+                        "u32" | "i32" if !bytes.is_empty() && bytes.len() <= 4 => {
+                            let mut arr = [b'0'; 4];
+                            arr[..bytes.len()].copy_from_slice(bytes);
+                            format_u64_for_int_type(u64::from(u32::from_le_bytes(arr)), t)
+                        }
+                        "u64" | "i64" if !bytes.is_empty() && bytes.len() <= 8 => {
+                            let mut arr = [b'0'; 8];
+                            arr[..bytes.len()].copy_from_slice(bytes);
+                            format_u64_for_int_type(u64::from_le_bytes(arr), t)
+                        }
+                        _ => Err(format!(
+                            "cannot convert string '{s}' to parameter type '{t}'"
+                        )),
+                    }
+                }
+            } else {
+                Err(format!("expected integer for parameter type '{t}', got {val}"))
+            }
+        }
+        "f32" => {
+            let f = val
+                .as_f64()
+                .ok_or_else(|| format!("expected float for parameter type 'f32', got {val}"))?;
+            Ok(format!("f32::from_bits({:#010x}u32)", (f as f32).to_bits()))
+        }
+        "f64" => {
+            let f = val
+                .as_f64()
+                .ok_or_else(|| format!("expected float for parameter type 'f64', got {val}"))?;
+            Ok(format!("f64::from_bits({:#018x}u64)", f.to_bits()))
+        }
+        "bool" => {
+            if let Some(b) = val.as_bool() {
+                Ok(if b { "true".to_string() } else { "false".to_string() })
+            } else if let Some(u) = val.as_u64() {
+                Ok(if u != 0 { "true".to_string() } else { "false".to_string() })
+            } else if let Some(n) = val.as_i64() {
+                Ok(if n != 0 { "true".to_string() } else { "false".to_string() })
+            } else {
+                Err(format!("expected bool for parameter type 'bool', got {val}"))
+            }
+        }
+        other => Err(format!("unsupported bench scalar parameter type '{other}'")),
+    }
+}
+
+fn format_custom_ptr_param(
+    idx: usize,
+    ptr_ty: &str,
+    values: &[&serde_json::Value],
+    slot_expr: &str,
+) -> Result<(String, String), String> {
+    let is_mut = ptr_ty.starts_with("*mut ");
+    let elem_ty = ptr_ty
+        .strip_prefix("*const ")
+        .or_else(|| ptr_ty.strip_prefix("*mut "))
+        .unwrap_or("u8")
+        .trim();
+    let ptr_method = if is_mut { "as_mut_ptr" } else { "as_ptr" };
+
+    let is_placeholder = |v: &serde_json::Value| -> bool {
+        v.is_null()
+            || v.is_i64()
+            || v.is_u64()
+            || matches!(v.as_str(), Some("buf" | "ptr" | "buffer" | ""))
+    };
+
+    if values.iter().all(|v| is_placeholder(v)) {
+        return Ok(default_ptr_buffer_setup(idx, ptr_ty));
+    }
+
+    // Check if any tuple supplies an explicit array of element literals or a byte string.
+    let mut max_len = 64usize;
+    for v in values {
+        if let Some(arr) = v.as_array() {
+            max_len = max_len.max(arr.len());
+        } else if let Some(s) = v.as_str()
+            && !matches!(s, "buf" | "ptr" | "buffer" | "")
+        {
+            max_len = max_len.max(s.len());
+        }
+    }
+
+    let default_elem = match elem_ty {
+        "f32" => "100.0f32",
+        "f64" => "100.0f64",
+        "bool" => "false",
+        "u8" | "i8" | "u16" | "i16" | "u32" | "i32" | "u64" | "i64" | "usize" | "isize" => "0",
+        other => {
+            return Err(format!(
+                "unsupported custom buffer element type '{other}' for pointer '{ptr_ty}'"
+            ));
+        }
+    };
+
+    let mut rows = Vec::with_capacity(values.len());
+    for v in values {
+        let mut elems = Vec::with_capacity(max_len);
+        if let Some(arr) = v.as_array() {
+            for item in arr {
+                elems.push(format_json_scalar_literal(item, elem_ty)?);
+            }
+            while elems.len() < max_len {
+                elems.push(default_elem.to_string());
+            }
+        } else if let Some(s) = v.as_str()
+            && !matches!(s, "buf" | "ptr" | "buffer" | "")
+            && matches!(elem_ty, "u8" | "i8")
+        {
+            for &b in s.as_bytes() {
+                elems.push(format_u64_for_int_type(u64::from(b), elem_ty)?);
+            }
+            while elems.len() < max_len {
+                elems.push(default_elem.to_string());
+            }
+        } else if is_placeholder(v) {
+            for _ in 0..max_len {
+                elems.push(default_elem.to_string());
+            }
+        } else {
+            return Err(format!(
+                "expected null/\"buf\"/0, element array, or byte string for pointer parameter '{ptr_ty}', got {v}"
+            ));
+        }
+        rows.push(format!("[{}]", elems.join(", ")));
+    }
+
+    let setup = format!(
+        "let mut bufs_{idx}: [[{elem_ty}; {max_len}]; {}] = [{}];",
+        values.len(),
+        rows.join(", ")
+    );
+    let arg = if values.len() == 1 {
+        format!("std::hint::black_box(bufs_{idx}[0].{ptr_method}() as {ptr_ty})")
+    } else {
+        format!("std::hint::black_box(bufs_{idx}[{slot_expr}].{ptr_method}() as {ptr_ty})")
+    };
+    Ok((setup, arg))
+}
+
+fn generate_ascii_digit_word(k: usize, rng: &mut u64) -> u64 {
+    // Include canonical edge cases in slots 0..4, then 87.5% valid 8-byte ASCII digits
+    // mixed with 12.5% late-byte (bytes 5..7) invalid delimiters so branchy loops run deep.
+    match k {
+        0 => u64::from_le_bytes(*b"00000000"),
+        1 => u64::from_le_bytes(*b"99999999"),
+        2 => u64::from_le_bytes(*b"33333333"),
+        3 => u64::from_le_bytes(*b"12345678"),
+        _ => {
+            let mut bytes = [0u8; 8];
+            let r1 = splitmix64(rng);
+            for (b_idx, slot) in bytes.iter_mut().enumerate() {
+                *slot = b'0' + (((r1 >> (b_idx * 8)) as u8) % 10);
+            }
+            let r2 = splitmix64(rng);
+            if (r2 & 7) == 0 {
+                // Inject a realistic late-byte non-digit (bytes 5, 6, or 7) ~12.5% of the time.
+                const BAD_CHARS: [u8; 8] = [b'/', b':', b'.', b' ', b'A', b';', b'-', 0];
+                let bad_pos = 5 + ((r2 >> 8) as usize % 3);
+                bytes[bad_pos] = BAD_CHARS[((r2 >> 16) as usize) & 7];
+            }
+            u64::from_le_bytes(bytes)
+        }
+    }
+}
+
+fn generate_oms_valid_u64(entry: &str, pname: &str, ty: &str, k: usize, rng: &mut u64) -> u64 {
+    let fn_lower = entry.to_ascii_lowercase();
+    let norm = pname.trim_start_matches('_').to_ascii_lowercase();
+    if fn_lower.contains("fix")
+        || fn_lower.contains("digit")
+        || fn_lower.contains("ascii")
+        || norm.contains("ascii")
+        || norm.contains("digit")
+        || norm.contains("fix")
+    {
+        return generate_ascii_digit_word(k, rng);
+    }
+
+    let r = splitmix64(rng);
+    match norm.as_str() {
+        "d" | "denom" | "divisor" => 13,
+        "magic" => (1u64 << 32) / 13, // 330_382_099
+        "state" | "st" => {
+            // Cover all 8 valid states 0..=7, favoring active states 0..=4 (75%).
+            if (r & 3) == 0 {
+                5 + ((r >> 8) % 3)
+            } else {
+                (r >> 8) % 5
+            }
+        }
+        "event" | "ev" => r & 7,
+        "max_qty" | "max_shares" | "limit" | "cap" => 1_000,
+        "qty" | "shares" | "parent_qty" | "q0" | "q1" | "q2" | "q3" => {
+            if (r & 15) == 0 {
+                1_200
+            } else {
+                1 + (r % 900)
+            }
+        }
+        "risk_flags" | "flags" => match r & 15 {
+            0 => 1,
+            1 => 2,
+            2 => 4,
+            3..=8 => 12, // short + locate confirmed (valid)
+            _ => 0,
+        },
+        "collar_ok" => u64::from((r & 15) != 0),
+        "kill_switch" | "halted" => 0,
+        "meta" => {
+            let side = if (r & 1) == 0 {
+                u64::from(b'B')
+            } else {
+                u64::from(b'S')
+            };
+            let tif = (r >> 8) % 3_600;
+            let shares = 1 + ((r >> 20) % 10_000);
+            (side << 56) | (tif << 32) | shares
+        }
+        "side" => {
+            if matches!(ty, "u8" | "i8") {
+                if (r & 1) == 0 {
+                    u64::from(b'B')
+                } else {
+                    u64::from(b'S')
+                }
+            } else {
+                r & 1
+            }
+        }
+        "tick" | "tick_size" => {
+            const TICKS: [u64; 7] = [1, 2, 4, 8, 16, 32, 64];
+            TICKS[(r as usize) % TICKS.len()]
+        }
+        "key" => 1 + (r % 65_535),
+        "cl_ord_id" | "order_id" | "symbol" | "seed" | "salt" => r | 1,
+        other if other == "len" || other.ends_with("_len") || other.contains("len") => {
+            64 + (r % 192)
+        }
+        other if other.contains("notional") => 1_000_000_000,
+        other if other.contains("bps") => 50 + (r % 450),
+        other
+            if other.contains("price")
+                || matches!(other, "p0" | "p1" | "p2" | "p3" | "bid" | "ask") =>
+        {
+            10_000 + (r % 190_000)
+        }
+        _ => 1 + (r % 64),
+    }
+}
+
+fn bench_param_setup_and_arg_preset(
+    preset: BenchPreset,
+    entry: &str,
+    idx: usize,
+    pname: &str,
+    ty: &str,
+    slot_expr: &str,
+) -> Result<(Option<String>, String), String> {
+    let t = ty.trim();
+    if t.starts_with("*const ") || t.starts_with("*mut ") {
+        let (setup, arg) = default_ptr_buffer_setup(idx, t);
+        return Ok((Some(setup), arg));
+    }
+
+    let mut rng = 0x676e_6f6d_6f6e_3031u64
+        ^ ((idx as u64 + 1).wrapping_mul(0x517c_c1b7_2722_0a95))
+        ^ match preset {
+            BenchPreset::Default => 0,
+            BenchPreset::AsciiDigits => 0x1111_2222_3333_4444,
+            BenchPreset::OmsValid => 0x5555_6666_7777_8888,
+        };
+
+    let mut literals = Vec::with_capacity(PRESET_RING_LEN);
+    for k in 0..PRESET_RING_LEN {
+        match t {
+            "u64" | "i64" | "u32" | "i32" | "u16" | "i16" | "u8" | "i8" | "usize" | "isize" => {
+                let raw = match preset {
+                    BenchPreset::AsciiDigits => {
+                        let norm = pname.trim_start_matches('_').to_ascii_lowercase();
+                        if norm == "len" || norm.ends_with("_len") {
+                            64
+                        } else {
+                            generate_ascii_digit_word(k, &mut rng)
+                        }
+                    }
+                    BenchPreset::OmsValid => generate_oms_valid_u64(entry, pname, t, k, &mut rng),
+                    BenchPreset::Default => splitmix64(&mut rng) | 1,
+                };
+                literals.push(format_u64_for_int_type(raw, t)?);
+            }
+            "f32" => {
+                let r = splitmix64(&mut rng);
+                let f = 100.0f32 + ((r & 255) as f32) * 0.25f32;
+                literals.push(format!("f32::from_bits({:#010x}u32)", f.to_bits()));
+            }
+            "f64" => {
+                let r = splitmix64(&mut rng);
+                let f = 100.0f64 + ((r & 255) as f64) * 0.25f64;
+                literals.push(format!("f64::from_bits({:#018x}u64)", f.to_bits()));
+            }
+            "bool" => {
+                let r = splitmix64(&mut rng);
+                literals.push(if (r & 1) != 0 { "true" } else { "false" }.to_string());
+            }
+            other => return Err(format!("unsupported bench parameter type '{other}'")),
+        }
+    }
+
+    let setup = format!(
+        "const INPUT_{idx}: [{t}; {PRESET_RING_LEN}] = [{}];",
+        literals.join(", ")
+    );
+    let arg = format!("std::hint::black_box(INPUT_{idx}[{slot_expr}])");
+    Ok((Some(setup), arg))
 }
 
 fn bench_ret_mix(ret_ty: &str, call_expr: &str) -> Result<String, String> {
@@ -1765,33 +2242,144 @@ fn bench_ret_mix(ret_ty: &str, call_expr: &str) -> Result<String, String> {
     }
 }
 
+struct HostBenchResult {
+    ns_per_op: Option<f64>,
+    note: Option<String>,
+    mode: Option<String>,
+}
+
+impl HostBenchResult {
+    fn skipped(note: String) -> Self {
+        Self { ns_per_op: None, note: Some(note), mode: None }
+    }
+}
+
 fn run_host_microbench(
     loaded: &LoadedSource,
     entry: &str,
     x64_cpu: &str,
+    bench_inputs: Option<&[Vec<serde_json::Value>]>,
+    bench_preset: BenchPreset,
     fallback_strata_rs: Option<&str>,
-) -> (Option<f64>, Option<String>) {
+) -> Result<HostBenchResult, GnomonError> {
     let Some(sig) = parse_extern_c_signature(&loaded.src, entry) else {
-        return (
-            None,
-            Some(format!("host microbenchmark skipped: could not parse Rust signature for '{entry}'")),
-        );
+        return Ok(HostBenchResult::skipped(format!(
+            "host microbenchmark skipped: could not parse Rust signature for '{entry}'"
+        )));
     };
 
     let mut setups = Vec::new();
     let mut arg_exprs = Vec::new();
     let mut extern_params = Vec::new();
-    for (idx, (_pname, pty)) in sig.params.iter().enumerate() {
-        extern_params.push(format!("p{idx}: {pty}"));
-        match bench_param_setup_and_arg(idx, pty) {
-            Ok((setup, arg)) => {
-                if let Some(s) = setup {
-                    setups.push(s);
+    let mut slot_decl: Option<String> = None;
+    let mut use_lcg_slot = false;
+    let bench_mode: String;
+
+    if let Some(tuples) = bench_inputs {
+        if tuples.is_empty() {
+            return Err(GnomonError::InvalidInput(
+                "bench_inputs must contain at least one input tuple".into(),
+            ));
+        }
+        for (t_idx, tuple) in tuples.iter().enumerate() {
+            if tuple.len() != sig.params.len() {
+                return Err(GnomonError::InvalidInput(format!(
+                    "bench_inputs[{t_idx}] arity mismatch for '{entry}': expected {} argument(s), got {}",
+                    sig.params.len(),
+                    tuple.len()
+                )));
+            }
+        }
+        let n = tuples.len();
+        bench_mode = format!("custom:{n}_tuples");
+        let slot_expr = if n == 1 {
+            "0usize".to_string()
+        } else if n.is_power_of_two() {
+            slot_decl = Some(format!("let slot = (i as usize) & {};", n - 1));
+            "slot".to_string()
+        } else {
+            slot_decl = Some(format!("let slot = (i as usize) % {n};"));
+            "slot".to_string()
+        };
+
+        for (idx, (_pname, pty)) in sig.params.iter().enumerate() {
+            extern_params.push(format!("p{idx}: {pty}"));
+            let t = pty.trim();
+            let col_vals: Vec<&serde_json::Value> = tuples.iter().map(|row| &row[idx]).collect();
+            if t.starts_with("*const ") || t.starts_with("*mut ") {
+                let (setup, arg) = format_custom_ptr_param(idx, t, &col_vals, &slot_expr)
+                    .map_err(|reason| {
+                        GnomonError::InvalidInput(format!(
+                            "invalid bench_inputs for '{entry}' param {idx}: {reason}"
+                        ))
+                    })?;
+                setups.push(setup);
+                arg_exprs.push(arg);
+            } else {
+                let mut lits = Vec::with_capacity(n);
+                for (t_idx, val) in col_vals.iter().enumerate() {
+                    let lit = format_json_scalar_literal(val, t).map_err(|reason| {
+                        GnomonError::InvalidInput(format!(
+                            "invalid bench_inputs[{t_idx}][{idx}] for '{entry}': {reason}"
+                        ))
+                    })?;
+                    lits.push(lit);
                 }
+                setups.push(format!("const INPUT_{idx}: [{t}; {n}] = [{}];", lits.join(", ")));
+                let arg = if n == 1 {
+                    format!("std::hint::black_box(INPUT_{idx}[0])")
+                } else {
+                    format!("std::hint::black_box(INPUT_{idx}[{slot_expr}])")
+                };
                 arg_exprs.push(arg);
             }
-            Err(reason) => {
-                return (None, Some(format!("host microbenchmark skipped: {reason}")));
+        }
+    } else if bench_preset == BenchPreset::Default {
+        bench_mode = format!("preset:{}", bench_preset.as_str());
+        for (idx, (_pname, pty)) in sig.params.iter().enumerate() {
+            extern_params.push(format!("p{idx}: {pty}"));
+            match bench_param_setup_and_arg_default(idx, pty) {
+                Ok((setup, arg)) => {
+                    if let Some(s) = setup {
+                        setups.push(s);
+                    }
+                    arg_exprs.push(arg);
+                }
+                Err(reason) => {
+                    return Ok(HostBenchResult::skipped(format!(
+                        "host microbenchmark skipped: {reason}"
+                    )));
+                }
+            }
+        }
+    } else {
+        bench_mode = format!("preset:{}", bench_preset.as_str());
+        let has_scalar = sig.params.iter().any(|(_, pty)| {
+            let t = pty.trim();
+            !t.starts_with("*const ") && !t.starts_with("*mut ")
+        });
+        if has_scalar {
+            // Non-repeating 64-bit LCG index into the 256-entry hot-path table so TAGE branch
+            // predictors cannot memorize a periodic ring on branchy FSM / SWAR ref kernels.
+            use_lcg_slot = true;
+            slot_decl = Some(
+                "rng = rng.wrapping_mul(6364136223846793005u64).wrapping_add(1442695040888963407u64); let slot = (rng >> 56) as usize;".to_string(),
+            );
+        }
+        for (idx, (pname, pty)) in sig.params.iter().enumerate() {
+            extern_params.push(format!("p{idx}: {pty}"));
+            match bench_param_setup_and_arg_preset(bench_preset, entry, idx, pname, pty, "slot") {
+                Ok((setup, arg)) => {
+                    if let Some(s) = setup {
+                        setups.push(s);
+                    }
+                    arg_exprs.push(arg);
+                }
+                Err(reason) => {
+                    return Ok(HostBenchResult::skipped(format!(
+                        "host microbenchmark skipped: {reason}"
+                    )));
+                }
             }
         }
     }
@@ -1799,7 +2387,11 @@ fn run_host_microbench(
     let call_expr = format!("unsafe {{ {entry}({}) }}", arg_exprs.join(", "));
     let mix_stmt = match bench_ret_mix(&sig.ret_ty, &call_expr) {
         Ok(s) => s,
-        Err(reason) => return (None, Some(format!("host microbenchmark skipped: {reason}"))),
+        Err(reason) => {
+            return Ok(HostBenchResult::skipped(format!(
+                "host microbenchmark skipped: {reason}"
+            )));
+        }
     };
 
     let ret_decl = if sig.ret_ty.trim().is_empty() || sig.ret_ty.trim() == "()" {
@@ -1817,24 +2409,51 @@ fn run_host_microbench(
         let _ = writeln!(harness, "    {s}");
     }
     let _ = writeln!(harness, "    let mut acc: u64 = 1;");
+    if use_lcg_slot {
+        let _ = writeln!(harness, "    let mut rng: u64 = 0x243f_6a88_85a3_08d3;");
+    }
     let _ = writeln!(harness, "    for i in 0..{BENCH_WARMUP_ITERS}u64 {{");
+    if let Some(ref sd) = slot_decl {
+        let _ = writeln!(harness, "        {sd}");
+        if use_lcg_slot {
+            let _ = writeln!(harness, "        let _ = i;");
+        }
+    } else if sig.params.is_empty() || bench_inputs.is_some_and(|t| t.len() == 1) {
+        let _ = writeln!(harness, "        let _ = i;");
+    }
     let _ = writeln!(harness, "        {mix_stmt}");
     let _ = writeln!(harness, "    }}");
-    let _ = writeln!(harness, "    let t0 = std::time::Instant::now();");
-    let _ = writeln!(harness, "    for i in 0..{BENCH_TIMED_ITERS}u64 {{");
-    let _ = writeln!(harness, "        {mix_stmt}");
+    let _ = writeln!(harness, "    let mut best_ns = f64::INFINITY;");
+    let _ = writeln!(harness, "    for _trial in 0..3 {{");
+    if use_lcg_slot {
+        let _ = writeln!(harness, "        rng = 0x243f_6a88_85a3_08d3;");
+    }
+    let _ = writeln!(harness, "        let t0 = std::time::Instant::now();");
+    let _ = writeln!(harness, "        for i in 0..{BENCH_TIMED_ITERS}u64 {{");
+    if let Some(ref sd) = slot_decl {
+        let _ = writeln!(harness, "            {sd}");
+        if use_lcg_slot {
+            let _ = writeln!(harness, "            let _ = i;");
+        }
+    } else if sig.params.is_empty() || bench_inputs.is_some_and(|t| t.len() == 1) {
+        let _ = writeln!(harness, "            let _ = i;");
+    }
+    let _ = writeln!(harness, "            {mix_stmt}");
+    let _ = writeln!(harness, "        }}");
+    let _ = writeln!(harness, "        let ns = t0.elapsed().as_nanos() as f64 / {BENCH_TIMED_ITERS}.0;");
+    let _ = writeln!(harness, "        if ns < best_ns {{ best_ns = ns; }}");
     let _ = writeln!(harness, "    }}");
-    let _ = writeln!(harness, "    let dt = t0.elapsed();");
     let _ = writeln!(harness, "    std::hint::black_box(acc);");
-    let _ = writeln!(
-        harness,
-        "    println!(\"{{:.6}}\", dt.as_nanos() as f64 / {BENCH_TIMED_ITERS}.0);"
-    );
+    let _ = writeln!(harness, "    println!(\"{{:.6}}\", best_ns);");
     let _ = writeln!(harness, "}}");
 
     let tmp = match TempDirGuard::new("gnomon_bench") {
         Ok(t) => t,
-        Err(e) => return (None, Some(format!("host microbenchmark temp dir failed: {e}"))),
+        Err(e) => {
+            return Ok(HostBenchResult::skipped(format!(
+                "host microbenchmark temp dir failed: {e}"
+            )));
+        }
     };
     let (sanitized, _) = sanitize_for_native_asm(&loaded.src);
     let bench_src = strip_panic_handler(&sanitized);
@@ -1846,13 +2465,19 @@ fn run_host_microbench(
         fallback_strata_rs,
     ) {
         Ok(p) => p,
-        Err(e) => return (None, Some(format!("host microbenchmark staging failed: {e}"))),
+        Err(e) => {
+            return Ok(HostBenchResult::skipped(format!(
+                "host microbenchmark staging failed: {e}"
+            )));
+        }
     };
     let obj_path = tmp.path().join("target.o");
     let harness_path = tmp.path().join("harness.rs");
     let bin_path = tmp.path().join("bench_bin");
     if let Err(e) = std::fs::write(&harness_path, &harness) {
-        return (None, Some(format!("host microbenchmark harness write failed: {e}")));
+        return Ok(HostBenchResult::skipped(format!(
+            "host microbenchmark harness write failed: {e}"
+        )));
     }
 
     let rustc = find_rustc_binary();
@@ -1874,16 +2499,17 @@ fn run_host_microbench(
         .output()
     {
         Ok(o) => o,
-        Err(e) => return (None, Some(format!("host microbenchmark obj compile failed: {e}"))),
+        Err(e) => {
+            return Ok(HostBenchResult::skipped(format!(
+                "host microbenchmark obj compile failed: {e}"
+            )));
+        }
     };
     if !obj_out.status.success() {
-        return (
-            None,
-            Some(format!(
-                "host microbenchmark object build skipped: {}",
-                format_cmd_error("rustc --emit=obj", &obj_out)
-            )),
-        );
+        return Ok(HostBenchResult::skipped(format!(
+            "host microbenchmark object build skipped: {}",
+            format_cmd_error("rustc --emit=obj", &obj_out)
+        )));
     }
 
     let bin_out = match Command::new(&rustc)
@@ -1904,47 +2530,56 @@ fn run_host_microbench(
         .output()
     {
         Ok(o) => o,
-        Err(e) => return (None, Some(format!("host microbenchmark link failed: {e}"))),
+        Err(e) => {
+            return Ok(HostBenchResult::skipped(format!(
+                "host microbenchmark link failed: {e}"
+            )));
+        }
     };
     if !bin_out.status.success() {
-        return (
-            None,
-            Some(format!(
-                "host microbenchmark link skipped: {}",
-                format_cmd_error("rustc bench bin", &bin_out)
-            )),
-        );
+        return Ok(HostBenchResult::skipped(format!(
+            "host microbenchmark link skipped: {}",
+            format_cmd_error("rustc bench bin", &bin_out)
+        )));
     }
 
     let run_out = match Command::new(&bin_path).output() {
         Ok(o) => o,
-        Err(e) => return (None, Some(format!("host microbenchmark execution failed: {e}"))),
+        Err(e) => {
+            return Ok(HostBenchResult::skipped(format!(
+                "host microbenchmark execution failed: {e}"
+            )));
+        }
     };
     if !run_out.status.success() {
-        return (
-            None,
-            Some(format!(
-                "host microbenchmark exited abnormally ({}); target may dereference non-host pointers",
-                run_out.status
-            )),
-        );
+        return Ok(HostBenchResult::skipped(format!(
+            "host microbenchmark exited abnormally ({}); target may dereference non-host pointers",
+            run_out.status
+        )));
     }
     let stdout = String::from_utf8_lossy(&run_out.stdout);
     match stdout.trim().parse::<f64>() {
-        Ok(ns) if ns.is_finite() && ns > 0.0 => (Some((ns * 10_000.0).round() / 10_000.0), None),
-        _ => (
-            None,
-            Some(format!("host microbenchmark returned non-numeric output: '{}'", stdout.trim())),
-        ),
+        Ok(ns) if ns.is_finite() && ns > 0.0 => Ok(HostBenchResult {
+            ns_per_op: Some((ns * 10_000.0).round() / 10_000.0),
+            note: None,
+            mode: Some(bench_mode),
+        }),
+        _ => Ok(HostBenchResult::skipped(format!(
+            "host microbenchmark returned non-numeric output: '{}'",
+            stdout.trim()
+        ))),
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_function_profile(
     loaded: &LoadedSource,
     entry: &str,
     compiled: &[CompiledTarget],
     x64_cpu: &str,
     bench: bool,
+    bench_inputs: Option<&[Vec<serde_json::Value>]>,
+    bench_preset: BenchPreset,
     fallback_strata_rs: Option<&str>,
 ) -> Result<FunctionProfile, GnomonError> {
     let mut target_profiles = Vec::with_capacity(compiled.len());
@@ -1981,14 +2616,21 @@ fn build_function_profile(
     }
 
     let mut fn_notes = Vec::new();
-    let host_ns_per_op = if bench {
-        let (ns, note) = run_host_microbench(loaded, entry, x64_cpu, fallback_strata_rs);
-        if let Some(n) = note {
+    let (host_ns_per_op, bench_mode) = if bench {
+        let res = run_host_microbench(
+            loaded,
+            entry,
+            x64_cpu,
+            bench_inputs,
+            bench_preset,
+            fallback_strata_rs,
+        )?;
+        if let Some(n) = res.note {
             fn_notes.push(n);
         }
-        ns
+        (res.ns_per_op, res.mode)
     } else {
-        None
+        (None, None)
     };
 
     Ok(FunctionProfile {
@@ -1996,6 +2638,7 @@ fn build_function_profile(
         source_path: loaded.path.as_ref().map(|p| p.display().to_string()),
         targets: target_profiles,
         host_ns_per_op,
+        bench_mode,
         notes: fn_notes,
     })
 }

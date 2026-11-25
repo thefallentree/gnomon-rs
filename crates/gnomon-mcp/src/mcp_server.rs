@@ -14,7 +14,9 @@ use serde::{Deserialize, Serialize};
 use crate::GnomonError;
 use crate::engine::{CheckContractRequest, ContractPred, GnomonEngine, prepare_goal_artifacts};
 use crate::ir_codec::{InputType, IrLawKind, IrTypedVar, IrVal, IrValType, LoadedArtifact};
-use crate::profiler::{DEFAULT_ARM64_CPU, DEFAULT_X64_CPU, ProfileArch, ProfileRequest};
+use crate::profiler::{
+    BenchPreset, DEFAULT_ARM64_CPU, DEFAULT_X64_CPU, ProfileArch, ProfileRequest,
+};
 
 /// Single stateful Gnomon MCP Server serving all 8 verification, abstraction & profiling tools.
 #[derive(Clone)]
@@ -411,6 +413,12 @@ pub struct ProfileParams {
     /// Run opt-in 1,000,000-iteration native host x86-64 microbenchmark (`host_ns_per_op`).
     #[serde(default)]
     pub bench: bool,
+    /// Optional explicit ring of hot-path input tuples for `bench: true` (JSON arrays of ints, floats, bools, hex/ASCII strings, or `"buf"`/`null`/arrays for pointer params).
+    #[serde(default)]
+    pub bench_inputs: Option<Vec<Vec<serde_json::Value>>>,
+    /// Built-in realistic hot-path input preset for `bench: true`: `"default"`, `"ascii-digits"`, or `"oms-valid"`.
+    #[serde(default)]
+    pub bench_preset: BenchPreset,
 }
 
 fn load_mcp_contract_pred(
@@ -815,6 +823,8 @@ impl GnomonMcpServer {
                     x64_cpu: p.x64_cpu.unwrap_or_else(|| DEFAULT_X64_CPU.to_string()),
                     arm64_cpu: p.arm64_cpu.unwrap_or_else(|| DEFAULT_ARM64_CPU.to_string()),
                     bench: p.bench,
+                    bench_inputs: p.bench_inputs,
+                    bench_preset: p.bench_preset,
                 };
                 eng.profile(&req)
             })

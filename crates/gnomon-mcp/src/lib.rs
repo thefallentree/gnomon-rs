@@ -25,9 +25,10 @@ pub use ir_codec::{
 };
 pub use mcp_server::{GnomonMcpServer, ProfileParams, SliceFrameParam};
 pub use profiler::{
-    DEFAULT_ARM64_CPU, DEFAULT_X64_CPU, FunctionProfile, ProfileArch, ProfileComparison,
-    ProfileOutput, ProfileRequest, TargetDelta, TargetProfile, parse_target_arch,
-    parse_targets_csv, profile_rust,
+    BenchPreset, DEFAULT_ARM64_CPU, DEFAULT_X64_CPU, FunctionProfile, ProfileArch,
+    ProfileComparison, ProfileOutput, ProfileRequest, TargetDelta, TargetProfile,
+    parse_bench_inputs_json, parse_bench_preset, parse_target_arch, parse_targets_csv,
+    profile_rust,
 };
 pub use rust_bridge::{
     bind_stratum_imports, compile_rust_to_wasm, compile_rust_to_wasm_with_registry,

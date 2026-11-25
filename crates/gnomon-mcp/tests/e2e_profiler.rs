@@ -145,6 +145,7 @@ fn test_profile_div_vs_barrett_x64_and_arm64() {
         x64_cpu: DEFAULT_X64_CPU.to_string(),
         arm64_cpu: DEFAULT_ARM64_CPU.to_string(),
         bench: false,
+        ..ProfileRequest::default()
     };
 
     let out = eng.profile(&req).expect("profile div vs barrett");
@@ -242,6 +243,7 @@ fn test_profile_register_spill_detection_x64_vs_arm64_and_lean() {
         x64_cpu: DEFAULT_X64_CPU.to_string(),
         arm64_cpu: DEFAULT_ARM64_CPU.to_string(),
         bench: false,
+        ..ProfileRequest::default()
     };
 
     let out = eng.profile(&req).expect("profile spill contrast");
@@ -424,7 +426,7 @@ fn test_profile_mcp_stdio_jsonrpc_live() {
         assert!(names.contains(&expected), "missing tool {expected}");
     }
 
-    // 3. tools/call -> gnomon_profile (compare mode with x64 + arm64 + bench)
+    // 3. tools/call -> gnomon_profile (compare mode with x64 + arm64 + bench + bench_preset)
     let resp = send_recv(
         &mut stdin,
         &mut reader,
@@ -441,7 +443,8 @@ fn test_profile_mcp_stdio_jsonrpc_live() {
                     "targets": ["x64", "arm64"],
                     "x64_cpu": "skylake",
                     "arm64_cpu": "neoverse-v2",
-                    "bench": true
+                    "bench": true,
+                    "bench_preset": "oms-valid"
                 }
             }
         }),
@@ -453,12 +456,119 @@ fn test_profile_mcp_stdio_jsonrpc_live() {
     assert_eq!(parsed["comparison"]["ref_entry"], "rem_hw_u32");
     assert_eq!(parsed["comparison"]["opt_entry"], "rem_barrett_u32");
     assert_eq!(parsed["comparison"]["target_deltas"].as_array().unwrap().len(), 2);
+    assert_eq!(parsed["profile"]["bench_mode"], "preset:oms-valid");
     assert!(parsed["profile"]["host_ns_per_op"].as_f64().unwrap() > 0.0);
     assert!(parsed["opt_profile"]["host_ns_per_op"].as_f64().unwrap() > 0.0);
+
+    // 4. tools/call -> gnomon_profile with explicit bench_inputs ring
+    let resp_inputs = send_recv(
+        &mut stdin,
+        &mut reader,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 4,
+            "method": "tools/call",
+            "params": {
+                "name": "gnomon_profile",
+                "arguments": {
+                    "content": DIV_VS_BARRETT_RS,
+                    "entry": "rem_hw_u32",
+                    "opt_entry": "rem_barrett_u32",
+                    "targets": ["x64"],
+                    "bench": true,
+                    "bench_inputs": [
+                        [12345, 13, 330382099],
+                        [54321, 13, 330382099]
+                    ]
+                }
+            }
+        }),
+    );
+    assert!(resp_inputs["error"].is_null(), "gnomon_profile bench_inputs MCP error: {resp_inputs}");
+    let text2 = resp_inputs["result"]["content"][0]["text"].as_str().unwrap();
+    let parsed2: Value = serde_json::from_str(text2).expect("parse bench_inputs JSON payload");
+    assert_eq!(parsed2["status"], "OK");
+    assert_eq!(parsed2["profile"]["bench_mode"], "custom:2_tuples");
+    assert!(parsed2["profile"]["host_ns_per_op"].as_f64().unwrap() > 0.0);
+    assert!(parsed2["opt_profile"]["host_ns_per_op"].as_f64().unwrap() > 0.0);
 
     drop(stdin);
     let status = child.wait().unwrap();
     assert!(status.success());
+}
+
+#[test]
+fn test_profile_bench_inputs_buffers_and_validation() {
+    let fixture = oms_fixture("s4_3_perf_opt_pairs.rs");
+    assert!(fixture.is_file(), "missing fixture {}", fixture.display());
+
+    // 1. Pointer array buffer binding for *const f32 parameters (VWAP)
+    let out = Command::new(gnomon_bin())
+        .args([
+            "profile",
+            fixture.to_str().unwrap(),
+            "--entry",
+            "oms_vwap_scalar_ref",
+            "--opt-entry",
+            "oms_vwap_vec_opt",
+            "--targets",
+            "x64",
+            "--bench",
+            "--bench-inputs",
+            "[[[100.25, 100.5, 100.75, 101.0], [10.0, 20.0, 30.0, 40.0]]]",
+        ])
+        .output()
+        .expect("run gnomon profile with float buffer bench-inputs");
+    assert!(
+        out.status.success(),
+        "vwap custom buffer bench failed:\nstdout={}\nstderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["status"], "OK");
+    assert_eq!(v["profile"]["bench_mode"], "custom:1_tuples");
+    assert!(v["profile"]["host_ns_per_op"].as_f64().unwrap() > 0.0);
+    assert!(v["opt_profile"]["host_ns_per_op"].as_f64().unwrap() > 0.0);
+
+    // 2. Arity mismatch in --bench-inputs returns clean exit code 2
+    let bad_arity = Command::new(gnomon_bin())
+        .args([
+            "profile",
+            fixture.to_str().unwrap(),
+            "--entry",
+            "oms_fix_digits_opt",
+            "--targets",
+            "x64",
+            "--bench",
+            "--bench-inputs",
+            "[[1, 2]]",
+        ])
+        .output()
+        .expect("run gnomon profile with bad arity");
+    assert_eq!(bad_arity.status.code(), Some(2));
+    assert!(
+        String::from_utf8_lossy(&bad_arity.stderr).contains("arity mismatch"),
+        "expected arity mismatch diagnostic, got: {}",
+        String::from_utf8_lossy(&bad_arity.stderr)
+    );
+
+    // 3. Unknown --bench-preset returns clean exit code 2
+    let bad_preset = Command::new(gnomon_bin())
+        .args([
+            "profile",
+            fixture.to_str().unwrap(),
+            "--entry",
+            "oms_fix_digits_opt",
+            "--targets",
+            "x64",
+            "--bench",
+            "--bench-preset",
+            "nonexistent-preset",
+        ])
+        .output()
+        .expect("run gnomon profile with unknown preset");
+    assert_eq!(bad_preset.status.code(), Some(2));
 }
 
 #[test]
@@ -488,6 +598,7 @@ pub extern "C" fn first_exported_after_cfg_panic(a: u64, b: u64) -> u64 {
         x64_cpu: DEFAULT_X64_CPU.to_string(),
         arm64_cpu: DEFAULT_ARM64_CPU.to_string(),
         bench: true,
+        ..ProfileRequest::default()
     };
     let out = eng.profile(&req).expect("profile cfg(wasm32) panic handler with bench");
     assert_eq!(out.status, "OK");
