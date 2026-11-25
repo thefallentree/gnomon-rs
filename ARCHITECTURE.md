@@ -7,7 +7,7 @@
 | **OS** | Ubuntu 22.04.5 LTS (`jammy`), `x86_64` | `glibc 2.35` |
 | **CPU** | Intel Xeon Gold 6132 @ 2.60 GHz (8 cores) | `avx2`, `avx512*`, `bmi1`, `bmi2`, `popcnt` |
 | **Memory / Disk** | 23 GiB RAM, 275 GiB free | — |
-| **Rust Compiler** | `rustc 1.100.0` (bundled LLVM `23.1.5`) | Edition `2024`, Resolver `2` |
+| **Rust Compiler** | `rustc 1.100.0` (bundled LLVM `23.1.5`) | Edition `2024`, Resolver `3` |
 | **Rust Targets** | `x86_64-unknown-linux-gnu`, `wasm32-unknown-unknown` | Includes `clippy`, `rustfmt`; ARM64 lowering via LLVM-23 `llc` + `llvm-mca` |
 | **Kani Verifier** | `Kani Rust Verifier 0.68.0` / `CBMC 6.11.0` | **15/15** TCB v2 harnesses verified green (`0` failures, `11m54.38s` total, `0` stubs/unwindsets) |
 | **Bitwuzla SMT** | `0.11.0` (source-built static release) | `QF_ABVFP` + `BV128`; static PIC `GMP 6.3.0` + `MPFR 4.2.1` in `~/.local/bitwuzla` |
@@ -25,7 +25,7 @@ export CXX="/usr/lib/llvm-23/bin/clang++"
 ### Locked Workspace Crate Versions (`Cargo.toml`)
 - `wasmparser = "0.263.0"`, `wasm-encoder = "0.263.0"`, `wasm-smith = "0.263.0"`, `wasmtime = "51.0.0"`, `arbitrary = "1.5.0"`
 - `egglog = "3.0.0"`, `bitwuzla = { version = "0.11.0", features = ["static"] }`, `stitch_core = "0.1.0"`
-- `rmcp = "3.11.0"`, `tokio = "1.54.1"`, `serde = "1.0.229"`, `serde_json = "1.0.154"`, `schemars = "1"`, `clap = "4"`, `sha2 = "0.10"`, `base64 = "0.22"`, `thiserror = "2.0.21"`, `proptest = "1.12.0"`
+- `rmcp = "3.11.0"`, `tokio = "1.54.1"`, `serde = "1.0.229"`, `serde_json = "1.0.154"`, `schemars = "1.2.3"`, `clap = "4.6.10"`, `sha2 = "0.11.1"`, `base64 = "0.23.1"`, `thiserror = "2.0.21"`, `proptest = "1.12.0"`
 
 ---
 

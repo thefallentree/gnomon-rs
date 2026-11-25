@@ -6,7 +6,7 @@ members = [
     "crates/gnomon-mcp",
     "crates/gnomon-bench",
 ]
-resolver = "2"
+resolver = "3"
 
 [workspace.package]
 version = "0.1.0"
@@ -29,7 +29,9 @@ gnomon-wasm = { path = "crates/gnomon-wasm" }
 gnomon-sieve = { path = "crates/gnomon-sieve" }
 wasmparser = "0.263.0"
 wasm-encoder = "0.263.0"
+wasm-smith = "0.263.0"
 wasmtime = "51.0.0"
+arbitrary = "1.5.0"
 egglog = "3.0.0"
 bitwuzla = { version = "0.11.0", features = ["static"] }
 stitch_core = "0.1.0"
@@ -37,5 +39,9 @@ rmcp = "3.11.0"
 tokio = { version = "1.54.1", features = ["full"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
+schemars = "1.2.3"
+clap = { version = "4.6.10", features = ["derive"] }
+sha2 = "0.11.1"
+base64 = "0.23.1"
 thiserror = "2.0.21"
 proptest = "1.12.0"
