@@ -72,16 +72,21 @@ fn vp_rs(name: &str) -> PathBuf {
     p
 }
 
-/// Resolves prebuilt `examples/<subdir>/out/<name>.wasm` or compiles `examples/<subdir>/<name>.rs`
-/// into `tmp_dir` on demand so tests remain green even on a clean checkout without `out/`.
+/// Resolves prebuilt `examples/<subdir>/out/<name>.wasm` when it is at least as new as
+/// `examples/<subdir>/<name>.rs`, or compiles the `.rs` source into `tmp_dir` on demand so
+/// tests remain green on a clean checkout AND never silently run against stale `.wasm` binaries.
 fn fixture_wasm(subdir: &str, name: &str, simd128: bool, tmp_dir: &Path) -> PathBuf {
     let dir = repo_root().join("examples").join(subdir);
-    let prebuilt = dir.join("out").join(format!("{name}.wasm"));
-    if prebuilt.is_file() {
-        return prebuilt;
-    }
     let src = dir.join(format!("{name}.rs"));
     assert!(src.is_file(), "missing fixture source: {}", src.display());
+    let prebuilt = dir.join("out").join(format!("{name}.wasm"));
+    if prebuilt.is_file()
+        && let (Ok(pre_meta), Ok(src_meta)) = (prebuilt.metadata(), src.metadata())
+        && let (Ok(pre_mtime), Ok(src_mtime)) = (pre_meta.modified(), src_meta.modified())
+        && pre_mtime >= src_mtime
+    {
+        return prebuilt;
+    }
     let out = tmp_dir.join(format!("{name}.wasm"));
     let mut cmd = Command::new("rustc");
     cmd.args([

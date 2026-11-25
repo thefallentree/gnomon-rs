@@ -610,8 +610,11 @@ fn strip_panic_handler(src: &str) -> String {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum IrFpTy {
+    Half,
+    BFloat,
     F32,
     F64,
+    Fp128,
     Other,
 }
 
@@ -644,54 +647,145 @@ fn is_ir_token_end(bytes: &[u8], end: usize) -> bool {
 
 /// Attempts to parse an LLVM 23.1+ special FP token (`+inf`, `-inf`, `+qnan`, `-qnan`,
 /// `+snan`, `-snan`, `±nan(0x...)`, `±snan(0x...)`) starting at `i` and returns
-/// `(end_index, bits64)`.
+/// `(end_index, llvm23_0_hex_literal)` for the active FP type (`half`, `bfloat`, `float`,
+/// `double`, `fp128`). Returns `None` outside a supported FP type context so non-FP tokens
+/// and unsupported formats (`x86_fp80`, `ppc_fp128`) are never corrupted.
 fn parse_llvm23_special_fp(
     ir: &str,
     i: usize,
     fp_ty: Option<IrFpTy>,
-) -> Option<(usize, u64)> {
+) -> Option<(usize, String)> {
+    let ty = fp_ty?;
+    if ty == IrFpTy::Other {
+        return None;
+    }
     let bytes = ir.as_bytes();
-    let sign_bit = match *bytes.get(i)? {
-        b'+' => 0u64,
-        b'-' => 1u64 << 63,
+    let is_neg = match *bytes.get(i)? {
+        b'+' => false,
+        b'-' => true,
         _ => return None,
     };
     let rest = &ir[i + 1..];
-    if rest.starts_with("inf") && is_ir_token_end(bytes, i + 4) && bytes.get(i + 4) != Some(&b'(') {
-        return Some((i + 4, sign_bit | 0x7FF0_0000_0000_0000));
+
+    enum SpecialKind {
+        Inf,
+        QNaN,
+        SNaN,
+        PayloadNaN { is_snan: bool, payload: u128 },
     }
-    if rest.starts_with("qnan") && is_ir_token_end(bytes, i + 5) && bytes.get(i + 5) != Some(&b'(')
+
+    let (end, kind) = if rest.starts_with("inf")
+        && is_ir_token_end(bytes, i + 4)
+        && bytes.get(i + 4) != Some(&b'(')
     {
-        return Some((i + 5, sign_bit | 0x7FF8_0000_0000_0000));
-    }
-    if rest.starts_with("snan") && is_ir_token_end(bytes, i + 5) && bytes.get(i + 5) != Some(&b'(')
+        (i + 4, SpecialKind::Inf)
+    } else if rest.starts_with("qnan")
+        && is_ir_token_end(bytes, i + 5)
+        && bytes.get(i + 5) != Some(&b'(')
     {
-        return Some((i + 5, sign_bit | 0x7FF4_0000_0000_0000));
-    }
-    let (is_snan, prefix_len) = if rest.starts_with("nan(0x") {
-        (false, 7usize) // "+nan(0x"
-    } else if rest.starts_with("snan(0x") {
-        (true, 8usize) // "+snan(0x"
+        (i + 5, SpecialKind::QNaN)
+    } else if rest.starts_with("snan")
+        && is_ir_token_end(bytes, i + 5)
+        && bytes.get(i + 5) != Some(&b'(')
+    {
+        (i + 5, SpecialKind::SNaN)
     } else {
-        return None;
-    };
-    let hex_start = i + prefix_len;
-    let mut hex_end = hex_start;
-    while hex_end < bytes.len() && bytes[hex_end].is_ascii_hexdigit() {
-        hex_end += 1;
-    }
-    if hex_end == hex_start || bytes.get(hex_end) != Some(&b')') {
-        return None;
-    }
-    let payload = u64::from_str_radix(&ir[hex_start..hex_end], 16).ok()?;
-    let quiet_bit = if is_snan { 0u64 } else { 1u64 << 51 };
-    let bits64 = match fp_ty {
-        Some(IrFpTy::F32) => {
-            sign_bit | 0x7FF0_0000_0000_0000 | quiet_bit | ((payload & 0x3F_FFFF) << 29)
+        let (is_snan, prefix_len) = if rest.starts_with("nan(0x") {
+            (false, 7usize) // "+nan(0x"
+        } else if rest.starts_with("snan(0x") {
+            (true, 8usize) // "+snan(0x"
+        } else {
+            return None;
+        };
+        let hex_start = i + prefix_len;
+        let mut hex_end = hex_start;
+        while hex_end < bytes.len() && bytes[hex_end].is_ascii_hexdigit() {
+            hex_end += 1;
         }
-        _ => sign_bit | 0x7FF0_0000_0000_0000 | quiet_bit | (payload & 0x0007_FFFF_FFFF_FFFF),
+        if hex_end == hex_start || bytes.get(hex_end) != Some(&b')') {
+            return None;
+        }
+        let payload = u128::from_str_radix(&ir[hex_start..hex_end], 16).ok()?;
+        (hex_end + 1, SpecialKind::PayloadNaN { is_snan, payload })
     };
-    Some((hex_end + 1, bits64))
+
+    let sign64 = if is_neg { 1u64 << 63 } else { 0u64 };
+    let sign16 = if is_neg { 1u16 << 15 } else { 0u16 };
+    let lit = match ty {
+        IrFpTy::F32 => {
+            let bits64 = match kind {
+                SpecialKind::Inf => sign64 | 0x7FF0_0000_0000_0000,
+                SpecialKind::QNaN => sign64 | 0x7FF8_0000_0000_0000,
+                SpecialKind::SNaN => sign64 | 0x7FF4_0000_0000_0000,
+                SpecialKind::PayloadNaN { is_snan, payload } => {
+                    let quiet_bit = if is_snan { 0u64 } else { 1u64 << 51 };
+                    sign64
+                        | 0x7FF0_0000_0000_0000
+                        | quiet_bit
+                        | (((payload as u64) & 0x3F_FFFF) << 29)
+                }
+            };
+            format!("0x{bits64:016X}")
+        }
+        IrFpTy::F64 => {
+            let bits64 = match kind {
+                SpecialKind::Inf => sign64 | 0x7FF0_0000_0000_0000,
+                SpecialKind::QNaN => sign64 | 0x7FF8_0000_0000_0000,
+                SpecialKind::SNaN => sign64 | 0x7FF4_0000_0000_0000,
+                SpecialKind::PayloadNaN { is_snan, payload } => {
+                    let quiet_bit = if is_snan { 0u64 } else { 1u64 << 51 };
+                    sign64
+                        | 0x7FF0_0000_0000_0000
+                        | quiet_bit
+                        | ((payload as u64) & 0x0007_FFFF_FFFF_FFFF)
+                }
+            };
+            format!("0x{bits64:016X}")
+        }
+        IrFpTy::Half => {
+            let bits16 = match kind {
+                SpecialKind::Inf => sign16 | 0x7C00,
+                SpecialKind::QNaN => sign16 | 0x7E00,
+                SpecialKind::SNaN => sign16 | 0x7D00,
+                SpecialKind::PayloadNaN { is_snan, payload } => {
+                    let quiet_bit = if is_snan { 0u16 } else { 0x0200 };
+                    sign16 | 0x7C00 | quiet_bit | ((payload as u16) & 0x01FF)
+                }
+            };
+            format!("0xH{bits16:04X}")
+        }
+        IrFpTy::BFloat => {
+            let bits16 = match kind {
+                SpecialKind::Inf => sign16 | 0x7F80,
+                SpecialKind::QNaN => sign16 | 0x7FC0,
+                SpecialKind::SNaN => sign16 | 0x7FA0,
+                SpecialKind::PayloadNaN { is_snan, payload } => {
+                    let quiet_bit = if is_snan { 0u16 } else { 0x0040 };
+                    sign16 | 0x7F80 | quiet_bit | ((payload as u16) & 0x003F)
+                }
+            };
+            format!("0xR{bits16:04X}")
+        }
+        IrFpTy::Fp128 => {
+            let (lo, hi) = match kind {
+                SpecialKind::Inf => (0u64, sign64 | 0x7FFF_0000_0000_0000),
+                SpecialKind::QNaN => (0u64, sign64 | 0x7FFF_8000_0000_0000),
+                SpecialKind::SNaN => (0u64, sign64 | 0x7FFF_4000_0000_0000),
+                SpecialKind::PayloadNaN { is_snan, payload } => {
+                    let quiet_bit = if is_snan { 0u64 } else { 1u64 << 47 };
+                    let lo = payload as u64;
+                    let hi = sign64
+                        | 0x7FFF_0000_0000_0000
+                        | quiet_bit
+                        | (((payload >> 64) as u64) & 0x0000_7FFF_FFFF_FFFF);
+                    (lo, hi)
+                }
+            };
+            format!("0xL{lo:016X}{hi:016X}")
+        }
+        IrFpTy::Other => return None,
+    };
+    Some((end, lit))
 }
 
 /// Attempts to parse a scientific-notation decimal float literal (`[-+]?[0-9]+\.[0-9]+[eE][+-][0-9]+`)
@@ -742,13 +836,13 @@ fn parse_inexact_f32_sci_literal(ir: &str, i: usize) -> Option<(usize, u64)> {
 }
 
 /// Normalizes LLVM 23.1+ textual IR floating-point literals into LLVM 23.0-compatible
-/// `0x<16-hex>` IEEE-754 binary64 hex encodings so IR emitted by `rustc 1.100+` (LLVM 23.1)
-/// lowers cleanly through system `llc-23` (23.0). Handles:
-/// - `f0x<8-hex>` (`float`) and `f0x<16-hex>` (`double`) hex literals
+/// hex encodings (`0x<16-hex>` for `float`/`double`, `0xH`/`0xR`/`0xL` for `half`/`bfloat`/`fp128`)
+/// so IR emitted by `rustc 1.100+` (LLVM 23.1) lowers cleanly through system `llc-23` (23.0). Handles:
+/// - `f0x<hex>` (`half`/`bfloat` 4-hex, `float` 8-hex, `double` 16-hex, `fp128` 32-hex) literals
 /// - `+inf`, `-inf`, `+qnan`, `-qnan`, `+snan`, `-snan`, `±nan(0x...)`, `±snan(0x...)`
 /// - `float` scientific-notation decimals (e.g. `1.000000e-01`, `1.401300e-45`) that round-trip
 ///   in `f32` but not losslessly through `f64`
-/// - Properly skips `;` line comments and double-quoted strings (including `\\` escapes).
+/// - Properly skips `;` line comments and double-quoted strings per LLVM's `LLLexer::LexQuote`.
 fn normalize_llvm_ir_for_llc(ir: &str) -> String {
     let bytes = ir.as_bytes();
     let mut out = String::with_capacity(ir.len() + 64);
@@ -768,23 +862,16 @@ fn normalize_llvm_ir_for_llc(ir: &str) -> String {
             continue;
         }
 
-        // 2. Copy double-quoted string literals verbatim (handling `\\` and `\"` escapes).
+        // 2. Copy double-quoted string literals verbatim.
+        // Per LLVM IR's LLLexer::LexQuote, strings always terminate at the next `"`
+        // (embedded quotes are hex-escaped as `\22`, never `\"`; `c"foo\"` is valid and ends at `"`).
         if b == b'"' {
             let start = i;
             i += 1;
-            while i < bytes.len() {
-                if bytes[i] == b'\\' {
-                    if i + 1 < bytes.len() && matches!(bytes[i + 1], b'\\' | b'"') {
-                        i += 2;
-                    } else {
-                        i += 1;
-                    }
-                    continue;
-                }
-                if bytes[i] == b'"' {
-                    i += 1;
-                    break;
-                }
+            while i < bytes.len() && bytes[i] != b'"' {
+                i += 1;
+            }
+            if i < bytes.len() {
                 i += 1;
             }
             out.push_str(&ir[start..i]);
@@ -793,7 +880,7 @@ fn normalize_llvm_ir_for_llc(ir: &str) -> String {
 
         // 3. Rewrite delimited LLVM 23.1 FP literals outside strings and comments.
         if is_ir_lit_left_delim(bytes, i) {
-            // 3a. `f0x<8-hex>` (float) and `f0x<16-hex>` (double)
+            // 3a. `f0x<hex>` (`half`/`bfloat` 4-hex, `float` 8-hex, `double` 16-hex, `fp128` 32-hex)
             if bytes[i..].starts_with(b"f0x") {
                 let hex_start = i + 3;
                 let mut hex_end = hex_start;
@@ -802,7 +889,19 @@ fn normalize_llvm_ir_for_llc(ir: &str) -> String {
                 }
                 let hex_len = hex_end - hex_start;
                 if is_ir_token_end(bytes, hex_end) {
-                    if hex_len == 8
+                    if hex_len == 4
+                        && matches!(last_fp_ty, Some(IrFpTy::Half | IrFpTy::BFloat))
+                        && let Ok(bits16) = u16::from_str_radix(&ir[hex_start..hex_end], 16)
+                    {
+                        let tag = if last_fp_ty == Some(IrFpTy::Half) {
+                            'H'
+                        } else {
+                            'R'
+                        };
+                        let _ = write!(out, "0x{tag}{bits16:04X}");
+                        i = hex_end;
+                        continue;
+                    } else if hex_len == 8
                         && let Ok(bits32) = u32::from_str_radix(&ir[hex_start..hex_end], 16)
                     {
                         let bits64 = f32_bits_to_f64_bits(bits32);
@@ -815,15 +914,24 @@ fn normalize_llvm_ir_for_llc(ir: &str) -> String {
                         let _ = write!(out, "0x{bits64:016X}");
                         i = hex_end;
                         continue;
+                    } else if hex_len == 32
+                        && last_fp_ty == Some(IrFpTy::Fp128)
+                        && let Ok(bits128) = u128::from_str_radix(&ir[hex_start..hex_end], 16)
+                    {
+                        let lo = bits128 as u64;
+                        let hi = (bits128 >> 64) as u64;
+                        let _ = write!(out, "0xL{lo:016X}{hi:016X}");
+                        i = hex_end;
+                        continue;
                     }
                 }
             }
 
             // 3b. `+inf`, `-inf`, `±qnan`, `±snan`, `±nan(0x...)`, `±snan(0x...)`
             if matches!(b, b'+' | b'-')
-                && let Some((end, bits64)) = parse_llvm23_special_fp(ir, i, last_fp_ty)
+                && let Some((end, lit)) = parse_llvm23_special_fp(ir, i, last_fp_ty)
             {
-                let _ = write!(out, "0x{bits64:016X}");
+                out.push_str(&lit);
                 i = end;
                 continue;
             }
@@ -838,7 +946,7 @@ fn normalize_llvm_ir_for_llc(ir: &str) -> String {
                 continue;
             }
 
-            // 3d. Track FP type context (`float` / `double` / other) and reset across top-level defs.
+            // 3d. Track FP type context (`half`/`bfloat`/`float`/`double`/`fp128`/other) and reset across top-level defs.
             if b.is_ascii_alphabetic() {
                 let start = i;
                 while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
@@ -847,9 +955,12 @@ fn normalize_llvm_ir_for_llc(ir: &str) -> String {
                 let word = &ir[start..i];
                 if !matches!(bytes.get(i), Some(b'.' | b':')) {
                     match word {
+                        "half" => last_fp_ty = Some(IrFpTy::Half),
+                        "bfloat" => last_fp_ty = Some(IrFpTy::BFloat),
                         "float" => last_fp_ty = Some(IrFpTy::F32),
                         "double" => last_fp_ty = Some(IrFpTy::F64),
-                        "half" | "bfloat" | "fp128" | "x86_fp80" | "ppc_fp128" => {
+                        "fp128" => last_fp_ty = Some(IrFpTy::Fp128),
+                        "x86_fp80" | "ppc_fp128" => {
                             last_fp_ty = Some(IrFpTy::Other);
                         }
                         "define" | "declare" | "attributes" => {
@@ -863,7 +974,8 @@ fn normalize_llvm_ir_for_llc(ir: &str) -> String {
             }
         }
 
-        if b == b'}' {
+        // Only reset FP type context on top-level `}` (column 0), not inline `{ ... }` struct types/literals.
+        if b == b'}' && (i == 0 || bytes[i - 1] == b'\n') {
             last_fp_ty = None;
         }
         let ch = ir[i..].chars().next().unwrap();
@@ -3074,6 +3186,7 @@ bar:
     fn test_normalize_llvm_ir_for_llc() {
         let ir = "\
 @bs = constant [4 x i8] c\"foo\\\\\", align 1
+@single_bs = constant [4 x i8] c\"foo\\\", align 1
 @msg = private constant [12 x i8] c\"f0x4B000000\\00\"
 ; comment with unmatched \" quote and f0x4B000000 +inf should stay untouched
 define float @f(float %x) {
@@ -3087,6 +3200,7 @@ define float @f(float %x) {
   %8 = fcmp one float %x, +inf
   %9 = select i1 %8, float -inf, float +qnan
   %10 = select i1 %8, float +nan(0x1234), float +snan(0x1)
+  %11 = fadd float extractvalue ({ float, i32 } { float 1.000000e+00, i32 0 }, 0), 1.000000e-01
   ret float -qnan
 }
 define double @d(double %x) {
@@ -3095,11 +3209,28 @@ define double @d(double %x) {
   %3 = select i1 %c, double +nan(0x1234), double -snan(0x1)
   ret double %3
 }
-; keep non-literal myf0x4B000000 and f0x4B0000001 untouched
+define half @h(i1 %c) {
+  %1 = select i1 %c, half +inf, half +nan(0x1)
+  ret half %1
+}
+define bfloat @bf(i1 %c) {
+  %1 = select i1 %c, bfloat -inf, bfloat +qnan
+  ret bfloat %1
+}
+define fp128 @q(i1 %c) {
+  %1 = select i1 %c, fp128 +inf, fp128 +snan(0x1)
+  ret fp128 %1
+}
+define x86_fp80 @e() {
+  ret x86_fp80 +inf
+}
+; keep non-literal myf0x4B000000, f0x4B0000001, and non-FP +inf untouched
+@meta = !{ +inf }
 ";
         let norm = normalize_llvm_ir_for_llc(ir);
-        // Backslash-terminated string + quoted string + comment preserved verbatim
+        // Backslash-terminated strings (both `\\"` and LLVM-valid `\"`) + comment preserved verbatim
         assert!(norm.contains("c\"foo\\\\\""));
+        assert!(norm.contains("c\"foo\\\""));
         assert!(norm.contains("c\"f0x4B000000\\00\""));
         assert!(norm.contains("; comment with unmatched \" quote and f0x4B000000 +inf"));
         // f32 f0x<8-hex> incl. sNaN payload preservation (bit 51 stays 0!)
@@ -3107,10 +3238,11 @@ define double @d(double %x) {
         assert!(norm.contains("splat (float 0x47EFFFFFE0000000)"));
         assert!(norm.contains("fadd float %x, 0x8000000000000000"));
         assert!(norm.contains("fadd float %x, 0x7FF0000020000000"));
-        // Inexact f32 scientific decimals rewritten, exact 1.000000e+00 preserved
+        // Inexact f32 scientific decimals rewritten (including after inline `{ ... }`), exact 1.000000e+00 preserved
         assert!(norm.contains("fadd float %x, 0x3FB99999A0000000"));
         assert!(norm.contains("fadd float %x, 0x36A0000000000000"));
         assert!(norm.contains("fadd float %x, 1.000000e+00"));
+        assert!(norm.contains("extractvalue ({ float, i32 } { float 1.000000e+00, i32 0 }, 0), 0x3FB99999A0000000"));
         // f32 ±inf, ±qnan, ±nan(0x...), ±snan(0x...)
         assert!(norm.contains("fcmp one float %x, 0x7FF0000000000000"));
         assert!(norm.contains("float 0xFFF0000000000000, float 0x7FF8000000000000"));
@@ -3120,6 +3252,12 @@ define double @d(double %x) {
         assert!(norm.contains("fadd double %x, 0x400921FB54442D18"));
         assert!(norm.contains("fadd double %x, 1.000000e-01"));
         assert!(norm.contains("double 0x7FF8000000001234, double 0xFFF0000000000001"));
+        // half / bfloat / fp128 use their native LLVM 23.0 tagged hex formats; x86_fp80 & non-FP untouched
+        assert!(norm.contains("half 0xH7C00, half 0xH7E01"));
+        assert!(norm.contains("bfloat 0xRFF80, bfloat 0xR7FC0"));
+        assert!(norm.contains("fp128 0xL00000000000000007FFF000000000000, fp128 0xL00000000000000017FFF000000000000"));
+        assert!(norm.contains("ret x86_fp80 +inf"));
+        assert!(norm.contains("@meta = !{ +inf }"));
         // Non-literals untouched
         assert!(norm.contains("myf0x4B000000"));
         assert!(norm.contains("f0x4B0000001"));
