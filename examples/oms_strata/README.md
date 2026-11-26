@@ -71,7 +71,7 @@ $GNOMON --state "$STATE" define-op --name price_collar_ok --entry price_collar_o
 
 ## Exact CLI Verification Commands
 
-Run from the repository root (`/home/sunyc/src/gnomon-rs`):
+Run from the repository root:
 
 ```bash
 GNOMON=./target/release/gnomon

@@ -116,12 +116,12 @@ gnomon profile examples/oms_strata/s4_3_perf_opt_pairs.rs \
 Exit codes: `0` = Success / `PROVED` / `OK`, `1` = `FALSIFIED` / `TRAP` / `UNKNOWN`, `2` = CLI / parse / TCB admission error.
 
 ### Single MCP Server (`gnomon mcp`)
-Registered in `~/.gemini/config/mcp_config.json`:
+Example MCP client configuration (e.g., `mcp_config.json`):
 ```json
 {
   "mcpServers": {
     "gnomon": {
-      "command": "/home/sunyc/src/gnomon-rs/target/release/gnomon",
+      "command": "/path/to/gnomon-rs/target/release/gnomon",
       "args": ["mcp"]
     }
   }

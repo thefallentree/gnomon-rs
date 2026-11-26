@@ -3,6 +3,7 @@ name = "gnomon-sieve"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
 
 [dependencies]
 gnomon-kernel.workspace = true
